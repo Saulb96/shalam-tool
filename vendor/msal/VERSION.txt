@@ -1,0 +1,3 @@
+@azure/msal-browser 5.22.0 (2026-09-15), from the npm registry.
+npm integrity: sha512-5kgu9xeEKgGc2JeidxAtU15NJTqiH/CMCRRQAJ4Rac56kB7KVg91vbNmn+z3RO1vNomPN69UvjKG9h1Pghx6dQ==
+Files: lib/msal-browser.min.js, lib/redirect-bridge/msal-redirect-bridge.min.js, LICENSE (MIT).

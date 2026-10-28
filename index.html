@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>M1S · Shalam Tool</title>
+<link rel="icon" type="image/png" href="favicon.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<canvas id="bg" aria-hidden="true"></canvas>
+<div class="wrap">
+  <header class="glass bar">
+    <div class="top">
+      <h1>M1S · Shalam Tool</h1>
+      <span id="health" class="health" aria-live="polite"></span>
+      <span class="sp"></span>
+      <span id="busy" class="chip busy" hidden><span class="mini"></span><span id="busyMsg">Refreshing…</span><button class="ghost" id="btnCancelBusy" type="button">Cancel</button></span>
+      <button id="btnRefresh" type="button" hidden title="Read every source again now">Refresh</button>
+      <button id="btnSources" type="button" hidden title="Where each source file is, the error email and the admins">⚙ Sources</button>
+      <span id="who" class="chip who" hidden></span>
+    </div>
+    <div class="chips" id="chips" hidden></div>
+  </header>
+
+  <div id="banners"></div>
+
+  <section id="signin" class="glass" hidden>
+    <h2>Shalam Tool</h2>
+    <p id="signinMsg">Sign in with your M1S account to see the inventory and its sources.</p>
+    <button class="primary" id="btnSignin" type="button">Sign in</button>
+  </section>
+
+  <section id="app" hidden aria-busy="false">
+    <div class="glass gridcard">
+      <div class="tabs" id="tabs" role="tablist">
+        <button class="tab on" type="button" role="tab" data-tab="inv">Inventory</button>
+        <button class="tab" type="button" role="tab" data-tab="pull">Pull from China</button>
+        <button class="tab iss" type="button" role="tab" data-tab="problems">Problems<span class="c" id="cProb">0</span></button>
+      </div>
+
+      <div class="tabpane" id="tab-inv">
+        <div class="card lead">
+          <div class="lbl">Inventory</div>
+          <h2>Stages arrive in step 2</h2>
+          <p class="note">This first version checks that every source opens and counts its rows. On hand, In China, On the water,
+            At port and Incoming are built on these counts in the next steps.</p>
+          <div class="inload" id="invLoad" hidden>
+            <svg width="120" height="70" viewBox="0 0 150 86" aria-hidden="true">
+              <g class="ship">
+                <rect x="40" y="24" width="18" height="14" rx="2" fill="#2f9bd6"/><rect x="60" y="24" width="18" height="14" rx="2" fill="#f2734a"/><rect x="80" y="24" width="18" height="14" rx="2" fill="#38a169"/>
+                <rect x="50" y="10" width="18" height="14" rx="2" fill="#8a6fd1"/><rect x="70" y="10" width="18" height="14" rx="2" fill="#2f9bd6"/>
+                <rect x="100" y="16" width="12" height="22" rx="2" fill="#16202c" opacity=".8"/>
+                <path d="M26 38h100l-12 18H38z" fill="#1b6fae"/>
+              </g>
+              <g class="wave"><path d="M0 62q10-6 20 0t20 0 20 0 20 0 20 0 20 0 20 0 20 0 20 0" stroke="#8fb8d8" stroke-width="3" fill="none"/></g>
+            </svg>
+            <div class="msg" id="invLoadMsg">Loading…</div>
+            <button type="button" id="btnCancelLoad">Cancel</button>
+          </div>
+        </div>
+        <div class="srcgrid" id="srcCards"></div>
+      </div>
+
+      <div class="tabpane" id="tab-pull" hidden>
+        <div class="card lead">
+          <div class="lbl">Pull from China</div>
+          <h2>Arrives in step 2</h2>
+          <p class="note">Every unshipped Master Sheet Live line, China Pickup included, with its status on Container Tracking
+            (booked, loaded, on the water, or not on the tracker yet).</p>
+        </div>
+      </div>
+
+      <div class="tabpane" id="tab-problems" hidden>
+        <div class="lbl sect">Sources</div>
+        <div class="pane short"><table class="grid" id="srcTable"></table></div>
+        <div class="toolbar">
+          <div class="lbl">Issues found in the files</div>
+          <input type="search" id="pq" placeholder="Filter issues: source, code, PO, style, message…" autocomplete="off" spellcheck="false">
+          <span class="selinfo" id="pqInfo"></span>
+        </div>
+        <div class="pane" id="issPane"><table class="grid" id="issTable"></table></div>
+      </div>
+    </div>
+  </section>
+</div>
+<dialog id="dlg"><div class="glass dlg" id="dlgBody"></div></dialog>
+<div id="toast" class="glass" role="status" aria-live="polite"></div>
+<script src="config.js"></script>
+<script src="vendor/xlsx-js-style/xlsx.bundle.js"></script>
+<script src="vendor/msal/msal-browser.min.js"></script>
+<script src="core/common.js"></script>
+<script src="core/pobook.js"></script>
+<script src="core/upc.js"></script>
+<script src="core/ct.js"></script>
+<script src="core/shipping.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+xlsx-js-style 1.2.0-beta (SheetJS Community Edition 0.18.5 with cell styles), Apache License 2.0.
+Upstream: https://github.com/gitbrent/xlsx-js-style (SheetJS: https://github.com/SheetJS/sheetjs).
+Copied byte for byte from the live Order Tracker (saulb96/order-tracker index.html, where it is inlined at line 13),
+so imports and exports read and write spreadsheets exactly as the live tool does. Loaded only when a spreadsheet is
+read or written. Its zip reader/writer (XLSX.CFB) also reads the pictures embedded in .xlsx files.
+sha256: a5a55a33902702f09c984606667ad004e42d61451921dddb8cb75508782d6f86
