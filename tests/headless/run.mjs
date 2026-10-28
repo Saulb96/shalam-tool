@@ -1,8 +1,9 @@
 // The page in headless Edge against a stand-in for SharePoint: a fake sign-in (never a real one), a fake Graph that
-// answers from invented workbooks, and checks on the chips, banners, the error email and the tabs.
+// answers from invented workbooks, a test config.js with invented locations, and checks on the chips, banners, the
+// error email, the read-only rules and the tabs.
 //   node tests/headless/run.mjs [scenario,scenario…]      (default: all)
-// Edge runs InPrivate, with sync off and a new throwaway profile; every request that isn't to 127.0.0.1 is blocked.
-// Screenshots go to .tmp/. Exits 1 when any check fails.
+// Edge runs InPrivate, with sync off and a new throwaway profile; each scenario gets its own fresh browser context;
+// every request that isn't to 127.0.0.1 is blocked. Screenshots go to .tmp/. Exits 1 when any check fails.
 import { createServer } from 'node:http';
 import { createServer as netServer } from 'node:net';
 import { spawn } from 'node:child_process';
@@ -16,10 +17,25 @@ const EDGE = process.env.EDGE_PATH || 'C:/Program Files (x86)/Microsoft/Edge/App
 const REPO = resolve(root());
 const OUT = join(REPO, '.tmp');
 const GRAPH = 'https://graph.microsoft.com/v1.0';
-const TEST_CONFIG = { tenantId: '00000000-0000-4000-8000-000000000000', clientId: '11111111-1111-4111-8111-111111111111' };
-const ACCOUNT = { name: 'Test User', username: 'test.user@example.com', homeAccountId: 'test-home', localAccountId: 'test-local', tenantId: TEST_CONFIG.tenantId };
 const MAIL_TO = 'saul@example.com';
-const SITE_ID = 'site-prod', PROD = 'drv-prod', SRC = 'drv-src', REP = 'drv-rep';
+// Invented locations: two sharing links and four /sites/… paths, on sites and libraries the stand-in below knows.
+const TEST_WEB = 'https://contoso-test.sharepoint.example';
+const LOC = {
+  msl: `${TEST_WEB}/:x:/s/TestSite/EaTestMasterSheetLink001?e=test01`,
+  tracker: `${TEST_WEB}/:x:/s/TestSite/EaTestTrackerLink0002?e=test02`,
+  ct: '/sites/TestSite/Shared Documents/Logistics/Test Container Sheet.xlsx',
+  forwarder: '/sites/TestReports/Shared Documents/Shipping/Forwarder',
+  drayage: '/sites/TestReports/Shared Documents/Shipping/Drayage',
+  ats: '/sites/TestSite/Shared Documents/Stock/ATS',
+};
+const CT_V2 = '/sites/TestSite/Shared Documents/Logistics/Test Container Sheet v2.xlsx';
+const CT_PATH = '/drives/drv-src/root:/Logistics/Test Container Sheet.xlsx';   // how Container Tracking is read: by its path in its library
+const TEST_CONFIG = { tenantId: '00000000-0000-4000-8000-000000000000', clientId: '11111111-1111-4111-8111-111111111111',
+  sources: LOC, errorEmailTo: MAIL_TO, errorEmailName: 'Saul' };
+const ACCOUNT = { name: 'Test User', username: 'test.user@example.com', homeAccountId: 'test-home', localAccountId: 'test-local', tenantId: TEST_CONFIG.tenantId };
+// As a real Graph token lists them: the sign-in scopes (email, openid, profile) come along with the three asked for.
+const READ_SCP = 'email Mail.Send openid profile Sites.Read.All User.Read';
+const SITE_ID = 'site-prod', SRC = 'drv-src', REP = 'drv-rep';
 const XOPT = { type: 'array', cellFormula: false, cellHTML: false, cellStyles: false };   // as app.js reads files
 const KEYS = ['msl', 'tracker', 'pobook', 'ct', 'forwarder', 'drayage', 'ats', 'upc'];
 const NAMES = { msl: 'Master Sheet Live', tracker: 'PO Status Tracker', pobook: 'PO Book lines', ct: 'Container Tracking',
@@ -105,11 +121,6 @@ function buildFixtures() {
   const upcPages = [[u('1', 'AB-100', '000000000017', 'Lip gloss'), u('2', 'AB-200', '000000000024', 'Lip gloss 2'), u('3', 'CD-300', '12345', 'Brush')],
     [u('4', 'ZZ-900', '000000000031', 'Old cream'), u('5', 'EF-400', '000000000048', 'Bag')]];
 
-  const src = k => ({ link: `https://example.invalid/files/${k}`, driveId: k.includes('dir') ? REP : SRC, itemId: k, name: '', webUrl: `https://example.invalid/files/${k}` });
-  const settings = { version: 1, sources: { msl: src('itm-msl'), tracker: src('itm-trk'), ct: src('itm-ct'), forwarder: src('itm-fwd-dir'), drayage: src('itm-dray-dir') },
-    admins: [ACCOUNT.username], errorEmailTo: MAIL_TO, updatedBy: ACCOUNT.name, updatedAt: iso(20) };
-  bytes.set('settings.json', Buffer.from(JSON.stringify(settings)));
-
   // The PO Book page, served at /po-book/index.html: its CORE block as copied into core/pobook.js, or changed.
   const block = PB.coreText(readFileSync(join(REPO, 'core', 'pobook.js'), 'utf8'));
   const poBook = body => `<!doctype html><html><head><title>PO Book</title></head><body><script>\n/*CORE-START*/${body}/*CORE-END*/\n</script></body></html>`;
@@ -153,40 +164,66 @@ let DL = '';          // the download host: another port on 127.0.0.1, so downlo
 let world = null;     // the SharePoint state of the scenario being run
 
 function newWorld(fx, o = {}) {
-  return { fx, o: { settings: true, mslFile: 'msl.xlsx', ctFile: 'ct.xlsx', fwdAge: 0, tracker: 200, poBook: 'same', mail: 202, ats: null, slowCt: false, ...o },
-    folders: new Set(['Inventory', ...(o.ats ? ['Inventory/ATS'] : []), ...(o.errorsDir ? ['Inventory/Errors'] : [])]), markers: new Map(),
-    calls: [], downloads: [], unanswered: [], pending: new Set(), aborted: [], poBookGets: 0 };
+  return { fx, o: { mslFile: 'msl.xlsx', ctFile: 'ct.xlsx', fwdAge: 0, tracker: 200, poBook: 'same', mail: 202, ats: { empty: true }, slowCt: false, sources: {}, ...o },
+    calls: [], downloads: [], pageGets: [], unanswered: [], pending: new Set(), aborted: [], poBookGets: 0 };
 }
+// The config.js the page gets: the invented locations, with the scenario's changes.
+const configFor = w => ({ ...TEST_CONFIG, sources: { ...LOC, ...((w && w.o.sources) || {}) } });
 
 const J = (status, json) => ({ status, json });
 const notFound = () => J(404, { error: { code: 'itemNotFound', message: 'The resource could not be found.' } });
+const denied = () => J(403, { error: { code: 'accessDenied', message: 'Access denied.' } });
 const webUrl = id => `https://example.invalid/files/${id}`;
 const by = { user: { displayName: 'Test Saver' } };
 function fileMeta(id, name, fx, age) {
   return { id, name, webUrl: webUrl(id), lastModifiedDateTime: iso(age), lastModifiedBy: by, file: {}, eTag: `"${id}-1"`,
-    '@microsoft.graph.downloadUrl': `${DL}/fx/${fx}` };
+    parentReference: { driveId: SRC }, '@microsoft.graph.downloadUrl': `${DL}/fx/${fx}` };
 }
 const folderMeta = (id, name) => ({ id, name, webUrl: webUrl(id), folder: { childCount: 3 }, lastModifiedDateTime: iso(1) });
 const listMeta = (id, name) => ({ id, displayName: name, name, webUrl: webUrl(id), lastModifiedDateTime: iso(1), lastModifiedBy: by });
 const kid = (id, name, age, extra) => ({ id, name, lastModifiedDateTime: iso(age), lastModifiedBy: by, webUrl: webUrl(id), file: {}, ...extra });
 
-function graph(w, method, path, q, body) {
+// /sites/<site> paths go to the host app.js gives them; the sites, their libraries and two sharing links.
+const SITES = { Production: SITE_ID, TestSite: 'site-test', TestReports: 'site-rep' };
+const DRIVES = {
+  'site-test': [{ id: 'drv-assets', name: 'Site Assets', webUrl: `${TEST_WEB}/sites/TestSite/SiteAssets` },
+    { id: SRC, name: 'Documents', webUrl: `${TEST_WEB}/sites/TestSite/Shared%20Documents` }],
+  'site-rep': [{ id: REP, name: 'Documents', webUrl: `${TEST_WEB}/sites/TestReports/Shared%20Documents` }],
+};
+const SHARES = { [LOC.msl]: ['itm-msl', 'Master Sheet Live.xlsx'], [LOC.tracker]: ['itm-trk', 'PO Status Tracker.xlsx'] };
+const isResolve = x => /^\/shares\/|^\/sites\/[^/]+:\/sites\/(?!Production$)|\/drives$|\/root:\//.test(x.path);
+// Finding a location afresh: a sharing link, a site or its libraries (a path inside a known library is not one).
+const isLookup = x => /^\/shares\/|^\/sites\/[^/]+:\/sites\/(?!Production$)|\/drives$/.test(x.path);
+
+function graph(w, method, path, q) {
   const o = w.o;
   if (method === 'GET') {
-    if (path === '/sites/met1sol.sharepoint.com:/sites/Production') return J(200, { id: SITE_ID });
-    if (path === `/sites/${SITE_ID}/drive`) return J(200, { id: PROD });
-    if (path === `/drives/${PROD}/root:/Inventory/settings.json`) {
-      if (o.settings === 403) return J(403, { error: { code: 'accessDenied', message: 'Access denied.' } });
-      return o.settings ? J(200, { id: 'itm-settings', name: 'settings.json', eTag: '"settings-1"', file: {}, '@microsoft.graph.downloadUrl': `${DL}/fx/settings.json` }) : notFound();
+    let m;
+    if ((m = /^\/sites\/met1sol\.sharepoint\.com:\/sites\/([^/]+)$/.exec(path))) return SITES[m[1]] ? J(200, { id: SITES[m[1]] }) : notFound();
+    if ((m = /^\/sites\/([^/]+)\/drives$/.exec(path)) && DRIVES[m[1]]) return J(200, { value: DRIVES[m[1]] });
+    if ((m = /^\/shares\/u!([\w-]+)\/driveItem$/.exec(path))) {
+      const hit = SHARES[Buffer.from(m[1], 'base64url').toString('utf8')];
+      if (!hit) return notFound();
+      // o.shares 403: Graph won't open sharing links for this sign-in (Microsoft lists only write permissions for it).
+      if (o.shares === 403) return denied();
+      return J(200, { id: hit[0], name: hit[1], webUrl: webUrl(hit[0]), file: {}, parentReference: { driveId: SRC } });
     }
-    if (path === `/drives/${PROD}/root:/Inventory:/children`) {   // what the page checks when settings.json is missing
-      return J(200, { value: [...w.folders].filter(f => /^Inventory\/[^/]+$/.test(f)).map(f => folderMeta('dir-' + f.replace(/\W/g, '-'), f.split('/')[1])) });
+    // o.ctReplaced: the sheet was renamed to "… OLD.xlsx" and a new file saved under the old name (a new id).
+    if (path === `/drives/${SRC}/root:/Logistics/Test Container Sheet.xlsx`) return J(200, o.ctReplaced ? fileMeta('itm-ct-new', 'Test Container Sheet.xlsx', o.ctFile, 0) : fileMeta('itm-ct', 'Test Container Sheet.xlsx', o.ctFile, 0));
+    if (path === `/drives/${SRC}/items/itm-ct-new` && o.ctReplaced) return J(200, fileMeta('itm-ct-new', 'Test Container Sheet.xlsx', o.ctFile, 0));
+    if (path === `/drives/${SRC}/root:/Logistics/Test Container Sheet v2.xlsx`) return J(200, fileMeta('itm-ct2', 'Test Container Sheet v2.xlsx', 'ct.xlsx', 0));
+    if (path === `/drives/${REP}/root:/Shipping/Forwarder`) return J(200, folderMeta('itm-fwd-dir', 'Forwarder'));
+    if (path === `/drives/${REP}/root:/Shipping/Drayage`) return J(200, folderMeta('itm-dray-dir', 'Drayage'));
+    if (path === `/drives/${SRC}/root:/Stock/ATS` || path === `/drives/${SRC}/items/itm-ats-dir`) return o.ats ? J(200, folderMeta('itm-ats-dir', 'ATS')) : notFound();
+    if (path === `/drives/${SRC}/items/itm-ats-dir/children` && o.ats) {
+      const lock = kid('itm-ats-lock', '~$ats-report-new.xlsx', 0), sub = { id: 'itm-ats-sub', name: 'Old', folder: { childCount: 2 }, lastModifiedDateTime: iso(0) };
+      if (o.ats.empty) return J(200, { value: [lock, sub] });
+      return J(200, { value: [kid('itm-ats-1', 'ats-report-new.xlsx', o.ats.age), kid('itm-ats-0', 'ats-report-older.xlsx', o.ats.age + 7), lock, sub] });
     }
     if (path === `/drives/${SRC}/items/itm-msl`) return J(200, fileMeta('itm-msl', 'Master Sheet Live.xlsx', o.mslFile, 1));
-    if (path === `/drives/${SRC}/items/itm-trk`) {
-      return o.tracker === 403 ? J(403, { error: { code: 'accessDenied', message: 'Access denied.' } }) : J(200, fileMeta('itm-trk', 'PO Status Tracker.xlsx', 'tracker.xlsx', 1));
-    }
-    if (path === `/drives/${SRC}/items/itm-ct`) return J(200, fileMeta('itm-ct', 'Container Tracking Sheet.xlsx', o.ctFile, 0));
+    if (path === `/drives/${SRC}/items/itm-trk`) return o.tracker === 403 ? denied() : J(200, fileMeta('itm-trk', 'PO Status Tracker.xlsx', 'tracker.xlsx', 1));
+    if (path === `/drives/${SRC}/items/itm-ct`) return J(200, fileMeta('itm-ct', o.ctReplaced ? 'Test Container Sheet OLD.xlsx' : 'Test Container Sheet.xlsx', o.ctFile, o.ctReplaced ? 5 : 0));
+    if (path === `/drives/${SRC}/items/itm-ct2`) return J(200, fileMeta('itm-ct2', 'Test Container Sheet v2.xlsx', 'ct.xlsx', 0));
     if (path === `/drives/${REP}/items/itm-fwd-dir`) return J(200, folderMeta('itm-fwd-dir', 'Forwarder'));
     if (path === `/drives/${REP}/items/itm-fwd-dir/children`) {
       // two pages; the newest file is on the second, so the page must follow @odata.nextLink
@@ -210,38 +247,11 @@ function graph(w, method, path, q, body) {
       return J(200, { value: w.fx.upcPages[0], '@odata.nextLink': `${GRAPH}/sites/${SITE_ID}/lists/lst-upc/items?$expand=fields&$top=999&$skiptoken=p2` });
     }
   }
-  if (path === `/drives/${PROD}/root/children` && method === 'POST') return makeFolder(w, '', body);
-  const m = /^\/drives\/drv-prod\/root:\/(.+?)(?::\/(content|children))?$/.exec(path);
-  if (m) {
-    const [, p, op] = m, parent = p.split('/').slice(0, -1).join('/');
-    if (method === 'GET' && !op && w.folders.has(p)) return J(200, folderMeta('dir-' + p.replace(/\W/g, '-'), p.split('/').pop()));
-    if (method === 'GET' && op === 'children' && p === 'Inventory/ATS' && w.folders.has(p)) {
-      const a = o.ats || {};
-      return J(200, { value: [kid('itm-ats-1', 'ats-report-new.xlsx', a.age), kid('itm-ats-0', 'ats-report-older.xlsx', a.age + 7), kid('itm-ats-lock', '~$ats-report-new.xlsx', 0)] });
-    }
-    if (method === 'POST' && op === 'children') return makeFolder(w, p, body);
-    if (method === 'PUT' && op === 'content' && parent === 'Inventory/Errors') {
-      if (!w.folders.has(parent)) return notFound();   // path uploads don't create parent folders
-      if (q.get('@microsoft.graph.conflictBehavior') === 'fail' && w.markers.has(p)) return J(409, { error: { code: 'nameAlreadyExists', message: 'The specified item name already exists.' } });
-      w.markers.set(p, body);
-      return J(201, { id: 'itm-marker-' + w.markers.size, name: p.split('/').pop(), eTag: '"m-1"' });
-    }
-    if (method === 'DELETE' && !op && w.markers.has(p)) { w.markers.delete(p); return { status: 204 }; }
-    if (method === 'GET' && !op) return notFound();
-  }
   if (method === 'POST' && path === '/me/sendMail') {
     return o.mail === 202 ? { status: 202 } : J(o.mail, { error: { code: 'ErrorAccessDenied', message: 'Access is denied. Check credentials and try again.' } });
   }
   w.unanswered.push(`${method} ${path}`);
-  return notFound();
-}
-function makeFolder(w, parent, body) {
-  const name = body && body.name, p = parent ? parent + '/' + name : name;
-  if (!name || !(body.folder)) return J(400, { error: { code: 'invalidRequest', message: 'A folder needs a name.' } });
-  if (parent && !w.folders.has(parent)) return notFound();
-  if (w.folders.has(p)) return J(409, { error: { code: 'nameAlreadyExists', message: 'The specified item name already exists.' } });
-  w.folders.add(p);
-  return J(201, folderMeta('dir-' + p.replace(/\W/g, '-'), name));
+  return method === 'GET' ? notFound() : J(405, { error: { code: 'notAllowed', message: 'The stand-in answers reads and the email only.' } });
 }
 
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.png': 'image/png', '.json': 'application/json', '.svg': 'image/svg+xml' };
@@ -261,17 +271,18 @@ function pageServer() {
         try { body = text ? JSON.parse(text) : null; } catch (e) { body = text; }
         const gpath = path.slice('/__graph'.length), q = new URLSearchParams(rawQ);
         const w = world;
-        const r = w ? graph(w, req.method, gpath, q, body) : notFound();
-        if (w) w.calls.push({ method: req.method, path: gpath, query: rawQ, auth: req.headers.authorization || '', body, status: r.status });
+        const r = w ? graph(w, req.method, gpath, q) : notFound();
+        if (w) w.calls.push({ method: req.method, path: gpath, query: rawQ, auth: req.headers.authorization || '', prefer: req.headers.prefer || '', body, status: r.status });
         res.writeHead(r.status, r.json ? { 'Content-Type': 'application/json' } : {});
         res.end(r.json ? JSON.stringify(r.json) : undefined);
       });
       return;
     }
+    if (world) world.pageGets.push({ method: req.method, path });
     if (req.method !== 'GET') { res.writeHead(405); res.end(); return; }
     if (path === '/config.js') {
       res.writeHead(200, { 'Content-Type': TYPES['.js'], 'Cache-Control': 'no-store' });
-      res.end(`window.INV_CONFIG = ${JSON.stringify(TEST_CONFIG)};\n`);
+      res.end(`window.INV_CONFIG = ${JSON.stringify(configFor(world), null, 2)};\n`);
       return;
     }
     if (path === '/po-book/index.html') {
@@ -290,17 +301,16 @@ function pageServer() {
   });
 }
 
-// Pre-signed download links: no sign-in needed, cross-origin with CORS open, and no Authorization header expected
-// (a preflight asking to send one is refused, as SharePoint's download host would not need it).
+// Pre-signed download links: no sign-in needed, cross-origin with CORS open, and no Authorization header expected.
 function downloadServer() {
   return createServer((req, res) => {
     const cors = { 'Access-Control-Allow-Origin': '*' };
-    if (req.method === 'OPTIONS') { res.writeHead(204, cors); res.end(); return; }
     const name = decodeURIComponent(req.url.split('?')[0]).replace(/^\/fx\//, '');
     const w = world;
+    if (w) w.downloads.push({ name, method: req.method, auth: !!req.headers.authorization });
+    if (req.method === 'OPTIONS') { res.writeHead(204, cors); res.end(); return; }
     const buf = w && w.fx.bytes.get(name);
-    if (w) w.downloads.push({ name, auth: !!req.headers.authorization });
-    if (!buf) { res.writeHead(404, cors); res.end(); return; }
+    if (!buf || req.method !== 'GET') { res.writeHead(404, cors); res.end(); return; }
     const send = () => { res.writeHead(200, { ...cors, 'Content-Type': 'application/octet-stream', 'Content-Length': buf.length }); res.end(buf); };
     if (w.o.slowCt && name === w.o.ctFile) {
       w.pending.add(name);
@@ -314,17 +324,21 @@ function downloadServer() {
 
 // ------------------------------------------------------------------ what runs in the page before its own scripts
 
-function initScript(pageOrigin) {
-  const b64u = o => Buffer.from(JSON.stringify(o)).toString('base64url');
-  const token = `${b64u({ alg: 'none', typ: 'JWT' })}.${b64u({ aud: 'https://graph.microsoft.com', scp: 'User.Read Sites.ReadWrite.All Mail.Send', name: ACCOUNT.name })}.headless`;
+// opts.scp: the permissions the fake sign-in's tokens carry (the page reads them from the token, as from a real one);
+// MSAL's result lists them too, as the sign-in service's reply does. opts.opaque: tokens the page can't decode.
+// opts.noStorage: browser storage blocked, as in some locked-down browsers.
+function initScript(pageOrigin, opts = {}) {
   return `(() => {
   if (window.__headless) return;
-  const H = window.__headless = { blocked: [], msal: [], msalSetTried: 0, config: null };
+  const H = window.__headless = { blocked: [], requests: [], msal: [], msalSetTried: 0, config: null, tokens: 0, forced: 0, scp: ${JSON.stringify(opts.scp || READ_SCP)}, opaque: ${!!opts.opaque} };
   const GRAPH = ${JSON.stringify(GRAPH)}, PAGE = ${JSON.stringify(pageOrigin)}, DL = ${JSON.stringify(DL)};
   const realFetch = window.fetch.bind(window);
   // Graph goes to the local stand-in; the page and the download host pass; anything else is refused and recorded.
+  // Every call is logged with its method and the address the page asked for.
   window.fetch = function (input, init) {
     const url = typeof input === 'string' ? input : (input && input.url) || String(input);
+    const method = String((init && init.method) || (input && typeof input === 'object' && input.method) || 'GET').toUpperCase();
+    H.requests.push({ method, url });
     if (url === GRAPH || url.startsWith(GRAPH + '/')) return realFetch(PAGE + '/__graph' + url.slice(GRAPH.length), init);
     let o = '';
     try { o = new URL(url, location.href).origin; } catch (e) { /* not a URL */ }
@@ -332,6 +346,19 @@ function initScript(pageOrigin) {
     H.blocked.push(url);
     return Promise.reject(new TypeError('Failed to fetch'));
   };
+  // The 5-minute refresh is held here (any timer of 2 minutes or more) so a check can run it now with fireLong().
+  const realSet = window.setTimeout.bind(window), realClear = window.clearTimeout.bind(window);
+  const long = new Map();
+  let seq = 1e9;
+  window.setTimeout = function (fn, ms, ...args) {
+    if (typeof fn === 'function' && Number(ms) >= 120000) { const id = ++seq; long.set(id, { fn, args }); return id; }
+    return realSet(fn, ms, ...args);
+  };
+  window.clearTimeout = function (id) { if (!long.delete(id)) realClear(id); };
+  H.longWaiting = () => long.size;
+  H.fireLong = () => { const due = [...long.values()]; long.clear(); for (const t of due) t.fn(...t.args); return due.length; };
+  ${opts.noStorage ? `Object.defineProperty(window, 'localStorage', { configurable: true, get() { throw new DOMException('Storage is blocked.', 'SecurityError'); } });` : ''}
+  const b64u = o => btoa(JSON.stringify(o)).replace(/=+$/, '').replace(/\\+/g, '-').replace(/\\//g, '_');
   const account = ${JSON.stringify(ACCOUNT)};
   class InteractionRequiredAuthError extends Error { constructor(m) { super(m); this.name = 'InteractionRequiredAuthError'; } }
   const never = name => () => { H.msal.push(name); return Promise.reject(new Error(name + ' is not allowed in the headless check')); };
@@ -343,9 +370,11 @@ function initScript(pageOrigin) {
     getActiveAccount() { return this.active; }
     setActiveAccount(a) { this.active = a; }
     async acquireTokenSilent(req) {
+      H.tokens++; if (req && req.forceRefresh) H.forced++;
       // A scenario sets H.tokenFail to make the quiet renewal fail the way MSAL's hidden-frame timeout does.
       if (H.tokenFail) { const e = new Error('Token renewal operation failed due to timeout.'); e.errorCode = H.tokenFail; throw e; }
-      return { accessToken: ${JSON.stringify(token)}, account, scopes: (req && req.scopes) || [] };
+      const t = H.opaque ? 'headless-opaque-token-' + H.tokens : b64u({ alg: 'none', typ: 'JWT' }) + '.' + b64u({ aud: 'https://graph.microsoft.com', scp: H.scp, name: account.name }) + '.headless';
+      return { accessToken: t, account, scopes: H.scp.split(' ').filter(Boolean) };
     }
   }
   for (const n of ['loginRedirect', 'loginPopup', 'acquireTokenRedirect', 'acquireTokenPopup', 'logoutRedirect', 'logoutPopup']) PublicClientApplication.prototype[n] = never(n);
@@ -370,21 +399,23 @@ function snapshot() {
   }
   const issRows = [...document.querySelectorAll('#issTable tbody tr')];
   const H = window.__headless || {};
+  let store = null;
+  try { store = Object.fromEntries(Object.keys(localStorage).filter(k => k.startsWith('inv:')).map(k => [k, localStorage.getItem(k)])); } catch (e) { store = null; }
   return {
     title: document.title, appShown: shown(q('#app')), signinShown: shown(q('#signin')), busy: q('#app') && q('#app').getAttribute('aria-busy'),
     busyShown: shown(q('#busy')), health: txt(q('#health')), chips, cards, srows, cardCount: document.querySelectorAll('#srcCards .scard').length,
-    banners: [...document.querySelectorAll('#banners .banner')].map(b => ({ kind: (b.className.match(/\b(err|warn|info)\b/) || [])[1] || '', text: txt(b) })),
+    banners: [...document.querySelectorAll('#banners .banner')].map(b => ({ kind: (b.className.match(/\b(err|warn|info)\b/) || [])[1] || '', text: txt(b), id: b.id || '',
+      buttons: [...b.querySelectorAll('button')].map(txt) })),
     cProb: txt(q('#cProb')), pqInfo: txt(q('#pqInfo')),
     issueGroups: issRows.filter(r => r.classList.contains('gh')).map(txt),
     issueRows: issRows.filter(r => !r.classList.contains('gh') && !r.querySelector('.more,.empty')).length,
     srcRows: document.querySelectorAll('#srcTable tr[id^="srow-"]').length,
     tabs: Object.fromEntries(['inv', 'pull', 'problems'].map(t => [t, shown(q('#tab-' + t))])),
-    sourcesButton: shown(q('#btnSources')), who: txt(q('#who')),
-    dlgOpen: !!(q('#dlg') && q('#dlg').open), dlgFields: [...document.querySelectorAll('#dlg input[id^="sf_"], #dlg textarea[id^="sf_"]')].map(x => x.id),
-    dlgAdmins: (q('#sf_admins') || {}).value || '', dlgCancel: !!q('#dlg #dCancel'),
+    who: txt(q('#who')), sourcesButton: !!q('#btnSources'), dialog: !!q('dialog'),
     toast: txt(q('#toast')), toastShown: shown(q('#toast')),
     msalFake: !!(window.msal && window.msal.headlessFake), msalSetTried: H.msalSetTried || 0, msalInteractive: H.msal || [],
-    msalConfig: H.config, fetchBlocked: H.blocked || [], loading: [...document.querySelectorAll('.chip.src[data-state="load"]')].map(x => x.id),
+    msalConfig: H.config, fetchBlocked: H.blocked || [], requests: H.requests || [], tokens: H.tokens || 0, forced: H.forced || 0,
+    loading: [...document.querySelectorAll('.chip.src[data-state="load"]')].map(x => x.id), store,
   };
 }
 const READY = `(() => { if (window.__stale) return false; const a = document.getElementById('app'), h = document.getElementById('health');
@@ -451,15 +482,21 @@ async function signInWindows(cdp) {
   return targetInfos.map(t => t.url).filter(u => /sync|signin|sign-in|login\.|microsoftonline|account/i.test(u));
 }
 
+const ALL_NET = [];   // every request any tab made in the whole run, as Edge saw it
+
+// A tab in its own new browser context, so its browser storage starts empty (the email marks, the saved locations).
 async function openTab(cdp, init) {
-  const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank' });
+  const { browserContextId } = await cdp.send('Target.createBrowserContext', { disposeOnDetach: true });
+  const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank', browserContextId });
   const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
-  const t = { targetId, sessionId, blocked: [], console: [], exceptions: [] };
+  const t = { targetId, sessionId, browserContextId, blocked: [], net: [], console: [], exceptions: [] };
   t.send = (m, p) => cdp.send(m, p, sessionId);
   t.off = cdp.on(m => {
     if (m.sessionId !== sessionId) return;
     const p = m.params || {};
     if (m.method === 'Fetch.requestPaused') {
+      const r = { method: p.request.method, url: p.request.url };
+      t.net.push(r); ALL_NET.push(r);
       let u = null;
       try { u = new URL(p.request.url); } catch (e) { /* refused below */ }
       if (u && ((u.protocol === 'http:' && u.hostname === '127.0.0.1') || u.protocol === 'data:' || u.protocol === 'blob:')) t.send('Fetch.continueRequest', { requestId: p.requestId }).catch(() => {});
@@ -476,6 +513,7 @@ async function openTab(cdp, init) {
   await t.send('Runtime.enable');
   await t.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
   await t.send('Page.addScriptToEvaluateOnNewDocument', { source: init });
+  await t.send('Page.bringToFront').catch(() => {});
   t.eval = async expr => {
     const r = await t.send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true });
     if (r.exceptionDetails) throw new Error('In the page: ' + ((r.exceptionDetails.exception && r.exceptionDetails.exception.description) || r.exceptionDetails.text));
@@ -488,6 +526,11 @@ async function openTab(cdp, init) {
   };
   t.snap = () => t.eval(`(${snapshot})()`);
   t.click = sel => t.eval(`(() => { const el = document.querySelector(${JSON.stringify(sel)}); if (!el) throw new Error('no ${sel.replace(/'/g, '')}'); el.click(); return true; })()`);
+  t.reload = async () => {
+    await t.eval('window.__stale = 1');
+    await t.send('Page.reload', { ignoreCache: true });
+    await t.waitFor(READY, 'the page to load again');
+  };
   t.shot = async name => {
     const m = await t.send('Page.getLayoutMetrics');
     const s = m.cssContentSize || m.contentSize;
@@ -497,39 +540,64 @@ async function openTab(cdp, init) {
     writeFileSync(file, Buffer.from(r.data, 'base64'));
     return file;
   };
-  t.close = async () => { t.off(); await cdp.send('Target.closeTarget', { targetId }).catch(() => {}); };
+  t.close = async () => {
+    t.off();
+    await cdp.send('Target.closeTarget', { targetId }).catch(() => {});
+    await cdp.send('Target.disposeBrowserContext', { browserContextId }).catch(() => {});
+  };
   return t;
+}
+
+// Runs the page's 5-minute refresh now and waits for it to finish. Answers how many held timers ran.
+async function runRefresh(t, w, expectCalls = true) {
+  const from = w.calls.length;
+  const fired = await t.eval('window.__headless.fireLong()');
+  const end = Date.now() + 15000;
+  while (expectCalls && fired && w.calls.length === from && Date.now() < end) await sleep(100);
+  await t.waitFor(IDLE, 'the refresh to finish', 30000);
+  return { fired, calls: w.calls.slice(from) };
 }
 
 // ------------------------------------------------------------------ scenarios
 
-const isWrite = c => c.method !== 'GET';
-const markerPuts = calls => calls.filter(c => c.method === 'PUT' && c.path.startsWith(`/drives/${PROD}/root:/Inventory/Errors/`));
 const sendMails = calls => calls.filter(c => c.method === 'POST' && c.path === '/me/sendMail');
 const banner = (s, kind) => s.banners.filter(b => b.kind === kind).map(b => b.text).join(' | ');
 const pair = (card, label) => { const p = card && card.pairs.find(x => x[0] === label); return p ? p[1] : null; };
 const rc = e => `${fmtN(e.read)} read / ${fmtN(e.counted)} counted`;
 const mailText = c => (c && c.body && c.body.message) || {};
+const mailKey = (today, k) => `inv:mailed:${C.isoDay(today)}:${k}`;
+// The read-only rule, three ways: as the page asked (the fake fetch), as Edge sent it, and as the stand-in got it.
+const okPage = r => r.method === 'GET' || (r.method === 'POST' && r.url === GRAPH + '/me/sendMail');
+const okNet = origin => r => r.method === 'GET' || (r.method === 'POST' && r.url === `${origin}/__graph/me/sendMail`);
+const okCall = x => x.method === 'GET' || (x.method === 'POST' && x.path === '/me/sendMail');
 
 function greenExcept(c, s, except) {
   for (const k of ['msl', 'tracker', 'pobook', 'ct', 'forwarder', 'drayage', 'upc'].filter(k => !except.includes(k))) {
     c(`${NAMES[k]} chip green`, s.chips[k] && s.chips[k].state === 'ok', s.chips[k] ? `${s.chips[k].state}: ${s.chips[k].text}` : 'no chip');
   }
 }
-function oneEmail(c, w, calls, source, problem, today) {
-  const puts = markerPuts(calls), sends = sendMails(calls);
-  const name = `Inventory/Errors/${C.isoDay(today)} ${source}.json`;
-  c(`exactly one marker file created: "${name.split('/').pop()}"`, puts.length === 1 && puts[0].status === 201 && puts[0].path.endsWith(`root:/${name}:/content`),
-    puts.map(p => `${p.status} ${p.path}`).join('; ') || 'none');
-  c('the marker is created with conflictBehavior=fail', puts.length === 1 && /@microsoft\.graph\.conflictBehavior=fail/.test(decodeURIComponent(puts[0].query)), puts[0] && puts[0].query);
+function oneEmail(c, s, calls, k, problem, today) {
+  const source = NAMES[k], sends = sendMails(calls);
   c('exactly one sendMail', sends.length === 1, `${sends.length} sent`);
-  c('the marker is written before the email', puts.length === 1 && sends.length === 1 && calls.indexOf(puts[0]) < calls.indexOf(sends[0]));
   const msg = mailText(sends[0]);
   c(`the subject names ${source} and the problem`, msg.subject && msg.subject.includes(`: ${source} — ${problem}`), msg.subject);
-  c('sent to the error address, plain text, kept in Sent Items',
+  c('sent to errorEmailTo from config.js, plain text, kept in Sent Items',
     sends[0] && msg.toRecipients && msg.toRecipients.length === 1 && msg.toRecipients[0].emailAddress.address === MAIL_TO &&
     msg.body && msg.body.contentType === 'Text' && sends[0].body.saveToSentItems === true, JSON.stringify(msg.toRecipients));
-  return { puts, sends, msg };
+  const key = mailKey(today, k);
+  c(`this browser noted today's email ("${key}")`, !!(s.store && s.store[key]), JSON.stringify(s.store));
+  return { sends, msg };
+}
+function stopChecks(c, s, w, scpWords) {
+  const stop = s.banners.find(b => b.id === 'stopBanner');
+  c('red stop banner with Sign in again', !!stop && stop.kind === 'err' && /Stopped: nothing is loaded/.test(stop.text) && stop.buttons.includes('Sign in again'), JSON.stringify(s.banners));
+  for (const wd of scpWords) c(`the banner names ${wd}`, !!stop && stop.text.includes(wd), stop && stop.text);
+  c('not one request to SharePoint (no Graph call, no download)', w.calls.length === 0 && w.downloads.length === 0,
+    w.calls.map(x => `${x.method} ${x.path}`).concat(w.downloads.map(d => d.name)).join('; '));
+  c('no source loads: every chip grey "not read"', KEYS.every(k => s.chips[k] && s.chips[k].state === 'off' && /not read/.test(s.chips[k].text)),
+    KEYS.map(k => s.chips[k] && `${s.chips[k].state} ${s.chips[k].text}`).join(' | '));
+  c('no email', sendMails(w.calls).length === 0);
+  c('health line says it stopped', /Stopped/.test(s.health), s.health);
 }
 
 const SCENARIOS = [
@@ -539,12 +607,23 @@ const SCENARIOS = [
       let s = await t.snap();
       c('signed in with the fake account (no real sign-in)', s.appShown && !s.signinShown && s.who.includes(ACCOUNT.name), s.who);
       greenExcept(c, s, []);
-      c('ATS chip grey "no report yet"', s.chips.ats && s.chips.ats.state === 'off' && /no report yet/.test(s.chips.ats.text), s.chips.ats && s.chips.ats.text);
+      c('ATS chip grey "no report yet", with where to save it', s.chips.ats && s.chips.ats.state === 'off' && /no report yet/.test(s.chips.ats.text) &&
+        s.chips.ats.title.includes('Save the weekly ATS report into Stock/ATS on the TestSite site.'), s.chips.ats && `${s.chips.ats.text} | ${s.chips.ats.title}`);
       for (const k of ['msl', 'tracker', 'pobook', 'ct', 'forwarder', 'drayage', 'upc']) {
         c(`${NAMES[k]} chip shows "${rc(e[k])}"`, s.chips[k] && s.chips[k].text.includes(rc(e[k])), s.chips[k] && s.chips[k].text);
       }
       c('chips show who saved the file', s.chips.ct.text.includes('Test Saver'), s.chips.ct.text);
       c('Container Tracking chip links to the file', s.chips.ct.href === webUrl('itm-ct'), s.chips.ct.href);
+      const shares = w.calls.filter(x => x.path.startsWith('/shares/'));
+      c('both sharing links resolved through /shares/u!…/driveItem, without the redeem header',
+        shares.length === 2 && shares.every(x => !/redeem/i.test(x.prefer)), shares.map(x => `${x.path} prefer="${x.prefer}"`).join('; '));
+      c('each /sites/… path resolved through its site and the library matched by its address',
+        ['/sites/met1sol.sharepoint.com:/sites/TestSite', '/sites/met1sol.sharepoint.com:/sites/TestReports', '/sites/site-test/drives', '/sites/site-rep/drives',
+          `/drives/${SRC}/root:/Logistics/Test Container Sheet.xlsx`, `/drives/${REP}/root:/Shipping/Forwarder`, `/drives/${REP}/root:/Shipping/Drayage`, `/drives/${SRC}/root:/Stock/ATS`]
+          .every(p => w.calls.some(x => x.path === p && x.status === 200)), w.calls.filter(isResolve).map(x => `${x.status} ${x.path}`).join('; '));
+      const locKeys = Object.keys(s.store || {}).filter(k => k.startsWith('inv:loc:'));
+      c('the resolved ids are kept in this browser under "inv:loc:" + the exact location text',
+        Object.values(LOC).every(v => locKeys.includes('inv:loc:' + v)) && locKeys.length === 6, locKeys.join(' ; '));
       const msl = s.cards.msl;
       c(`Master Sheet Live card: ${e.msl.lines} lines, ${e.msl.open} open, ${e.msl.shipped} shipped (PO Book marks applied)`,
         pair(msl, 'Lines') === String(e.msl.lines) && pair(msl, 'Open') === String(e.msl.open) && pair(msl, 'Shipped') === String(e.msl.shipped),
@@ -561,7 +640,8 @@ const SCENARIOS = [
       c('PO Book copy check ran and matched (PO Book lines chip stays green)', w.poBookGets >= 1 && s.chips.pobook.state === 'ok', `fetched ${w.poBookGets}×`);
       c('no banner', s.banners.length === 0, JSON.stringify(s.banners));
       c('health line: all sources loaded', /All sources loaded/.test(s.health), s.health);
-      c('no email: nothing written to SharePoint', !w.calls.some(isWrite), w.calls.filter(isWrite).map(x => `${x.method} ${x.path}`).join('; '));
+      c('no email', sendMails(w.calls).length === 0);
+      c('no ⚙ Sources button and no popup in the page', !s.sourcesButton && !s.dialog);
       c(`Problems count = every issue the parsers found (${e.totalIssues})`, s.cProb === String(e.totalIssues), s.cProb);
       c('no console errors', t.console.length === 0, t.console.join(' | '));
       c('Inventory tab: a card per source', s.tabs.inv && s.cardCount === 8, `${s.cardCount} cards`);
@@ -588,45 +668,105 @@ const SCENARIOS = [
     },
   },
   {
+    name: 'ok-reload', title: 'reload in the same browser: the saved locations are reused', after: 'ok',
+    async run({ t, w, c }) {
+      const from = w.calls.length;
+      await t.reload();
+      const s = await t.snap(), calls = w.calls.slice(from);
+      greenExcept(c, s, []);
+      c('no location found afresh (no /shares, site or library lookups)', !calls.some(isLookup), calls.filter(isLookup).map(x => x.path).join('; '));
+      c('the sharing links opened straight from their saved ids', ['itm-msl', 'itm-trk'].every(id => calls.some(x => x.path === `/drives/${SRC}/items/${id}`)), calls.map(x => x.path).join('; '));
+      c('each /sites/… path looked up by its path in its saved library, not by a saved id',
+        [`/drives/${SRC}/root:/Logistics/Test Container Sheet.xlsx`, `/drives/${REP}/root:/Shipping/Forwarder`, `/drives/${REP}/root:/Shipping/Drayage`, `/drives/${SRC}/root:/Stock/ATS`]
+          .every(p => calls.some(x => x.path === p && x.status === 200)) && !calls.some(x => /\/items\/itm-(ct|fwd-dir|dray-dir|ats-dir)$/.test(x.path)),
+        calls.map(x => x.path).join('; '));
+    },
+  },
+  {
+    name: 'ct-replaced', title: 'Container Tracking renamed away and a new file saved under its name', after: 'ok-reload',
+    async run({ t, w, c }) {
+      w.o.ctReplaced = true;
+      const from = w.calls.length, dls = w.downloads.length;
+      await t.reload();
+      const s = await t.snap(), calls = w.calls.slice(from);
+      c('Container Tracking reads the new file at the path in config.js', s.chips.ct.state === 'ok' && s.chips.ct.href === webUrl('itm-ct-new') && !s.chips.ct.title.includes('OLD'),
+        `${s.chips.ct.href} | ${s.chips.ct.title}`);
+      c('the old file (same id, new name) is not opened', !calls.some(x => x.path === `/drives/${SRC}/items/itm-ct`), calls.map(x => x.path).join('; '));
+      c('the new file was downloaded', w.downloads.slice(dls).some(d => d.name === 'ct.xlsx'));
+      w.o.ctReplaced = false;
+    },
+  },
+  {
+    name: 'cfg-change', title: 'config.js points Container Tracking somewhere else: resolved afresh', after: 'ok-reload',
+    async run({ t, w, c }) {
+      w.o.sources = { ct: CT_V2 };
+      const from = w.calls.length;
+      await t.reload();
+      const s = await t.snap(), calls = w.calls.slice(from);
+      c('the new location text is resolved (its library path is looked up)', calls.some(x => x.path === `/drives/${SRC}/root:/Logistics/Test Container Sheet v2.xlsx` && x.status === 200),
+        calls.filter(isResolve).map(x => x.path).join('; '));
+      c('Container Tracking chip green, reading the new file', s.chips.ct.state === 'ok' && s.chips.ct.title.includes('Test Container Sheet v2.xlsx'), s.chips.ct.title);
+      c('the other locations are not found afresh', !calls.some(x => x.path.startsWith('/shares/') || x.path === '/sites/met1sol.sharepoint.com:/sites/TestReports' || x.path === '/sites/site-rep/drives'),
+        calls.filter(isLookup).map(x => x.path).join('; '));
+      const keys = Object.keys(s.store || {}).filter(k => k.startsWith('inv:loc:'));
+      c('the old location is dropped from this browser, the new one kept', keys.includes('inv:loc:' + CT_V2) && !keys.includes('inv:loc:' + LOC.ct), keys.join(' ; '));
+    },
+  },
+  {
     name: 'ctbad', title: 'Container Tracking has no "Quantity" column', world: { ctFile: 'ct-bad.xlsx', poBook: 'missing' },
     async run({ t, w, c, today }) {
       const s = await t.snap();
       const ct = s.chips.ct;
       c('Container Tracking chip red', ct && ct.state === 'err', ct && `${ct.state}: ${ct.text}`);
       c('chip says "missing column" and names "Quantity"', /missing column/.test(ct.text) && /"Quantity"/.test(ct.title), ct.title);
-      // Container Tracking puts the headers seen in its message; the PO Book group adds a "Headers seen:" line.
       c('Problems lists the headers seen', /headers seen[^]*Pieces/i.test(s.srows.ct), s.srows.ct);
       const red = banner(s, 'err');
       c('red banner: stage numbers not loaded, naming Container Tracking and "Quantity"', /stage numbers are not loaded/i.test(red) && red.includes('Container Tracking') && red.includes('Quantity'), red);
       greenExcept(c, s, ['ct']);
       c("PO Book lines chip says nothing when the PO Book page can't be fetched", s.chips.pobook.state === 'ok' && w.poBookGets >= 1, s.chips.pobook.text);
-      const folderMade = w.calls.findIndex(x => x.method === 'POST' && x.path === `/drives/${PROD}/root:/Inventory:/children` && x.status === 201);
-      const { puts, msg } = oneEmail(c, w, w.calls, 'Container Tracking', 'missing column "Quantity"', today);
-      c('Inventory/Errors made before the marker (path uploads make no folders)', folderMade >= 0 && puts.length && folderMade < w.calls.indexOf(puts[0]), `folder POST at ${folderMade}`);
+      const { msg } = oneEmail(c, s, w.calls, 'ct', 'missing column "Quantity"', today);
       const body = (msg.body && msg.body.content) || '';
       c('email body: file, problem, headers seen, who had the page open, link',
-        body.includes('Container Tracking Sheet.xlsx') && body.includes('Quantity') && /headers seen[^]*Pieces/i.test(body) &&
+        body.includes('Test Container Sheet.xlsx') && body.includes('Quantity') && /headers seen[^]*Pieces/i.test(body) &&
         body.includes(ACCOUNT.name) && body.includes(ACCOUNT.username) && body.includes(webUrl('itm-ct')), body);
       c('page says "Saul has been emailed about this."', red.includes('Saul has been emailed about this.') && s.srows.ct.includes('Saul has been emailed about this.'), red);
       t.shots.push(await t.shot('ctbad'));
     },
   },
   {
-    name: 'reload', title: 'same day, reload: the marker answers 409', after: 'ctbad',
-    async run({ t, w, c }) {
+    name: 'reload', title: 'same day: a reload, then the 5-minute refresh, send nothing more', after: 'ctbad',
+    async run({ t, w, c, today }) {
       const from = w.calls.length;
-      await t.eval('window.__stale = 1');
-      await t.send('Page.reload', { ignoreCache: true });
-      await t.waitFor(READY, 'the page to load again');
-      const s = await t.snap(), calls = w.calls.slice(from);
+      await t.reload();
+      let s = await t.snap();
+      const calls = w.calls.slice(from);
       c('Container Tracking chip still red', s.chips.ct.state === 'err', s.chips.ct.text);
-      const puts = markerPuts(calls);
-      c('one marker create tried, refused with 409 (already sent today)', puts.length === 1 && puts[0].status === 409, puts.map(p => p.status).join(','));
-      c('no second sendMail', sendMails(calls).length === 0, `${sendMails(calls).length} sent`);
-      c('one email in total for the day', sendMails(w.calls).length === 1, `${sendMails(w.calls).length} sent`);
-      c('Inventory/Errors not made again', !calls.some(x => x.method === 'POST' && x.path.endsWith(':/children')));
+      c('the reload read the sources again', calls.some(x => x.path === CT_PATH), `${calls.length} calls`);
+      c('no second sendMail after the reload', sendMails(calls).length === 0, `${sendMails(calls).length} sent`);
       c('page says Saul was already emailed today', banner(s, 'err').includes('Saul was already emailed about Container Tracking today.'), banner(s, 'err'));
+      const r = await runRefresh(t, w);
+      s = await t.snap();
+      c('the 5-minute refresh was waiting, and ran', r.fired === 1 && r.calls.some(x => x.path === CT_PATH), `fired ${r.fired}, ${r.calls.length} calls`);
+      c('no sendMail from the 5-minute refresh', sendMails(r.calls).length === 0, `${sendMails(r.calls).length} sent`);
+      c('one email in total for the day', sendMails(w.calls).length === 1, `${sendMails(w.calls).length} sent`);
+      c('Container Tracking still red after the refresh', s.chips.ct.state === 'err', s.chips.ct.text);
+      c(`the mark is still there ("${mailKey(today, 'ct')}")`, !!(s.store && s.store[mailKey(today, 'ct')]));
       t.shots.push(await t.shot('reload'));
+    },
+  },
+  {
+    name: 'nostorage', title: 'browser storage blocked: one email per page session', world: { ctFile: 'ct-bad.xlsx' }, init: { noStorage: true },
+    async run({ t, w, c }) {
+      let s = await t.snap();
+      c('storage really is blocked in this page', s.store === null);
+      c('the page still loads: Container Tracking red, the rest green', s.chips.ct.state === 'err' && s.chips.msl.state === 'ok' && s.chips.upc.state === 'ok', `${s.chips.ct.state} ${s.chips.msl.state} ${s.chips.upc.state}`);
+      c('one sendMail', sendMails(w.calls).length === 1, `${sendMails(w.calls).length} sent`);
+      const r = await runRefresh(t, w);
+      c('the 5-minute refresh ran and sent nothing more (the in-memory mark)', r.fired === 1 && r.calls.length > 0 && sendMails(r.calls).length === 0, `fired ${r.fired}, ${sendMails(r.calls).length} sent`);
+      const from = w.calls.length;
+      await t.reload();
+      s = await t.snap();
+      c('a reload is a new page session, so it may send once more', sendMails(w.calls.slice(from)).length === 1, `${sendMails(w.calls.slice(from)).length} sent`);
     },
   },
   {
@@ -638,7 +778,7 @@ const SCENARIOS = [
       const red = banner(s, 'err');
       c('red banner: stage numbers not loaded, naming Master Sheet Live', /stage numbers are not loaded/i.test(red) && red.includes('Master Sheet Live') && red.includes('Quantity'), red);
       greenExcept(c, s, ['msl']);
-      const { msg } = oneEmail(c, w, w.calls, 'Master Sheet Live', 'missing column "Quantity"', today);
+      const { msg } = oneEmail(c, s, w.calls, 'msl', 'missing column "Quantity"', today);
       const body = (msg.body && msg.body.content) || '';
       c('email body has a "Headers seen:" line', /^Headers seen: .*\bQty\b/m.test(body), body);
     },
@@ -655,7 +795,7 @@ const SCENARIOS = [
       c('the old file is not opened or downloaded', !w.calls.some(x => /itm-fwd-(new|old)$/.test(x.path)) && !w.downloads.some(d => d.name === 'fwd.xlsx'),
         w.downloads.map(d => d.name).join(','));
       greenExcept(c, s, ['forwarder']);
-      oneEmail(c, w, w.calls, 'Forwarder', 'not used', today);
+      oneEmail(c, s, w.calls, 'forwarder', 'not used', today);
       t.shots.push(await t.shot('fwdold'));
     },
   },
@@ -664,11 +804,33 @@ const SCENARIOS = [
     async run({ t, w, c, today }) {
       const s = await t.snap(), a = s.chips.ats;
       c('ATS chip amber "12 days old"', a.state === 'warn' && /12 days old/.test(a.text), `${a.state}: ${a.text}`);
-      c('ATS chip names the newest report, lock file skipped', a.title.includes('ats-report-new.xlsx') && !a.title.includes('~$'), a.title);
-      c('ATS report is not downloaded in step 1', !w.downloads.some(d => /ats/.test(d.name)));
+      c('ATS chip names the newest report, lock file and subfolder skipped', a.title.includes('ats-report-new.xlsx') && !a.title.includes('~$'), a.title);
+      c('ATS report is only looked at: not downloaded in step 1', !w.downloads.some(d => /ats/.test(d.name)) && !w.calls.some(x => /itm-ats-[01]/.test(x.path)));
       c('health line names ATS', s.health.includes('ATS'), s.health);
       greenExcept(c, s, []);
-      oneEmail(c, w, w.calls, 'ATS', 'the newest report is 12 days old', today);
+      oneEmail(c, s, w.calls, 'ats', 'the newest report is 12 days old', today);
+    },
+  },
+  {
+    name: 'atsfound', title: 'a recent ATS report: found, read in step 3', world: { ats: { age: 2 } },
+    async run({ t, w, c }) {
+      const s = await t.snap(), a = s.chips.ats;
+      c('ATS chip grey "read in step 3", naming the newest file', a.state === 'off' && /read in step 3/.test(a.text) && a.title.includes('Found ats-report-new.xlsx'), `${a.state}: ${a.text} | ${a.title}`);
+      c('no email', sendMails(w.calls).length === 0);
+      c('nothing downloaded from the ATS folder', !w.downloads.some(d => /ats/.test(d.name)));
+    },
+  },
+  {
+    name: 'atsmissing', title: 'no ATS folder yet', world: { ats: null },
+    async run({ t, w, c }) {
+      const s = await t.snap(), a = s.chips.ats;
+      c('ATS chip grey "no report yet"', a.state === 'off' && /no report yet/.test(a.text), `${a.state}: ${a.text}`);
+      c('the chip says where to save it', /save it into Stock\/ATS on the TestSite site/.test(a.text) && a.title.includes('Save the weekly ATS report into Stock/ATS on the TestSite site.'), `${a.text} | ${a.title}`);
+      c('the card says it too', s.cards.ats.text.includes('Save the weekly ATS report into Stock/ATS on the TestSite site.'), s.cards.ats.text);
+      c('the folder was only looked for (a 404), never made', w.calls.some(x => x.path === `/drives/${SRC}/root:/Stock/ATS` && x.status === 404));
+      c('no email, no red or amber', sendMails(w.calls).length === 0 && !banner(s, 'err') && !banner(s, 'warn'), JSON.stringify(s.banners));
+      greenExcept(c, s, []);
+      t.shots.push(await t.shot('atsmissing'));
     },
   },
   {
@@ -680,25 +842,75 @@ const SCENARIOS = [
       const red = banner(s, 'err');
       c('red banner lists the tracker and Master Sheet Live', /stage numbers are not loaded/i.test(red) && red.includes('PO Status Tracker') && red.includes('Master Sheet Live'), red);
       greenExcept(c, s, ['tracker', 'msl']);
-      const { msg } = oneEmail(c, w, w.calls, 'PO Status Tracker', 'no access', today);
+      c('the chip links to the sharing link from config.js', s.chips.tracker.href === LOC.tracker, s.chips.tracker.href);
+      const { msg } = oneEmail(c, s, w.calls, 'tracker', 'no access', today);
       const body = (msg.body && msg.body.content) || '';
-      c('email written for Saul: whose account, which file, what fixes it, what it holds up',
-        body.includes(`${ACCOUNT.name}'s account can't open`) && /What fixes it: Give Test User access/.test(body) &&
+      c('email written for Saul: whose account, what fixes it, what it holds up',
+        body.includes(`${ACCOUNT.name}'s account can't open`) && /What fixes it: Give Test User access to it, or check its location in config\.js\./.test(body) &&
         /Until then: The stage numbers stay off/.test(body) && !/Your account/.test(body) && /^Shalam Tool: PO Status Tracker — no access$/.test(msg.subject), body);
       t.shots.push(await t.shot('noaccess'));
     },
   },
   {
-    name: 'mailfail', title: 'the email itself fails (sendMail 403)', world: { ctFile: 'ct-bad.xlsx', mail: 403 },
+    name: 'linkrefused', title: 'Graph refuses both sharing links (403), as it may for a read-only sign-in', world: { shares: 403 },
     async run({ t, w, c }) {
       const s = await t.snap();
+      for (const k of ['msl', 'tracker']) {
+        const x = s.chips[k];
+        c(`${NAMES[k]} chip red "link refused", not "no access"`, x.state === 'err' && /link refused/.test(x.text) && !/no access/.test(x.text), `${x.state}: ${x.text}`);
+        c(`${NAMES[k]}: says the read-only sign-in may be why, and that a /sites/… path avoids it`,
+          x.title.includes("read-only sign-in isn't allowed to open sharing links") && x.title.includes('/sites/<site>/<library>/<path>'), x.title);
+      }
+      const red = banner(s, 'err');
+      c('red banner names both', /stage numbers are not loaded/i.test(red) && red.includes('Master Sheet Live') && red.includes('PO Status Tracker'), red);
+      greenExcept(c, s, ['msl', 'tracker']);
+      const sends = sendMails(w.calls);
+      c('one email each for the two', sends.length === 2 && ['Master Sheet Live', 'PO Status Tracker'].every(n => sends.some(x => mailText(x).subject === `Shalam Tool: ${n} — link refused`)),
+        sends.map(x => mailText(x).subject).join(' | '));
+      const body = (mailText(sends[0]).body || {}).content || '';
+      c('the email gives the right fix (not "give access")', /What fixes it: Check Test User can open the file\. If they can, the read-only sign-in can't use sharing links: replace the link in config\.js with the file's \/sites\/<site>\/<library>\/<path> location\./.test(body) &&
+        !/Give Test User access/.test(body) && !/Your account/.test(body), body);
+      t.shots.push(await t.shot('linkrefused'));
+    },
+  },
+  {
+    name: 'atsbadlib', title: 'the ATS location in config.js names a library that does not exist', world: { sources: { ats: '/sites/TestSite/Shared Docs/Stock/ATS' } },
+    async run({ t, w, c, today }) {
+      const s = await t.snap(), a = s.chips.ats;
+      c('ATS chip red "not found", naming the library, not "no report yet"', a.state === 'err' && /not found/.test(a.text) && !/no report yet/.test(a.text) &&
+        a.title.includes('No library called "Shared Docs" on /sites/TestSite'), `${a.state}: ${a.text} | ${a.title}`);
+      greenExcept(c, s, []);
+      const { msg } = oneEmail(c, s, w.calls, 'ats', 'not found', today);
+      const body = (msg.body && msg.body.content) || '';
+      c("the email's fix is about its location, not the weekly report", /What fixes it: Put it back, or update its location in config\.js/.test(body), body);
+    },
+  },
+  {
+    name: 'atsbadsite', title: 'the ATS location in config.js names a site that does not exist', world: { sources: { ats: '/sites/TestSit/Shared Documents/Stock/ATS' } },
+    async run({ t, w, c, today }) {
+      const s = await t.snap(), a = s.chips.ats;
+      c('ATS chip red "not found", naming the site, not "no report yet"', a.state === 'err' && /not found/.test(a.text) && !/no report yet/.test(a.text) &&
+        a.title.includes("There's no site /sites/TestSit on SharePoint"), `${a.state}: ${a.text} | ${a.title}`);
+      greenExcept(c, s, []);
+      oneEmail(c, s, w.calls, 'ats', 'not found', today);
+    },
+  },
+  {
+    name: 'mailfail', title: 'the email itself fails (sendMail 403)', world: { ctFile: 'ct-bad.xlsx', mail: 403 },
+    async run({ t, w, c, today }) {
+      let s = await t.snap();
       c('Container Tracking chip red and says the email failed', s.chips.ct.state === 'err' && /email failed/.test(s.chips.ct.text), s.chips.ct.text);
       c('Problems row says emailing Saul failed', /Emailing Saul failed/.test(s.srows.ct), s.srows.ct);
       c('it blames the mailbox, not SharePoint', /Emailing Saul failed: this account's mailbox didn't allow sending \(403/.test(s.srows.ct) &&
         !/Emailing Saul failed: Your account can't open it on SharePoint/.test(s.srows.ct), s.srows.ct);
       c('one sendMail tried', sendMails(w.calls).length === 1, `${sendMails(w.calls).length}`);
-      const del = w.calls.filter(x => x.method === 'DELETE');
-      c('the marker is taken back so a later visit can retry', del.length === 1 && del[0].status === 204 && w.markers.size === 0, del.map(x => `${x.status} ${x.path}`).join('; '));
+      c('the browser mark is taken back, so a later visit can try again', !!s.store && !s.store[mailKey(today, 'ct')], JSON.stringify(s.store));
+      const r = await runRefresh(t, w);
+      c('the 5-minute refresh ran and did not retry (no new sendMail this page session)', r.fired === 1 && r.calls.length > 0 && sendMails(r.calls).length === 0, `${sendMails(r.calls).length} sent`);
+      const from = w.calls.length;
+      await t.reload();
+      s = await t.snap();
+      c('a later visit (reload) tries once more', sendMails(w.calls.slice(from)).length === 1, `${sendMails(w.calls.slice(from)).length} sent`);
     },
   },
   {
@@ -706,31 +918,117 @@ const SCENARIOS = [
     async run({ t, w, c }) {
       const s = await t.snap(), p = s.chips.pobook;
       c('PO Book lines chip amber "PO Book rules changed"', p.state === 'warn' && /PO Book rules changed/.test(p.text), `${p.state}: ${p.text}`);
-      c('no email for it', sendMails(w.calls).length === 0 && markerPuts(w.calls).length === 0);
+      c('no email for it', sendMails(w.calls).length === 0);
       c('no red banner', !banner(s, 'err'), banner(s, 'err'));
       greenExcept(c, s, ['pobook']);
     },
   },
   {
-    name: 'setup', title: 'no settings.json yet: the Sources popup', world: { settings: false },
+    name: 'blank', title: 'a blank location in config.js', world: { sources: { ct: '', drayage: '   ' } },
+    async run({ t, w, c }) {
+      const s = await t.snap();
+      for (const k of ['ct', 'drayage']) {
+        c(`${NAMES[k]} chip grey "not set"`, s.chips[k].state === 'off' && /not set/.test(s.chips[k].text) && /blank/.test(s.chips[k].title), `${s.chips[k].state}: ${s.chips[k].text} | ${s.chips[k].title}`);
+      }
+      c('nothing looked up for them', !w.calls.some(x => /Logistics|Drayage|itm-ct|itm-dray/.test(x.path)), w.calls.filter(x => /Logistics|Drayage|itm-ct|itm-dray/.test(x.path)).map(x => x.path).join('; '));
+      c('no email', sendMails(w.calls).length === 0);
+      c('info banner: stage numbers not loaded, Container Tracking blank in config.js', /stage numbers are not loaded: the location of Container Tracking is blank in config\.js/.test(banner(s, 'info')), banner(s, 'info'));
+      c('no red banner', !banner(s, 'err'), banner(s, 'err'));
+      c('health line counts the sources not set', /2 sources not set in config\.js/.test(s.health), s.health);
+      greenExcept(c, s, ['ct', 'drayage']);
+      t.shots.push(await t.shot('blank'));
+    },
+  },
+  {
+    name: 'trkblank', title: "the PO Status Tracker's location is blank in config.js", world: { sources: { tracker: '' } },
+    async run({ t, w, c }) {
+      const s = await t.snap();
+      c('PO Status Tracker chip grey "not set"', s.chips.tracker.state === 'off' && /not set/.test(s.chips.tracker.text), `${s.chips.tracker.state}: ${s.chips.tracker.text}`);
+      c('Master Sheet Live grey "waiting", saying the tracker is blank in config.js', s.chips.msl.state === 'off' && /waiting/.test(s.chips.msl.text) &&
+        s.chips.msl.title.includes('whose location is blank in config.js'), `${s.chips.msl.state}: ${s.chips.msl.title}`);
+      const red = banner(s, 'err');
+      c('the red banner names the real cause: the tracker is blank in config.js', red.includes('Master Sheet Live') && red.includes('PO Status Tracker: its location is blank in config.js.'), red);
+      c('no email', sendMails(w.calls).length === 0);
+      greenExcept(c, s, ['msl', 'tracker']);
+    },
+  },
+  {
+    name: 'readonly', title: 'the sign-in carries Sites.ReadWrite.All and Files.ReadWrite.All', world: {},
+    init: { scp: 'User.Read Sites.Read.All Sites.ReadWrite.All Files.ReadWrite.All Mail.Send' }, noGraph: true,
+    async run({ t, w, c }) {
+      const s = await t.snap();
+      stopChecks(c, s, w, ['Shalam Tool must be read-only, but its sign-in still allows changes to SharePoint (Sites.ReadWrite.All, Files.ReadWrite.All). In Entra, remove that permission from the Shalam Tool app and grant consent again.']);
+      c('a fresh token was asked for once before stopping (a cached one may predate the fix)', s.forced >= 1, `${s.tokens} tokens, ${s.forced} forced`);
+      c('no 5-minute refresh waiting', (await t.eval('window.__headless.longWaiting()')) === 0);
+      t.shots.push(await t.shot('readonly'));
+    },
+  },
+  {
+    name: 'manage', title: 'the sign-in carries Sites.Manage.All (and no Sites.Read.All)', world: {},
+    init: { scp: 'User.Read Sites.Manage.All Mail.Send' }, noGraph: true,
+    async run({ t, w, c }) {
+      const s = await t.snap();
+      stopChecks(c, s, w, ['still allows changes to SharePoint (Sites.Manage.All)']);
+    },
+  },
+  {
+    name: 'noread', title: 'the sign-in is missing Sites.Read.All', world: {},
+    init: { scp: 'User.Read Mail.Send' }, noGraph: true,
+    async run({ t, w, c }) {
+      const s = await t.snap();
+      stopChecks(c, s, w, ['missing the Sites.Read.All permission', 'User.Read, Mail.Send']);
+    },
+  },
+  {
+    name: 'selected', title: 'the sign-in carries write-capable permissions with no "Write" in their names', world: {},
+    init: { scp: 'User.Read Sites.Read.All Sites.Selected Files.SelectedOperations.Selected Mail.Send.Shared Mail.Send' }, noGraph: true,
+    async run({ t, w, c }) {
+      const s = await t.snap();
+      stopChecks(c, s, w, ['still allows changes to SharePoint (Sites.Selected, Files.SelectedOperations.Selected, Mail.Send.Shared)']);
+    },
+  },
+  {
+    name: 'opaque', title: "a token the page can't decode: the sign-in service's list of permissions is used", world: {}, init: { opaque: true },
+    async run({ t, w, c }) {
+      const s = await t.snap();
+      c('no stop banner', !s.banners.some(b => b.id === 'stopBanner'), JSON.stringify(s.banners));
+      greenExcept(c, s, []);
+    },
+  },
+  {
+    name: 'opaque-write', title: "a token the page can't decode, with Sites.ReadWrite.All in the sign-in service's list", world: {},
+    init: { opaque: true, scp: 'User.Read Sites.Read.All Sites.ReadWrite.All Mail.Send' }, noGraph: true,
+    async run({ t, w, c }) {
+      const s = await t.snap();
+      stopChecks(c, s, w, ['still allows changes to SharePoint (Sites.ReadWrite.All)']);
+    },
+  },
+  {
+    name: 'opaque-none', title: "a token the page can't decode and no list of permissions", world: {}, init: { opaque: true, scp: ' ' }, noGraph: true,
+    async run({ t, w, c }) {
+      const s = await t.snap();
+      stopChecks(c, s, w, ["couldn't read which permissions its sign-in has"]);
+    },
+  },
+  {
+    name: 'readonly-later', title: 'a later token allows changes (Entra changed while the page was open)', world: { ctFile: 'ct-bad.xlsx' },
     async run({ t, w, c }) {
       let s = await t.snap();
-      c('every chip grey "not set up"', KEYS.every(k => s.chips[k] && s.chips[k].state === 'off' && /not set up/.test(s.chips[k].text)), KEYS.map(k => s.chips[k] && s.chips[k].state).join(','));
-      c('info banner asks for the sources to be set up', /set up/.test(banner(s, 'info')), banner(s, 'info'));
-      c('⚙ Sources shown to the first visitor', s.sourcesButton);
-      await t.click('#btnSources');
-      await t.waitFor(`document.getElementById('dlg').open`, 'the Sources popup');
+      c('first load ran with a read-only sign-in', s.chips.msl.state === 'ok' && sendMails(w.calls).length === 1, s.chips.msl.state);
+      const from = w.calls.length, dls = w.downloads.length;
+      await t.eval(`window.__headless.scp = 'User.Read Sites.Read.All Sites.ReadWrite.All Mail.Send'`);
+      await t.click('#btnRefresh');
+      await t.waitFor(`!!document.getElementById('stopBanner')`, 'the stop banner', 15000);
+      await t.waitFor(IDLE, 'the load to stop', 10000);
       s = await t.snap();
-      const want = ['sf_msl', 'sf_tracker', 'sf_ct', 'sf_forwarder', 'sf_drayage', 'sf_ats', 'sf_mail', 'sf_admins'];
-      c('Sources popup has a field per source, the error email and the admins', want.every(id => s.dlgFields.includes(id)), s.dlgFields.join(','));
-      c('your own address is filled in as the first admin', s.dlgAdmins.includes(ACCOUNT.username), s.dlgAdmins);
-      c('the popup has Cancel', s.dlgCancel);
-      t.shots.push(await t.shot('setup-sources'));
-      await t.click('#dCancel');
-      await t.waitFor(`!document.getElementById('dlg').open`, 'the popup to close', 5000).catch(() => {});
-      s = await t.snap();
-      c('Cancel closes the popup', !s.dlgOpen);
-      c('nothing written to SharePoint', !w.calls.some(isWrite), w.calls.filter(isWrite).map(x => `${x.method} ${x.path}`).join('; '));
+      const stop = s.banners.find(b => b.id === 'stopBanner');
+      c('red stop banner naming Sites.ReadWrite.All', !!stop && stop.text.includes('allows changes to SharePoint (Sites.ReadWrite.All)'), JSON.stringify(s.banners));
+      c('nothing requested with that token', w.calls.length === from && w.downloads.length === dls, w.calls.slice(from).map(x => `${x.method} ${x.path}`).join('; '));
+      c('what was read before is no longer shown: every chip grey "not read"', KEYS.every(k => s.chips[k].state === 'off' && /not read/.test(s.chips[k].text)),
+        KEYS.map(k => `${s.chips[k].state} ${s.chips[k].text}`).join(' | '));
+      const r = await runRefresh(t, w, false);
+      await sleep(500);
+      c('no 5-minute refresh is left waiting, and nothing more is asked for', r.fired === 0 && w.calls.length === from, `fired ${r.fired}; ${r.calls.map(x => x.path).join('; ')}`);
     },
   },
   {
@@ -749,28 +1047,15 @@ const SCENARIOS = [
       c('Container Tracking chip says cancelled', s.chips.ct.state === 'off' && /cancelled/.test(s.chips.ct.text), `${s.chips.ct.state}: ${s.chips.ct.text}`);
       c('no chip left loading, loading line gone', !s.loading.length && !s.busyShown, s.loading.join(','));
       c('page says the refresh was cancelled', /cancelled/i.test(s.toast), s.toast);
-      const notReached = ['forwarder', 'drayage', 'ats', 'upc'].filter(k => /not set up/.test(s.chips[k].text));
-      c("sources not read before the Cancel don't claim to be \"not set up\"", !notReached.length,
+      const notReached = ['forwarder', 'drayage', 'ats', 'upc'].filter(k => /not set/.test(s.chips[k].text));
+      c("sources not read before the Cancel don't claim to be \"not set\"", !notReached.length,
         notReached.map(k => `${NAMES[k]}: ${s.chips[k].state} "${s.chips[k].text}"`).join('; '));
       c('they say they were not read because of the Cancel', ['forwarder', 'drayage', 'ats', 'upc'].every(k => /not read \(cancelled\)/.test(s.chips[k].text)),
         ['forwarder', 'drayage', 'ats', 'upc'].map(k => s.chips[k].text).join(' | '));
       c("the toast doesn't claim older data is shown on a first load", !/loaded before|read before/i.test(s.toast), s.toast);
       c('the health line names what was not read', /Not read this time/.test(s.health) && s.health.includes('Container Tracking'), s.health);
-      c('no email after a cancel', !sendMails(w.calls).length && !markerPuts(w.calls).length);
+      c('no email after a cancel', !sendMails(w.calls).length);
       t.shots.push(await t.shot('cancel'));
-    },
-  },
-  {
-    name: 'settings403', title: "the sources file can't be opened (403) on the first load", world: { settings: 403 },
-    async run({ t, w, c }) {
-      const s = await t.snap();
-      const red = banner(s, 'err');
-      c("red banner: couldn't load the sources, no access to the Inventory folder", /Couldn't load the sources/.test(red) && /can't open the Inventory folder/.test(red), red);
-      const unset = KEYS.filter(k => /not set up/.test(s.chips[k].text));
-      c('no chip claims "not set up"', !unset.length, unset.map(k => `${NAMES[k]}: "${s.chips[k].text}"`).join('; '));
-      c('every chip grey "not read"', KEYS.every(k => s.chips[k].state === 'off' && /not read/.test(s.chips[k].text)), KEYS.map(k => s.chips[k].text).join(' | '));
-      c('⚙ Sources not offered', !s.sourcesButton);
-      c('nothing written to SharePoint', !w.calls.some(isWrite), w.calls.filter(isWrite).map(x => `${x.method} ${x.path}`).join('; '));
     },
   },
   {
@@ -787,20 +1072,8 @@ const SCENARIOS = [
       c('no source turned red over a sign-in problem', !redChips.length, redChips.map(k => `${NAMES[k]}: ${s.chips[k].text}`).join('; '));
       c('the chips keep what was read before, marked with when', ['msl', 'ct', 'upc'].every(k => s.chips[k].state === 'ok' && /as read/.test(s.chips[k].text)),
         ['msl', 'ct', 'upc'].map(k => `${s.chips[k].state}: ${s.chips[k].text}`).join(' | '));
-      c('no email tried', !sendMails(w.calls).length && !markerPuts(w.calls).length);
+      c('no email tried', !sendMails(w.calls).length);
       t.shots.push(await t.shot('authfail'));
-    },
-  },
-  {
-    name: 'nosettings', title: 'settings.json is gone but the Inventory folder is in use', world: { settings: false, errorsDir: true },
-    async run({ t, w, c }) {
-      const s = await t.snap();
-      const red = banner(s, 'err');
-      c('red banner: the sources file is missing', /settings\.json is missing/.test(red), red);
-      c('no info banner inviting a new first admin', !banner(s, 'info'), banner(s, 'info'));
-      c('⚙ Sources not offered to whoever opens the page', !s.sourcesButton);
-      c('health line says the sources file is missing', /Sources file missing/.test(s.health), s.health);
-      c('nothing written to SharePoint', !w.calls.some(isWrite), w.calls.filter(isWrite).map(x => `${x.method} ${x.path}`).join('; '));
     },
   },
 ];
@@ -812,7 +1085,10 @@ async function main() {
   const unknown = pick.filter(n => !SCENARIOS.some(s => s.name === n));
   if (unknown.length) { console.log(`Unknown scenario: ${unknown.join(', ')}. Known: ${SCENARIOS.map(s => s.name).join(', ')}`); process.exit(2); }
   const want = new Set(pick.length ? pick : SCENARIOS.map(s => s.name));
-  for (const s of SCENARIOS) if (want.has(s.name) && s.after) want.add(s.after);
+  for (let grew = true; grew;) {   // a scenario that runs after another needs that one (and its own) first
+    grew = false;
+    for (const s of SCENARIOS) if (want.has(s.name) && s.after && !want.has(s.after)) { want.add(s.after); grew = true; }
+  }
   const run = SCENARIOS.filter(s => want.has(s.name));
 
   mkdirSync(OUT, { recursive: true });
@@ -820,10 +1096,12 @@ async function main() {
   const today = C.todayNY(Date.now());
   const e = expected(fx, today);
   const results = [];
-  const setup = { name: 'setup checks', title: 'fixtures and harness', checks: [] };
+  const setup = { name: 'setup checks', title: 'fixtures, harness and the whole run', checks: [] };
   const sc = (label, ok, detail) => setup.checks.push({ label, ok: !!ok, detail: ok ? '' : String(detail ?? '') });
   sc('core/pobook.js block hashes to CORE_SHA256 (the fake PO Book page serves it)', fx.blockMatches);
   sc('the invented files parse and exercise the PO Book marks and issues', e.sane, JSON.stringify(e));
+  const real = readFileSync(join(REPO, 'config.js'), 'utf8');
+  sc('the test config.js is not the real one (invented locations, test client id)', !Object.values(LOC).some(v => real.includes(v)) && !real.includes(TEST_CONFIG.clientId) && !/sharepoint\.example/.test(real));
   results.push(setup);
 
   const page = pageServer(), dl = downloadServer();
@@ -831,6 +1109,8 @@ async function main() {
   await new Promise(r => dl.listen(0, '127.0.0.1', r));
   const ORIGIN = `http://127.0.0.1:${page.address().port}`;
   DL = `http://127.0.0.1:${dl.address().port}`;
+  const allowedNet = okNet(ORIGIN);
+  const allCalls = [], allDownloads = [];
 
   let edge = null;
   try {
@@ -838,7 +1118,6 @@ async function main() {
     console.log(`Edge ${edge.version}, headless, InPrivate, sync off · page ${ORIGIN} · downloads ${DL}`);
     const early = await signInWindows(edge.cdp);
     sc('Edge opened no sign-in or sync window', !early.length, early.join(', '));
-    const init = initScript(ORIGIN);
     let t = null, w = null;
     for (const s of run) {
       const checks = [];
@@ -848,16 +1127,25 @@ async function main() {
       try {
         if (!s.after) {
           if (t) await t.close();
+          if (w) { allCalls.push(...w.calls); allDownloads.push(...w.downloads); }
           w = world = newWorld(fx, s.world);
-          t = await openTab(edge.cdp, init);
+          t = await openTab(edge.cdp, initScript(ORIGIN, s.init));
           t.shots = [];
           await t.send('Page.navigate', { url: `${ORIGIN}/index.html` });
           if (s.wait !== 'busy') await t.waitFor(READY, 'the sources to load');
         }
-        const before = { blocked: t.blocked.length, exceptions: t.exceptions.length, calls: s.after ? w.calls.length : 0, downloads: s.after ? w.downloads.length : 0 };
+        const before = { blocked: t.blocked.length, exceptions: t.exceptions.length, net: s.after ? t.net.length : 0,
+          calls: s.after ? w.calls.length : 0, downloads: s.after ? w.downloads.length : 0 };
         await s.run({ t, w, c, e, today });
         // Checks every scenario gets.
         const snap = await t.snap();
+        const calls = w.calls.slice(before.calls), dls = w.downloads.slice(before.downloads), net = t.net.slice(before.net);
+        const bad = [...snap.requests.filter(x => !okPage(x)).map(x => `page asked ${x.method} ${x.url}`),
+          ...net.filter(x => !allowedNet(x)).map(x => `Edge sent ${x.method} ${x.url}`),
+          ...calls.filter(x => !okCall(x)).map(x => `Graph got ${x.method} ${x.path}`),
+          ...dls.filter(d => d.method !== 'GET').map(d => `download host got ${d.method} ${d.name}`),
+          ...w.pageGets.filter(x => x.method !== 'GET').map(x => `page host got ${x.method} ${x.path}`)];
+        c('read-only: no request but GETs and POST https://graph.microsoft.com/v1.0/me/sendMail', net.length > 0 && !bad.length, bad.join('; ') || 'no requests seen');
         c('title is "M1S · …"', /^M1S · /.test(snap.title), snap.title);
         c('fake sign-in in place: the vendored msal loaded and could not replace it', snap.msalFake && snap.msalSetTried >= 1, `fake ${snap.msalFake}, set tried ${snap.msalSetTried}`);
         const cfg = snap.msalConfig && snap.msalConfig.auth;
@@ -868,8 +1156,7 @@ async function main() {
         c('no request left 127.0.0.1', !blocked.length, blocked.join(', '));
         const ex = t.exceptions.slice(before.exceptions);
         c('no uncaught errors in the page', !ex.length, ex.join(' | '));
-        const calls = w.calls.slice(before.calls), dls = w.downloads.slice(before.downloads);
-        c('every Graph call carried a bearer token', calls.length > 0 && calls.every(x => /^Bearer \S+/.test(x.auth)), `${calls.length} calls`);
+        c('every Graph call carried a bearer token', (s.noGraph || calls.length > 0) && calls.every(x => /^Bearer \S+/.test(x.auth)), `${calls.length} calls`);
         c('file downloads went through the download link, without the token', dls.every(d => !d.auth) && !calls.some(x => x.method === 'GET' && /\/content$/.test(x.path)),
           dls.filter(d => d.auth).map(d => d.name).join(','));
         c('every Graph call was one the stand-in knows', !w.unanswered.length, w.unanswered.join('; '));
@@ -881,10 +1168,11 @@ async function main() {
       r.shots = t ? t.shots.splice(0) : [];
     }
     if (t) await t.close();
+    if (w) { allCalls.push(...w.calls); allDownloads.push(...w.downloads); }
     // The guards themselves: a request to another host must be refused by both. 127.0.0.2 is still this machine, so
     // nothing leaves it even if a guard were broken.
-    world = newWorld(fx, { settings: false });
-    t = await openTab(edge.cdp, init);
+    world = newWorld(fx, {});
+    t = await openTab(edge.cdp, initScript(ORIGIN));
     await t.send('Page.navigate', { url: `${ORIGIN}/index.html` });
     await t.waitFor(READY, 'the page to load');
     await t.eval(`(() => { new Image().src = 'http://127.0.0.2:9/guard-probe.png'; fetch('http://127.0.0.2:9/guard-probe').catch(() => {}); })()`);
@@ -893,6 +1181,12 @@ async function main() {
     sc('the request guard refuses a page request to another host', t.blocked.some(u => u.includes('guard-probe.png')), t.blocked.join(', ') || 'nothing refused');
     sc('the fake fetch refuses another host', probe.fetchBlocked.some(u => u.includes('guard-probe')), probe.fetchBlocked.join(', ') || 'nothing refused');
     await t.close();
+    // The read-only rule over the whole run, every tab: and the one POST was really seen, so the check is live.
+    const badNet = ALL_NET.filter(x => !allowedNet(x) && !/guard-probe/.test(x.url));
+    sc(`whole run: every one of ${fmtN(ALL_NET.length)} requests was a GET or the email POST`, ALL_NET.length > 0 && !badNet.length, badNet.map(x => `${x.method} ${x.url}`).join('; '));
+    sc('whole run: the stand-in got no write (no PUT, PATCH, DELETE, or POST other than /me/sendMail)', !allCalls.filter(x => !okCall(x)).length && !allDownloads.some(d => d.method !== 'GET'),
+      allCalls.filter(x => !okCall(x)).map(x => `${x.method} ${x.path}`).join('; '));
+    sc('whole run: the email POST was seen (the check above is live)', ALL_NET.some(x => x.method === 'POST' && /\/__graph\/me\/sendMail$/.test(x.url)));
   } catch (err) {
     sc('Edge started and was driven', false, err.message);
   } finally {

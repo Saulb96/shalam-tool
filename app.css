@@ -53,10 +53,9 @@ button:hover{background:#fff}
 button:disabled{opacity:.45;cursor:default}
 button.primary{color:#fff;border-color:transparent;background:linear-gradient(135deg,#2f9bd6,#1b6fae)}
 button.ghost{background:transparent;border-color:transparent;color:var(--accentink);padding:4px 6px}
-button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--sel);outline-offset:1px}
-input,select,textarea{font:inherit;border-radius:11px;border:1px solid var(--edge);background:rgba(255,255,255,.85);color:var(--ink);padding:6px 10px;outline:none}
-input:focus,select:focus,textarea:focus{box-shadow:0 0 0 3px rgba(47,155,214,.18)}
-textarea{resize:vertical;min-height:58px}
+button:focus-visible,a:focus-visible,input:focus-visible{outline:2px solid var(--sel);outline-offset:1px}
+input{font:inherit;border-radius:11px;border:1px solid var(--edge);background:rgba(255,255,255,.85);color:var(--ink);padding:6px 10px;outline:none}
+input:focus{box-shadow:0 0 0 3px rgba(47,155,214,.18)}
 .lbl{font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.12em;color:var(--muted)}
 .note{color:var(--muted);font-size:12px}
 
@@ -126,20 +125,7 @@ table.grid{border-collapse:separate;border-spacing:0;font-size:12.5px;width:max-
 .grid td.more{background:transparent;color:var(--muted)}
 .code{font-family:Consolas,"Cascadia Mono",monospace;font-size:11.5px}
 
-/* dialog, toast, spinners */
-dialog{border:none;padding:0;background:transparent;max-width:460px;width:92vw}
-dialog.wide{max-width:680px}
-dialog::backdrop{background:rgba(22,32,44,.25);backdrop-filter:blur(2px)}
-.dlg{padding:18px 20px;max-height:88vh;overflow:auto}
-.dlg h3{margin:0 0 10px;font-size:15px}
-.dlg .row{display:flex;flex-direction:column;gap:4px;margin:10px 0}
-.dlg .row .res{font-size:12px;color:var(--muted);min-height:16px;overflow-wrap:anywhere}
-.dlg .row .hint{font-size:11.5px;color:var(--muted)}
-.dlg .row .res.good{color:var(--grn)}
-.dlg .row .res.bad{color:var(--red)}
-.dlg .acts{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
-.dlg .err{color:var(--red);font-size:12px;white-space:pre-wrap}
-.dlg hr{border:none;border-top:1px solid var(--grid);margin:14px 0 4px}
+/* toast, spinners */
 #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);z-index:20;padding:9px 16px;display:none;max-width:min(680px,92vw)}
 .mini{display:inline-block;width:12px;height:12px;border:2px solid rgba(27,111,174,.25);border-top-color:var(--accentink);border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px}
 .ship{animation:bob 2.4s ease-in-out infinite;transform-origin:50% 80%}

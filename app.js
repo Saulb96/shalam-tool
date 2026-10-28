@@ -1,24 +1,20 @@
 // Shalam Tool: sign-in, reading every source from SharePoint, the source chips, the failure rules, the error email
 // and the Problems tab. Parsing lives in core/*.js; this file fetches, calls the parsers and draws.
+// The page is read-only: the one request it makes that isn't a GET is the error email (POST /me/sendMail).
 (function () {
   'use strict';
 
   const CFG = window.INV_CONFIG || {};
-  const SCOPES = ['User.Read', 'Sites.ReadWrite.All', 'Mail.Send'];
+  const SCOPES = ['User.Read', 'Sites.Read.All', 'Mail.Send'];
   const GRAPH = 'https://graph.microsoft.com/v1.0';
   const HOST = 'met1sol.sharepoint.com';
-  const SITE = HOST + ':/sites/Production';
-  const ROOT_DIR = 'Inventory';
-  const SETTINGS_PATH = 'Inventory/settings.json';
-  const ATS_DEFAULT = 'Inventory/ATS';
-  const ERR_DIR = 'Inventory/Errors';
+  const SITE = HOST + ':/sites/Production';   // where the PO_Book_Lines and UPC_MASTER lists are
   const REFRESH_MS = 5 * 60000;
   const MAX_REPORT_DAYS = 7;   // forwarder and drayage files older than this aren't used
   const AMBER_BDAYS = 2;       // ... and are amber from this many business days old
   const ATS_AMBER_DAYS = 8, ATS_MAIL_DAYS = 10;
   const ISSUE_PAGE = 200;
   const NY = 'America/New_York';
-  const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
   // A visit to .../index.html signs in as the folder address, so only one redirect address needs registering.
   const REDIRECT = location.origin + location.pathname.replace(/index\.html$/i, '');
   const POB_FIELDS = 'Title,LineKey,Kind,PONumber,Style,ParentKey,ShippedDate,ShippedBy,CRDOverride,Qty,Shipped,Data';
@@ -39,6 +35,7 @@
     return;
   }
 
+  // kind file / folder: its location (a SharePoint link or a /sites/… path) is in config.js under sources.<k>.
   const SOURCES = [
     { k: 'msl', name: 'Master Sheet Live', kind: 'file', sheet: 'Master Sheet Live', group: true },
     { k: 'tracker', name: 'PO Status Tracker', kind: 'file', sheet: 'PO Status Tracker', group: true },
@@ -52,15 +49,7 @@
   const BY_K = Object.fromEntries(SOURCES.map(x => [x.k, x]));
   const CORE_KEYS = ['msl', 'tracker', 'pobook', 'ct'];   // red here: the stage numbers are not loaded
   const REPORT_KEYS = ['forwarder', 'drayage'];            // trouble here: amber banner, numbers still shown
-
-  const FIELDS = [
-    { k: 'msl', label: 'Master Sheet Live', need: 'file', hint: 'The Master Sheet Live workbook itself.' },
-    { k: 'tracker', label: 'PO Status Tracker', need: 'file', hint: 'The workbook that has the PO Status Tracker sheet.' },
-    { k: 'ct', label: 'Container Tracking', need: 'file', hint: 'The Container Tracking Sheet workbook (Booking, Loaded, Open and Complete tabs).' },
-    { k: 'forwarder', label: 'Forwarder reports', need: 'folder', hint: "The folder the forwarder's .xlsx reports land in. The newest one is read." },
-    { k: 'drayage', label: 'Drayage reports', need: 'folder', hint: "The folder the drayage company's .csv reports land in. The newest one is read." },
-    { k: 'ats', label: 'ATS reports', need: 'folder', hint: 'The folder the weekly ATS report goes in. Leave it blank for Inventory/ATS on the Production site.' },
-  ];
+  const locText = k => String((CFG.sources && CFG.sources[k]) || '').trim();
 
   const LABELS = { rowsRead: 'Rows read', sectionRows: 'Round / section header rows', styleRows: 'Style rows', counted: 'Counted',
     notCounted: 'Not counted (listed on Problems)', roundRows: 'Round rows', records: 'Records', containers: 'Containers', rows: 'Rows',
@@ -129,9 +118,19 @@
     const d = new Date(iso);
     return iso && !isNaN(d) ? d.toLocaleString('en-US', { month: 'numeric', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : '';
   }
+  // Browser storage, every key starting "inv:". set answers whether it was kept (false when storage is blocked).
   const store = {
     get(k) { try { return localStorage.getItem('inv:' + k); } catch (e) { return null; } },
-    set(k, v) { try { localStorage.setItem('inv:' + k, v); } catch (e) { /* storage blocked: the choice just isn't remembered */ } },
+    set(k, v) { try { localStorage.setItem('inv:' + k, v); return true; } catch (e) { return false; } },
+    del(k) { try { localStorage.removeItem('inv:' + k); } catch (e) { /* storage blocked: nothing kept to remove */ } },
+    // Removes the keys under prefix that keep() turns down (old email marks, locations no longer in config.js).
+    prune(prefix, keep) {
+      try {
+        const p = 'inv:' + prefix, gone = [];
+        for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k && k.startsWith(p) && !keep(k.slice(p.length))) gone.push(k); }
+        for (const k of gone) localStorage.removeItem(k);
+      } catch (e) { /* storage blocked */ }
+    },
   };
   const human = (k, own) => (own && own[k]) || LABELS[k] || cap(String(k).replace(/([a-z])([A-Z])/g, (m, a, b) => a + ' ' + b.toLowerCase()));
   // Number fields of a parser's counts object as [label, value] rows; nested objects (one per tab) get a heading.
@@ -208,27 +207,56 @@
   // An access token. When it can't be renewed quietly, sign in again (by redirect the page leaves, so this never settles).
   // Any other failure (a timed-out renewal, no network to the sign-in service) is tagged .auth, so the page asks to sign
   // in again instead of marking the sources red.
-  async function token(force) {
+  // The sign-in result (accessToken, scopes).
+  async function rawToken(force) {
     try {
-      return (await pca.acquireTokenSilent({ scopes: SCOPES, account, forceRefresh: !!force })).accessToken;
+      return await pca.acquireTokenSilent({ scopes: SCOPES, account, forceRefresh: !!force });
     } catch (e) {
       if (!needsInteraction(e)) { if (e && typeof e === 'object') e.auth = true; throw e; }
-      if (framed) return (await pca.acquireTokenPopup({ scopes: SCOPES, account })).accessToken;
+      if (framed) return await pca.acquireTokenPopup({ scopes: SCOPES, account });
       await pca.acquireTokenRedirect({ scopes: SCOPES, account, redirectStartPage: location.href });
       return new Promise(() => {});
     }
   }
+  // Every token is checked before it is used: one that allows changes, or can't read SharePoint, stops the page (.stop).
+  // A cached token may predate a change in Entra, so a bad one is renewed once before stopping.
+  async function token(force) {
+    let r = await rawToken(force), bad = scopeProblem(r);
+    if (bad && !force) { r = await rawToken(true); bad = scopeProblem(r); }
+    if (bad) { scopeFatal = bad; throw Object.assign(new Error(bad), { stop: true }); }
+    return r.accessToken;
+  }
 
-  async function tokenScopes() {
+  // Shalam Tool must be read-only. Mail.Send (the error email) is the one permission allowed that isn't a read.
+  // The permissions come from the token's scp claim; Microsoft calls Graph tokens opaque, so if one can't be read,
+  // from the list the sign-in service returned with it (MSAL's scopes). The same rules apply to either.
+  const OIDC = /^(openid|profile|email|offline_access)$/i;
+  // A plain read: one part of its name is Read or ReadBasic (User.Read, Sites.Read.All, Mail.ReadBasic).
+  const isRead = x => x.split('.').some(p => /^Read(Basic)?$/i.test(p));
+  function scopeProblem(res) {
+    let scp = null;
     try {
-      const p = (await token()).split('.')[1];
-      return String(JSON.parse(atob(p.replace(/-/g, '+').replace(/_/g, '/'))).scp || '');
-    } catch (e) { return ''; }
+      const p = String(res && res.accessToken).split('.')[1];
+      scp = JSON.parse(atob(p.replace(/-/g, '+').replace(/_/g, '/'))).scp;
+    } catch (e) { /* not readable: the sign-in service's list below */ }
+    if (typeof scp !== 'string' && res && Array.isArray(res.scopes) && res.scopes.length) scp = res.scopes.join(' ');
+    if (typeof scp !== 'string') return "Shalam Tool couldn't read which permissions its sign-in has, so it can't make sure it is read-only and doesn't load anything. Click Sign in again; if this keeps happening, tell Saul.";
+    const list = scp.split(/\s+/).filter(Boolean);
+    // Anything with Write, Manage or FullControl in it, and anything else that isn't a plain read: Sites.Selected and
+    // the *.SelectedOperations.Selected permissions name no Write but can carry write access.
+    const writes = list.filter(x => !/^Mail\.Send$/i.test(x) && (/Write|Manage|FullControl/i.test(x) || !(isRead(x) || OIDC.test(x))));
+    if (writes.length) return `Shalam Tool must be read-only, but its sign-in still allows changes to SharePoint (${writes.join(', ')}). In Entra, remove that permission from the Shalam Tool app and grant consent again.`;
+    if (!list.some(x => /^Sites\.Read\.All$/i.test(x))) return `Shalam Tool's sign-in is missing the Sites.Read.All permission (it has: ${list.join(', ') || 'none'}), so it can't read SharePoint. In Entra, add Sites.Read.All to the Shalam Tool app and grant consent again.`;
+    mailScopeMissing = !list.some(x => /^Mail\.Send$/i.test(x));
+    return '';
   }
 
   // ---------- Graph ----------
   // 401: new token once. 429/503: wait for Retry-After, up to 3 times. Errors carry .status.
+  // Read-only: a GET, or the one POST that sends the error email. Anything else is refused before it leaves the page.
   async function g(url, opt = {}, tries = { auth: 0, busy: 0 }) {
+    const method = String(opt.method || 'GET').toUpperCase();
+    if (method !== 'GET' && !(method === 'POST' && url === '/me/sendMail')) throw new Error(`Shalam Tool is read-only, so it refused a ${method} request.`);
     const t = await token(tries.auth > 0);
     const headers = { Authorization: 'Bearer ' + t, ...(typeof opt.body === 'string' ? { 'Content-Type': 'application/json' } : {}), ...(opt.headers || {}) };
     const r = await fetch(/^https?:/.test(url) ? url : GRAPH + url, { ...opt, headers });
@@ -280,120 +308,117 @@
     return r.arrayBuffer();
   }
 
-  // ---------- the Production site and settings.json ----------
-  let siteId = null, prodDrive = null;
-  let settings = null, settingsRaw = null, settingsEtag = null, settingsState = 'unknown', settingsError = '';
-  const prodPath = p => `/drives/${prodDrive}/root:/${encPath(p)}`;
-
+  // ---------- the Production site (its lists) ----------
+  let siteId = null;
   async function ensureSite(signal) {
-    if (siteId && prodDrive) return;
-    try {
-      siteId = (await gj(`/sites/${SITE}?$select=id`, { signal })).id;
-      prodDrive = (await gj(`/sites/${siteId}/drive?$select=id`, { signal })).id;
-    } catch (e) {
-      if (e.status === 404) throw problem('not found', "The Production site, or its Documents library, couldn't be found on SharePoint (moved or renamed).");
-      throw e;
-    }
-  }
-
-  function normSettings(j) {
-    const sources = {};
-    const src = j && j.sources && typeof j.sources === 'object' ? j.sources : {};
-    for (const f of FIELDS) {
-      const v = src[f.k];
-      if (v && typeof v === 'object') sources[f.k] = { link: String(v.link || ''), driveId: String(v.driveId || ''), itemId: String(v.itemId || ''), name: String(v.name || ''), webUrl: String(v.webUrl || '') };
-    }
-    return {
-      version: 1, sources,
-      admins: Array.isArray(j && j.admins) ? j.admins.map(x => String(x).trim()).filter(Boolean) : [],
-      errorEmailTo: String((j && j.errorEmailTo) || '').trim(),
-      updatedBy: String((j && j.updatedBy) || ''), updatedAt: String((j && j.updatedAt) || ''),
-    };
-  }
-
-  async function loadSettings(signal) {
-    let it;
-    try { it = await gj(prodPath(SETTINGS_PATH), { signal }); }
+    if (siteId) return siteId;
+    try { siteId = (await gj(`/sites/${SITE}?$select=id`, { signal })).id; }
     catch (e) {
-      if (e.status !== 404) throw e;
-      settings = null; settingsRaw = null; settingsEtag = null;
-      settingsState = (await inventoryInUse(signal)) ? 'missing' : 'none';
-      return;
-    }
-    if (settingsState === 'ok' && it.eTag && it.eTag === settingsEtag) return;
-    const url = it['@microsoft.graph.downloadUrl'];
-    if (!url) throw new Error('SharePoint gave no download link for settings.json.');
-    const r = await fetchRetry(url, { signal, cache: 'no-store' });
-    if (!r.ok) { const e = new Error(`Downloading settings.json failed (${r.status}).`); e.status = r.status; throw e; }
-    const text = await r.text();
-    let j;
-    try { j = JSON.parse(text); } catch (e) { j = undefined; }
-    settingsEtag = it.eTag || null;
-    if (!j || typeof j !== 'object') {
-      settings = null; settingsRaw = null; settingsState = 'error';
-      settingsError = "Inventory/settings.json on the Production site isn't readable (it isn't valid JSON).";
-      return;
-    }
-    settingsRaw = j; settings = normSettings(j); settingsState = 'ok';
-  }
-  // settings.json answered 404. A first visit only when the Inventory folder is missing or holds nothing but ATS (made
-  // when the sources are first saved); anything else there (Errors, other files) means the file was moved or deleted,
-  // and handing the sources to whoever opens the page next would be wrong.
-  async function inventoryInUse(signal) {
-    try {
-      const kids = await gAll(prodPath(ROOT_DIR) + ':/children?$select=name&$top=999', signal);
-      return kids.some(x => String(x.name || '').toLowerCase() !== 'ats');
-    } catch (e) {
-      if (e.status === 404) return false;
+      if (e.status === 404) throw problem('not found', "The Production site couldn't be found on SharePoint (moved or renamed).");
       throw e;
     }
+    return siteId;
   }
 
-  const madeDirs = new Set();
-  // Path uploads don't create parent folders, so each folder is made first (an existing one answers 409: fine).
-  async function ensureFolder(dir, signal) {
-    let cur = '';
-    for (const seg of dir.split('/').filter(Boolean)) {
-      const parent = cur;
-      cur = cur ? cur + '/' + seg : seg;
-      if (madeDirs.has(cur)) continue;
-      try { await gj(prodPath(cur) + '?$select=id', { signal }); }
-      catch (e) {
-        if (e.status !== 404) throw e;
-        try {
-          await gj(parent ? prodPath(parent) + ':/children' : `/drives/${prodDrive}/root/children`,
-            { method: 'POST', body: JSON.stringify({ name: seg, folder: {}, '@microsoft.graph.conflictBehavior': 'fail' }), signal });
-        } catch (e2) { if (e2.status !== 409) throw e2; }
-      }
-      madeDirs.add(cur);
+  // ---------- where each file and folder is: config.js ----------
+  // A sharing link, a SharePoint address, or a /sites/<site>/<library>/<path>.
+  function readLocation(text) {
+    const t = String(text || '').trim();
+    if (!t) return null;
+    if (/^\/sites\//i.test(t)) return { kind: 'path', host: HOST, path: t };
+    if (/^https?:\/\//i.test(t)) {
+      let u;
+      try { u = new URL(t); } catch (e) { return { kind: 'bad' }; }
+      const id = u.searchParams.get('id');
+      if (id && /^\/sites\//i.test(id)) return { kind: 'path', host: u.host, path: id };
+      if (/^\/:[a-z]:\//i.test(u.pathname)) return { kind: 'share', url: t };
+      const p = safeDecode(u.pathname);
+      if (/^\/sites\//i.test(p) && !/\.aspx$/i.test(p)) return { kind: 'path', host: u.host, path: p };
+      return { kind: 'share', url: t };
     }
+    return { kind: 'bad' };
   }
-
-  async function saveSettings(obj, signal) {
-    await ensureFolder(ROOT_DIR, signal);
-    const headers = { 'Content-Type': 'application/json' };
-    let q = '';
-    if (settingsEtag) headers['If-Match'] = settingsEtag;
-    else q = '?@microsoft.graph.conflictBehavior=fail';
-    try {
-      const it = await gj(prodPath(SETTINGS_PATH) + ':/content' + q, { method: 'PUT', headers, body: JSON.stringify(obj, null, 2), signal });
-      settingsEtag = (it && it.eTag) || null;
-      settingsRaw = obj; settings = normSettings(obj); settingsState = 'ok';
-    } catch (e) {
-      if (e.status === 409 || e.status === 412) {
-        due = true;   // read their version as soon as the popup closes
-        throw new Error('Someone else saved the sources while this was open, so nothing was saved. Cancel, then open ⚙ Sources again to see their version.');
-      }
+  const shareId = u => 'u!' + btoa(unescape(encodeURIComponent(u))).replace(/=+$/, '').replace(/\//g, '_').replace(/\+/g, '-');
+  const SEL = '?$select=id,parentReference';
+  // A 404 for the file or folder itself (not its site or library) carries .missing: for ATS that means no report yet.
+  const missingItem = e => { if (e && e.status === 404) e.missing = true; return e; };
+  async function shareItem(loc, signal) {
+    let it;
+    // No "redeem" header: the link only resolves for people who already have access.
+    try { it = await gj(`/shares/${shareId(loc.url)}/driveItem${SEL}`, { signal }); }
+    catch (e) {
+      // Microsoft lists only write permissions for opening a sharing link, so a 403 may be the read-only sign-in itself.
+      if (e.status === 403) throw problem('link refused', "SharePoint refused the sharing link in config.js (403). Either your account can't open the file, or Shalam Tool's read-only sign-in isn't allowed to open sharing links; the file's /sites/<site>/<library>/<path> location in config.js doesn't need one.", { status: 403 });
+      throw missingItem(e);
+    }
+    const driveId = it.parentReference && it.parentReference.driveId;
+    if (!driveId) throw new Error("SharePoint didn't say which library this link is in.");
+    return { driveId, item: await gj(`/drives/${driveId}/items/${it.id}`, { signal }) };
+  }
+  const pathParts = loc => loc.path.split('/').filter(Boolean);
+  // The library a /sites/<site>/<library>/<path> is in: the site, then the library matched by the end of its webUrl.
+  async function pathDrive(loc, src, signal) {
+    const parts = pathParts(loc), site = parts[1], lib = parts[2];
+    let sid;
+    try { sid = (await gj(`/sites/${loc.host}:/sites/${encodeURIComponent(site)}?$select=id`, { signal })).id; }
+    catch (e) {
+      if (e.status === 404) throw problem('not found', `There's no site /sites/${site} on SharePoint, so the location in config.js for ${src.name} is wrong (or the site was renamed).`);
       throw e;
     }
+    const drives = await gAll(`/sites/${sid}/drives?$select=id,name,webUrl`, signal);
+    const d = drives.find(x => tail(x.webUrl).toLowerCase() === lib.toLowerCase()) || drives.find(x => String(x.name || '').toLowerCase() === lib.toLowerCase());
+    if (!d) throw problem('not found', `No library called "${lib}" on /sites/${site}. Its libraries: ${drives.map(x => tail(x.webUrl)).join(', ') || 'none'}.`);
+    return d.id;
+  }
+  async function pathItem(driveId, loc, signal) {
+    const rest = pathParts(loc).slice(3).join('/');
+    try { return await gj(rest ? `/drives/${driveId}/root:/${encPath(rest)}` : `/drives/${driveId}/root`, { signal }); }
+    catch (e) { throw missingItem(e); }
+  }
+  async function pathAt(loc, src, signal) {
+    const driveId = await pathDrive(loc, src, signal);
+    return { driveId, item: await pathItem(driveId, loc, signal) };
   }
 
-  const me = () => String((account && account.username) || '').toLowerCase();
-  const isAdmin = () => settingsState === 'none' || settingsState === 'error' ||
-    (settingsState === 'ok' && !!settings && settings.admins.some(a => a.toLowerCase() === me()));
+  // A source's file or folder, as Graph gives it. What a location resolves to is kept in this browser, keyed by the
+  // exact location text, so a change in config.js is resolved afresh. A sharing link follows its file wherever it
+  // moves, so it is reopened by its saved id; a /sites/… path is looked up by its path every time (only its library is
+  // saved), because a file renamed away and replaced by a new one under the old name keeps its id.
+  // Answers null when the location is blank.
+  async function locate(k, s, signal) {
+    const text = locText(k), src = BY_K[k];
+    if (!text) return null;
+    const key = 'loc:' + text;
+    let ref = null;
+    try { ref = JSON.parse(store.get(key) || 'null'); } catch (e) { ref = null; }
+    if (ref && ref.name) { s.file = ref.name; s.webUrl = ref.webUrl || ''; }   // kept if it can't be opened now
+    else if (/^https?:/i.test(text)) s.webUrl = text;
+    const loc = readLocation(text);
+    if (!loc || loc.kind === 'bad') throw problem("can't read the location", `Its location in config.js ("${text}") isn't a SharePoint link or a /sites/… path.`);
+    if (loc.kind === 'path' && pathParts(loc).length < 3) throw problem("can't read the location", 'A path needs the site, the library and the folder, like /sites/Production/Shared Documents/Folder.');
+    let at = null;
+    try {
+      if (ref && ref.driveId && (loc.kind === 'path' || ref.itemId)) {
+        try { at = { driveId: ref.driveId, item: loc.kind === 'path' ? await pathItem(ref.driveId, loc, signal) : await gj(`/drives/${ref.driveId}/items/${ref.itemId}`, { signal }) }; }
+        catch (e) { if (e.status !== 404) throw e; store.del(key); at = null; }   // gone from there: resolve the text again
+      }
+      if (!at) at = loc.kind === 'share' ? await shareItem(loc, signal) : await pathAt(loc, src, signal);
+    } catch (e) {
+      if (e.label) throw e;
+      if (e.status === 400) throw problem("can't read the location", `SharePoint didn't accept the link in config.js for ${src.name}. Copy it again (Share, then Copy link), or use a /sites/… path.`);
+      if (e.status === 404) throw problem('not found', "It isn't where config.js says it is (moved, renamed or deleted).", { status: 404, missing: !!e.missing });
+      throw e;
+    }
+    const item = at.item;
+    if (src.kind === 'file' && !item.file) throw problem("can't read the location", `config.js points ${src.name} at a folder (${item.name}); it needs the file itself.`);
+    if (src.kind === 'folder' && !item.folder) throw problem("can't read the location", `config.js points ${src.name} at a file (${item.name}); it needs the folder the reports land in.`);
+    store.set(key, JSON.stringify({ driveId: at.driveId, itemId: loc.kind === 'share' ? item.id : '', name: item.name || '', webUrl: item.webUrl || '' }));
+    return at;
+  }
+  const notSet = s => off(s, 'not set', "Its location in config.js is blank, so it isn't read.", 'location blank in config.js');
 
   // ---------- source status ----------
-  // state: ok (green) · warn (amber) · err (red) · off (grey: not set up, waiting, or no report yet) · load
+  // state: ok (green) · warn (amber) · err (red) · off (grey: not set, waiting, or no report yet) · load
   // short: the chip's second line when there is no saved date to show (the full message is in its tooltip and card).
   // stale: the time it was last read, when a later refresh couldn't read it.
   function fresh(k) {
@@ -408,7 +433,7 @@
     if (e && e.label) return { label: e.label, message: e.message, headers: e.headers || '' };
     const s = e && e.status;
     if (s === 401 || s === 403) return { label: 'no access', message: "Your account can't open it on SharePoint." };
-    if (s === 404) return { label: 'not found', message: "It isn't where ⚙ Sources points any more (moved, renamed or deleted). An admin can point to it again." };
+    if (s === 404) return { label: 'not found', message: "It wasn't found on SharePoint (moved, renamed or deleted)." };
     if (/failed to fetch|networkerror|load failed/i.test(String((e && e.message) || ''))) return { label: "can't reach", message: "Couldn't reach SharePoint. Check the connection; the page tries again in a few minutes." };
     return { label: "can't read", message: String((e && e.message) || e || 'Unknown error.') };
   }
@@ -454,18 +479,21 @@
   let loading = null, timer = null, due = false, again = false, lastLoaded = null, fatal = '', tab = 'inv';
   let fatalAuth = false;   // the fatal message asks to sign in again
   let cycleDone = false;   // a load cycle has ended (finished, cancelled or failed)
-  let scopeFatal = '';     // the sign-in lacks Sites.ReadWrite.All: nothing loads until the user signs in again
+  let scopeFatal = '';     // the sign-in isn't read-only, or can't read SharePoint: nothing loads until it's fixed
   let copyCheck = null;   // null: not known · true: same rules as the PO Book · false: the PO Book's rules changed
   let mailScopeMissing = false;
-  const mailMemo = new Map();
+  const mailMemo = new Map();   // source|day -> what happened to its email, in this page session
   // Parsed results, kept for step 2.
   const data = { po: null, ct: null, forwarder: null, drayage: null, upc: null };
 
-  function showLoading(k) { st[k] = { ...(st[k] || fresh(k)), state: 'load' }; renderSources(); }
-  function commit(k, s) { st[k] = s; renderSources(); }
+  // Once the page has stopped over its sign-in permissions, a reader finishing late shows nothing.
+  function showLoading(k) { if (scopeFatal) return; st[k] = { ...(st[k] || fresh(k)), state: 'load' }; renderSources(); }
+  function commit(k, s) { if (scopeFatal) return; st[k] = s; renderSources(); }
+  // Errors that end the whole cycle rather than one source: Cancel, the sign-in, or a token that isn't read-only.
+  const cycleError = e => isAbort(e) || !!(e && (e.auth || e.stop));
   async function attempt(s, fn) {
     try { return await fn(); }
-    catch (e) { if (isAbort(e) || (e && e.auth)) throw e; console.error(e); fail(s, e); return null; }
+    catch (e) { if (cycleError(e)) throw e; console.error(e); fail(s, e); return null; }
   }
 
   // noCancel: a step Cancel can't stop cleanly (the error email), so the Cancel buttons are hidden while it runs.
@@ -483,11 +511,10 @@
 
   // ---------- reading a file source ----------
   async function fileMeta(k, s, signal) {
-    const ref = settings.sources[k];
-    if (!ref || !ref.driveId || !ref.itemId) { off(s, 'not set up', 'Not set up yet. An admin points to it in ⚙ Sources.', 'set it in ⚙ Sources'); return null; }
-    s.file = ref.name || ''; s.webUrl = ref.webUrl || '';   // kept if the file can't be opened, for the chip and the email
-    const meta = await gj(`/drives/${ref.driveId}/items/${ref.itemId}`, { signal });
-    s.file = meta.name || ref.name || ''; s.webUrl = meta.webUrl || ref.webUrl || '';
+    const at = await locate(k, s, signal);
+    if (!at) { notSet(s); return null; }
+    const meta = at.item;
+    s.file = meta.name || s.file; s.webUrl = meta.webUrl || s.webUrl;
     s.savedAt = meta.lastModifiedDateTime || ''; s.savedBy = who(meta.lastModifiedBy);
     return meta;
   }
@@ -539,6 +566,7 @@
   async function listSource(k, s, fields, useCache, force, signal) {
     const name = BY_K[k].list;
     s.file = name + ' (list)';
+    await ensureSite(signal);
     let list;
     try { list = await gj(`/sites/${siteId}/lists/${encodeURIComponent(name)}`, { signal }); }
     catch (e) {
@@ -614,7 +642,8 @@
     }
 
     if (mrows && (!trk || S.tracker.state === 'err')) {
-      off(S.msl, 'waiting', "Not read, because it's read together with the PO Status Tracker, which didn't load.", 'read with the PO Status Tracker');
+      const why = S.tracker.label === 'not set' ? 'whose location is blank in config.js' : "which didn't load";
+      off(S.msl, 'waiting', `Not read, because it's read together with the PO Status Tracker, ${why}.`, 'read with the PO Status Tracker');
       S.msl.blocked = true;
     } else if (mrows) {
       try {
@@ -697,13 +726,12 @@
     const src = BY_K[k], s = fresh(k);
     showLoading(k);
     await attempt(s, async () => {
-      const ref = settings.sources[k];
-      if (!ref || !ref.driveId || !ref.itemId) return off(s, 'not set up', 'Not set up yet. An admin points to the folder in ⚙ Sources.', 'set it in ⚙ Sources');
-      s.file = ref.name || ''; s.webUrl = ref.webUrl || '';   // kept if the folder can't be opened
-      const folder = await gj(`/drives/${ref.driveId}/items/${ref.itemId}?$select=id,name,webUrl,folder`, { signal });
-      s.file = folder.name || ''; s.webUrl = folder.webUrl || ref.webUrl || '';
+      const at = await locate(k, s, signal);
+      if (!at) return notSet(s);
+      const drive = at.driveId, folder = at.item;
+      s.file = folder.name || s.file; s.webUrl = folder.webUrl || s.webUrl;
       setBusy(`Looking in the ${src.name} folder…`);
-      const kids = await gAll(`/drives/${ref.driveId}/items/${ref.itemId}/children?$select=id,name,lastModifiedDateTime,lastModifiedBy,file,folder,webUrl,size&$top=999`, signal);
+      const kids = await gAll(`/drives/${drive}/items/${folder.id}/children?$select=id,name,lastModifiedDateTime,lastModifiedBy,file,folder,webUrl,size&$top=999`, signal);
       const SH = window.InvShipping;
       const maxDays = SH.MAX_REPORT_DAYS ?? MAX_REPORT_DAYS, tries = SH.TRY_FILES ?? 3;
       const cands = SH.pickNewest(kids, src.ext, today) || [];
@@ -714,13 +742,13 @@
         const f = itemOf(c);
         if (c.tooOld) { stale = { f, c }; break; }   // the rest are older still
         try {
-          const meta = await gj(`/drives/${ref.driveId}/items/${f.id}`, { signal });
+          const meta = await gj(`/drives/${drive}/items/${f.id}`, { signal });
           const r = await parseReport(k, meta, today, force, signal);
           if (r && r.ok) { used = { meta, c, r }; break; }
           lastBad = r;
           failed.push(`${f.name}: ${(r && r.error) || 'nothing usable in it'}`);
         } catch (e) {
-          if (isAbort(e) || (e && e.auth)) throw e;
+          if (cycleError(e)) throw e;
           failed.push(`${f.name}: ${describe(e).message}`);
         }
       }
@@ -754,25 +782,27 @@
     commit(k, s);
   }
 
-  // ---------- ATS: step 1 only looks for the newest report ----------
+  // ---------- ATS: step 1 only looks for the newest report (it is read in step 3; nothing is ever uploaded) ----------
+  // Where to save the report, in plain words: "Inventory/ATS on the Production site" for /sites/Production/<library>/Inventory/ATS.
+  function atsPlace() {
+    const parts = locText('ats').split('/').filter(Boolean);
+    return /^\/sites\//i.test(locText('ats')) && parts.length > 3 ? `${parts.slice(3).join('/')} on the ${parts[1]} site` : 'the ATS folder set in config.js';
+  }
   async function loadAts(today, signal) {
     const s = fresh('ats');
     showLoading('ats');
+    const noReport = () => off(s, 'no report yet', `No ATS report yet. Save the weekly ATS report into ${atsPlace()}.`, `save it into ${atsPlace()}`);
     await attempt(s, async () => {
-      const ref = settings.sources.ats;
-      const custom = !!(ref && ref.driveId && ref.itemId);
-      const base = custom ? `/drives/${ref.driveId}/items/${ref.itemId}` : prodPath(ATS_DEFAULT);
-      let folder;
-      try { folder = await gj(base + '?$select=id,name,webUrl,folder', { signal }); }
-      catch (e) {
-        if (e.status === 404 && !custom) return off(s, 'no report yet', `There's no ${ATS_DEFAULT} folder on the Production site yet. The weekly ATS report goes there.`, 'weekly report goes in Inventory/ATS');
-        throw e;
-      }
-      s.file = folder.name || ''; s.webUrl = folder.webUrl || '';
-      const kids = (await gAll(base + (custom ? '/children' : ':/children') + '?$select=id,name,lastModifiedDateTime,lastModifiedBy,file,webUrl&$top=999', signal))
+      let at;
+      try { at = await locate('ats', s, signal); }
+      catch (e) { if (e.missing) return noReport(); throw e; }   // only the folder itself missing; a wrong site or library stays red
+      if (!at) return notSet(s);
+      const folder = at.item;
+      s.file = folder.name || s.file; s.webUrl = folder.webUrl || s.webUrl;
+      const kids = (await gAll(`/drives/${at.driveId}/items/${folder.id}/children?$select=id,name,lastModifiedDateTime,lastModifiedBy,file,webUrl&$top=999`, signal))
         .filter(x => x.file && !/^~\$/.test(x.name || ''));
       s.rows = [['Files in the folder', kids.length]];
-      if (!kids.length) return off(s, 'no report yet', 'No ATS report in the folder yet.', 'no file in the folder yet');
+      if (!kids.length) return noReport();
       const f = kids.slice().sort((a, b) => String(b.lastModifiedDateTime).localeCompare(String(a.lastModifiedDateTime)))[0];
       s.file = f.name; s.webUrl = f.webUrl || s.webUrl; s.savedAt = f.lastModifiedDateTime || ''; s.savedBy = who(f.lastModifiedBy);
       const ms = Date.parse(f.lastModifiedDateTime);
@@ -835,26 +865,30 @@
     if (s.state === 'ok') warn(s, 'PO Book rules changed', note);
   }
 
-  // ---------- the error email: once per source per day ----------
+  // ---------- the error email: once per source per day in each browser ----------
   function recipientName(addr) {
-    const a = String(addr || '').trim();
-    if (!a) return '';
-    if (account && a.toLowerCase() === me() && account.name) return String(account.name).split(/\s+/)[0];
-    const local = a.split('@')[0];
-    return /^[a-z]{2,}$/i.test(local) ? local[0].toUpperCase() + local.slice(1).toLowerCase() : a;
+    const named = String(CFG.errorEmailName || '').trim();
+    if (named) return named;
+    const local = addr.split('@')[0];
+    return /^[a-z]{2,}$/i.test(local) ? local[0].toUpperCase() + local.slice(1).toLowerCase() : addr;
   }
   // What fixes it, and what it holds up, in the email.
   const NEXT = {
     'missing column': 'Put the column back with the name shown, or have the page updated to the new name.',
     'missing tab': 'Put the tab back with the name shown, or have the page updated to the new name.',
-    'not found': 'Point ⚙ Sources at it again: it was moved, renamed or deleted.',
+    'not found': 'Put it back, or update its location in config.js: it was moved, renamed or deleted.',
+    "can't read the location": 'Fix its location in config.js.',
     empty: 'Open the file and check its rows are still there (it may have been cleared or saved over).',
     "can't read the file": 'Open the file and check it opens in Excel; save it again if it is damaged.',
   };
   function nextStep(src, s, user) {
-    if (s.label === 'no access') return `Give ${user} access to it, or check the link in ⚙ Sources.`;
+    if (s.label === 'link refused') return `Check ${user} can open the file. If they can, the read-only sign-in can't use sharing links: replace the link in config.js with the file's /sites/<site>/<library>/<path> location.`;
+    // The lists' names are in the page itself, not in config.js.
+    if (src.kind === 'list' && s.label === 'no access') return `Give ${user} access to the Production site.`;
+    if (src.kind === 'list' && s.label === 'not found') return `Check the Production site and its ${src.list} list are still there under those names, or have the page updated to the new names.`;
+    if (s.label === 'no access') return `Give ${user} access to it, or check its location in config.js.`;
     if (src.k === 'forwarder' && s.state === 'warn') return "Check the forwarder's report is still arriving in the folder.";
-    if (src.k === 'ats') return 'Check the weekly ATS report is still being saved to the folder.';
+    if (src.k === 'ats' && s.state === 'warn') return 'Check the weekly ATS report is still being saved to the folder.';
     return NEXT[s.label] || 'Open it and check it; the page tries again every 5 minutes while it is open.';
   }
   function effectOf(src) {
@@ -868,7 +902,9 @@
     const when = new Date().toLocaleString('en-US', { timeZone: NY, month: 'numeric', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }) + ' New York time';
     const user = (account && (account.name || account.username)) || 'The person who had the page open';
     // Written for Saul as the reader: "your account" on the screen is the account of whoever had the page open.
-    const what = s.label === 'no access' ? `${user}'s account can't open ${s.file || 'it'} on SharePoint${s.status ? ` (${s.status})` : ''}.` : `${s.label}. ${s.message}`;
+    const what = s.label === 'no access' ? `${user}'s account can't open ${s.file || 'it'} on SharePoint${s.status ? ` (${s.status})` : ''}.`
+      : s.label === 'link refused' ? `SharePoint refused the sharing link in config.js when ${user} opened the page (${s.status || 403}): either that account can't open the file, or Shalam Tool's read-only sign-in isn't allowed to open sharing links.`
+        : `${s.label}. ${s.message}`;
     const lines = [
       `Shalam Tool has a problem with ${src.name}.`,
       '',
@@ -887,7 +923,7 @@
       `Link to the file: ${s.webUrl || 'none'}`,
       `Shalam Tool: ${REDIRECT}`,
       '',
-      'This email is sent once per source per day, from the mailbox of whoever has the page open.');
+      'This email is sent once per source per day from each browser that has the page open, from the mailbox of whoever is signed in.');
     return {
       message: {
         subject: `Shalam Tool: ${src.name} — ${s.mailProblem}`,
@@ -906,53 +942,54 @@
     if (e && (e.name === 'TimeoutError' || isAbort(e))) return 'the mail server took too long to answer.';
     return /failed to fetch|networkerror|load failed/i.test(String((e && e.message) || '')) ? "couldn't reach Microsoft 365." : String((e && e.message) || e);
   }
-  // The email step isn't stopped by Cancel (stopping between the marker and the send would mean no email today), so
-  // Cancel is hidden while it runs; each call has a time limit instead, so a stalled request can't hold the page.
+  // Once per source per day (New York date) in this browser: the mark is checked and set before sending, in browser
+  // storage and in memory, so neither a reload nor the 5-minute refresh sends it again. With storage blocked, the
+  // in-memory mark alone allows one per page session. Old marks are removed.
+  const mailedNow = new Set();
+  function claimMail(day, k) {
+    const key = `mailed:${day}:${k}`;
+    store.prune('mailed:', rest => rest.startsWith(day + ':'));
+    if (mailedNow.has(key)) return false;
+    mailedNow.add(key);
+    if (store.get(key)) return false;
+    store.set(key, new Date().toISOString());
+    return true;
+  }
+  // The email step isn't stopped by Cancel (stopping between the mark and the send would mean no email today), so
+  // Cancel is hidden while it runs; the send has a time limit instead, so a stalled request can't hold the page.
   async function emailProblems(today) {
-    const to = settings && settings.errorEmailTo;
-    const name = recipientName(to);
+    const to = String(CFG.errorEmailTo || '').trim();
+    const name = to ? recipientName(to) : '';
     const day = window.InvCommon.isoDay(today);
-    const lim = () => timed(null, 30000);
     for (const src of SOURCES) {
       const s = st[src.k];
       if (!s || !s.mailProblem || (s.state !== 'err' && s.state !== 'warn')) continue;
-      if (!to) { s.mail = { state: 'none', text: 'No error email address is set yet: an admin adds one in ⚙ Sources.' }; continue; }
-      const key = src.k + '|' + day;
-      if (mailMemo.has(key)) { s.mail = mailMemo.get(key); continue; }
-      setBusy(`Emailing ${name} about ${src.name}… (finishes in a moment)`, true);
-      const path = `${ERR_DIR}/${day} ${src.name}.json`;
+      if (!to) { s.mail = { state: 'none', text: 'No error email address is set in config.js, so nobody is emailed about this.' }; continue; }
+      const memo = src.k + '|' + day;
+      if (mailMemo.has(memo)) { s.mail = mailMemo.get(memo); continue; }
       let mail;
-      try {
-        await ensureFolder(ERR_DIR, lim());
-        // Written only once per source and day: a second writer gets 409 and doesn't send.
-        await g(prodPath(path) + ':/content?@microsoft.graph.conflictBehavior=fail', { method: 'PUT', signal: lim(),
-          body: JSON.stringify({ source: src.name, problem: s.mailProblem, by: (account && account.username) || '', at: new Date().toISOString() }) });
-      } catch (e) {
-        if (e && e.auth) throw e;
-        const why = e.status ? describe(e).label : (e.name === 'TimeoutError' || isAbort(e)) ? 'it took too long' : describe(e).label;
-        mail = e.status === 409
-          ? { state: 'already', text: `${name} was already emailed about ${src.name} today.` }
-          : { state: 'failed', text: `Emailing ${name} failed: the page couldn't note today's email in ${ERR_DIR} (${why}), so it didn't send.` };
-        mailMemo.set(key, mail); s.mail = mail;
-        continue;
+      if (!claimMail(day, src.k)) {
+        mail = { state: 'already', text: `${name} was already emailed about ${src.name} today.` };
+      } else {
+        setBusy(`Emailing ${name} about ${src.name}… (finishes in a moment)`, true);
+        try {
+          await g('/me/sendMail', { method: 'POST', signal: timed(null, 30000), body: JSON.stringify(mailBody(src, s, to)) });
+          mail = { state: 'sent', text: `${name} has been emailed about this.` };
+          toast(`${name} has been emailed about ${src.name}.`, 6000);
+        } catch (e) {
+          if (cycleError(e)) { store.del(`mailed:${day}:${src.k}`); mailedNow.delete(`mailed:${day}:${src.k}`); throw e; }
+          mail = { state: 'failed', text: `Emailing ${name} failed: ${mailFailText(e)} Tell ${name} about the problem above.` };
+          // A later visit can try again; this page session doesn't (the memo below), so a failing mailbox isn't retried every 5 minutes.
+          store.del(`mailed:${day}:${src.k}`);
+        }
       }
-      try {
-        await g('/me/sendMail', { method: 'POST', signal: lim(), body: JSON.stringify(mailBody(src, s, to)) });
-        mail = { state: 'sent', text: `${name} has been emailed about this.` };
-        toast(`${name} has been emailed about ${src.name}.`, 6000);
-      } catch (e) {
-        if (e && e.auth) throw e;
-        mail = { state: 'failed', text: `Emailing ${name} failed: ${mailFailText(e)} Tell ${name} about the problem above.` };
-        // Take the marker back so a later visit can try again.
-        try { await g(prodPath(path), { method: 'DELETE', signal: lim() }); } catch (e2) { /* it stays: nobody emails about this today */ }
-      }
-      mailMemo.set(key, mail); s.mail = mail;
+      mailMemo.set(memo, mail); s.mail = mail;
     }
   }
 
   // ---------- the load cycle ----------
   // After a cancelled or failed cycle: a source read in this cycle keeps its new state; any other keeps what was read
-  // before, marked with when that was, or, if it was never read, says so (never "not set up"). Returns how many were
+  // before, marked with when that was, or, if it was never read, says so (never "not set"). Returns how many were
   // read in this cycle.
   function keepUnread(before, label, message, short) {
     let read = 0;
@@ -965,10 +1002,19 @@
     return read;
   }
 
+  // The sign-in isn't read-only, or can't read SharePoint: nothing is shown as read, and nothing more is requested.
+  function stopAll() {
+    fatal = scopeFatal; fatalAuth = true;
+    st = {};
+    for (const x of SOURCES) { const s = fresh(x.k); off(s, 'not read', 'Not read: Shalam Tool stopped because of its sign-in permissions (see the red banner).', 'see the red banner'); st[x.k] = s; }
+    for (const k of Object.keys(data)) data[k] = null;
+    lastLoaded = null;
+  }
+
   async function loadAll(force) {
     if (loading) { if (force) again = true; return; }
     if (!account) return;
-    if (scopeFatal) { fatal = scopeFatal; fatalAuth = true; renderAll(); return; }   // only signing in again helps
+    if (scopeFatal) { stopAll(); cycleDone = true; renderAll(); return; }   // only fixing the permission and signing in again helps
     const ctl = new AbortController(), signal = ctl.signal;
     loading = ctl;
     const before = { ...st };
@@ -976,27 +1022,20 @@
     fatal = ''; fatalAuth = false;
     setBusy('Connecting to SharePoint…');
     try {
-      await ensureSite(signal);
-      setBusy('Reading the sources list…');
-      await loadSettings(signal);
-      $('btnSources').hidden = !isAdmin();
-      if (!settings) {
-        const why = settingsState === 'error' ? "The sources file can't be read." : settingsState === 'missing' ? 'The sources file is missing.' : 'Not set up yet.';
-        st = {};
-        for (const x of SOURCES) { const s = fresh(x.k); off(s, settingsState === 'none' ? 'not set up' : 'no sources file', why); st[x.k] = s; }
-      } else {
-        // Master Sheet Live, the tracker and Container Tracking first; UPC_MASTER last.
-        await Promise.all([loadPoGroup(force, signal), loadCT(today, force, signal)]);
-        await Promise.all([loadReport('forwarder', today, force, signal), loadReport('drayage', today, force, signal), loadAts(today, signal)]);
-        await loadUpc(force, signal);
-        if (force || copyCheck == null) await checkPoBookCopy(signal);
-        if (signal.aborted) throw abortErr();
-        applyCopyCheck();
-        await emailProblems(today);
-      }
+      // Master Sheet Live, the tracker and Container Tracking first; UPC_MASTER last.
+      await Promise.all([loadPoGroup(force, signal), loadCT(today, force, signal)]);
+      await Promise.all([loadReport('forwarder', today, force, signal), loadReport('drayage', today, force, signal), loadAts(today, signal)]);
+      await loadUpc(force, signal);
+      if (force || copyCheck == null) await checkPoBookCopy(signal);
+      if (signal.aborted) throw abortErr();
+      applyCopyCheck();
+      await emailProblems(today);
       lastLoaded = Date.now();
     } catch (e) {
-      if (isAbort(e)) {
+      if (e && e.stop) {
+        ctl.abort();   // stop the other sources still reading
+        stopAll();
+      } else if (isAbort(e)) {
         again = false;   // a Refresh clicked during the load doesn't restart it after Cancel
         const read = keepUnread(before, 'not read (cancelled)', 'Loading was cancelled before this was read. Click Refresh to read it.', 'click Refresh');
         toast(lastLoaded ? 'Refresh cancelled. Sources not read this time show what was read before, with its time.'
@@ -1009,8 +1048,7 @@
           fatalAuth = true;
           fatal = `Your sign-in needs renewing (${(e.errorCode || e.message || String(e)).slice(0, 80)}). Click Sign in again; nothing is lost.`;
         } else {
-          const d = describe(e);
-          fatal = d.label === 'no access' ? "Your account can't open the Inventory folder on the Production site on SharePoint." : d.message;
+          fatal = describe(e).message;
         }
         keepUnread(before, 'not read', `Not read: ${fatalAuth ? 'the sign-in needs renewing' : "the sources couldn't be loaded"} (see the red banner).`, 'see the red banner');
       }
@@ -1025,15 +1063,15 @@
 
   function schedule() {
     clearTimeout(timer);
-    if (!account) return;
+    if (!account || scopeFatal) return;   // stopped over the sign-in's permissions: only Sign in again helps
     timer = setTimeout(() => {
-      if (document.hidden || $('dlg').open || loading) { due = true; schedule(); }
+      if (document.hidden || loading) { due = true; schedule(); }
       else loadAll(false);
     }, REFRESH_MS);
   }
 
   // ---------- drawing ----------
-  // A source with no state yet is waiting for its turn, never "not set up" (only settings say that).
+  // A source with no state yet is waiting for its turn, never "not set" (only a blank location in config.js says that).
   const baseWord = s => (s.state === 'load' ? 'loading' : s.state === 'ok' ? 'ok' : s.label || (s.state === 'off' ? 'waiting' : s.state));
   const staleWord = s => (s.stale ? 'as read ' + fmtShort(new Date(s.stale).toISOString()) : '');
   const statusWord = s => (s.stale ? (s.state === 'ok' ? '' : baseWord(s) + ', ') + staleWord(s) : baseWord(s));
@@ -1075,53 +1113,45 @@
 
   function renderHealth() {
     const el = $('health');
-    if (fatal) { el.innerHTML = `<span class="r"><b>Couldn't load</b></span>`; return; }
+    if (scopeFatal) { el.innerHTML = `<span class="r"><b>Stopped: sign-in permissions</b></span>`; el.title = scopeFatal; return; }
+    if (fatal) { el.innerHTML = `<span class="r"><b>Couldn't load</b></span>`; el.title = ''; return; }
     if (!cycleDone) { el.innerHTML = ''; return; }
-    if (!settings && settingsState !== 'unknown') {
-      el.innerHTML = settingsState === 'error' ? `<span class="r"><b>Sources file unreadable</b></span>`
-        : settingsState === 'missing' ? `<span class="r"><b>Sources file missing</b></span>` : `<span class="a"><b>Sources not set up yet</b></span>`;
-      el.title = '';
-      return;
-    }
     const bad = SOURCES.filter(x => st[x.k] && (st[x.k].state === 'err' || st[x.k].state === 'warn'));
     if (bad.length) {
       el.innerHTML = bad.map(x => `<span class="${st[x.k].state === 'err' ? 'r' : 'a'}"><b>${esc(x.name)}</b> ${esc(statusWord(st[x.k]))}</span>`).join(' · ');
       el.title = bad.map(x => `${x.name}: ${st[x.k].message}`).join('\n');
       return;
     }
-    const unset = SOURCES.filter(x => st[x.k] && st[x.k].state === 'off' && st[x.k].label === 'not set up').length;
+    const unset = SOURCES.filter(x => st[x.k] && st[x.k].state === 'off' && st[x.k].label === 'not set').length;
     const notRead = SOURCES.filter(x => !st[x.k] || st[x.k].stale || /^not read/.test(st[x.k].label || ''));
     if (notRead.length) {
       el.innerHTML = `<span class="a"><b>Not read this time:</b> ${esc(notRead.map(x => x.name).join(', '))}</span>`;
       el.title = 'Click Refresh to read them.';
       return;
     }
-    el.innerHTML = `<span class="g">${unset ? 'Every set-up source loaded' : 'All sources loaded'}</span> at ${esc(new Date(lastLoaded || Date.now()).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }))}${unset ? ` · ${plural(unset, 'source')} not set up` : ''}`;
+    el.innerHTML = `<span class="g">${unset ? 'All sources with a location loaded' : 'All sources loaded'}</span> at ${esc(new Date(lastLoaded || Date.now()).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }))}${unset ? ` · ${plural(unset, 'source')} not set in config.js` : ''}`;
     el.title = '';
   }
 
-  function banner(kind, html, withButton) {
-    return `<div class="banner ${kind}"><div class="bt">${html}</div>${withButton && isAdmin() ? '<button type="button" data-act="sources">⚙ Sources</button>' : ''}</div>`;
-  }
+  const banner = (kind, html) => `<div class="banner ${kind}"><div class="bt">${html}</div></div>`;
   // A message after "Source:" reads on from the colon ("PO Status Tracker: your account can't open it…").
   const onFromColon = m => String(m || '').replace(/^(Your|Not|It|The|No|Missing|Couldn't|Reading|Used|There|Nothing|Found)\b/, w => w.toLowerCase());
   function renderBanners() {
     const out = [];
-    if (fatal) out.push(`<div class="banner err"><div class="bt"><b>Couldn't load the sources.</b> ${esc(fatal)}</div>${fatalAuth ? '<button type="button" data-act="signin">Sign in again</button>' : ''}</div>`);
-    else if (settingsState === 'error') out.push(banner('err', `<b>The stage numbers are not loaded:</b> ${esc(settingsError)} ${isAdmin() ? 'Open ⚙ Sources and save to replace it.' : 'An admin can open ⚙ Sources and save it again.'}`, true));
-    else if (settingsState === 'missing') out.push(banner('err', `<b>The stage numbers are not loaded:</b> ${esc(SETTINGS_PATH)} is missing from the Production site, though the Inventory folder is in use (moved or deleted?). Saul can put it back from the site's recycle bin or the folder's version history; until then nobody can open ⚙ Sources.`));
-    else if (settingsState === 'none') out.push(banner('info', '<b>The sources aren\'t set up yet.</b> Open ⚙ Sources and point the page at each file. Whoever sets them up first becomes the first admin.', true));
-    else if (settings) {
+    if (scopeFatal) out.push(`<div class="banner err" id="stopBanner"><div class="bt"><b>Stopped: nothing is loaded.</b> ${esc(scopeFatal)}</div><button type="button" data-act="signin">Sign in again</button></div>`);
+    else if (fatal) out.push(`<div class="banner err"><div class="bt"><b>Couldn't load the sources.</b> ${esc(fatal)}</div>${fatalAuth ? '<button type="button" data-act="signin">Sign in again</button>' : ''}</div>`);
+    else {
       const red = CORE_KEYS.filter(k => st[k] && (st[k].state === 'err' || st[k].blocked));
-      const unset = CORE_KEYS.filter(k => st[k] && st[k].state === 'off' && st[k].label === 'not set up');
+      const unset = CORE_KEYS.filter(k => st[k] && st[k].state === 'off' && st[k].label === 'not set');
       if (red.length) {
+        // A blank location is part of the cause too (Master Sheet Live waits on a blank PO Status Tracker), so it's listed here.
         const items = red.map(k => {
           const s = st[k];
           return `<li><b>${esc(BY_K[k].name)}</b>: ${esc(onFromColon(s.message || s.label))}${s.mail ? ` <i>${esc(s.mail.text)}</i>` : ''}</li>`;
-        }).join('');
+        }).concat(unset.map(k => `<li><b>${esc(BY_K[k].name)}</b>: its location is blank in config.js.</li>`)).join('');
         out.push(banner('err', `<b>The stage numbers are not loaded.</b> They come back once this is fixed:<ul>${items}</ul>`));
       } else if (unset.length) {
-        out.push(banner('info', `<b>The stage numbers are not loaded:</b> ${esc(unset.map(k => BY_K[k].name).join(', '))} ${unset.length === 1 ? "isn't" : "aren't"} set up yet.`, true));
+        out.push(banner('info', `<b>The stage numbers are not loaded:</b> the location of ${esc(unset.map(k => BY_K[k].name).join(', '))} is blank in config.js.`));
       }
       const amb = REPORT_KEYS.filter(k => st[k] && (st[k].state === 'warn' || st[k].state === 'err'));
       if (amb.length) {
@@ -1136,7 +1166,7 @@
   }
 
   function renderSrcTable() {
-    let h = '<thead><tr><th class="fz">Source</th><th>File<th>Saved</th><th>Saved by</th><th class="num">Read</th><th class="num">Counted</th><th>Status</th><th>Message</th></tr></thead><tbody>';
+    let h = '<thead><tr><th class="fz">Source</th><th>File</th><th>Saved</th><th>Saved by</th><th class="num">Read</th><th class="num">Counted</th><th>Status</th><th>Message</th></tr></thead><tbody>';
     for (const src of SOURCES) {
       const s = st[src.k] || fresh(src.k);
       const file = s.file ? (s.webUrl ? `<a href="${esc(s.webUrl)}" target="_blank" rel="noopener">${esc(s.file)}</a>` : esc(s.file)) : '';
@@ -1193,7 +1223,6 @@
 
   function renderAll() {
     renderSources(); renderHealth(); renderBanners(); renderProblems();
-    $('btnSources').hidden = !account || settingsState === 'unknown' || !isAdmin();
   }
 
   function showTab(t) {
@@ -1207,165 +1236,11 @@
     store.set('tab', t);
   }
 
-  // ---------- dialog and toast ----------
-  const dlg = $('dlg');
-  let dlgCtl = null;
-  function openDlg(title, body, okLabel, onOk, wide) {
-    dlg.classList.toggle('wide', !!wide);
-    $('dlgBody').innerHTML = `<h3>${esc(title)}</h3>${body}<div class="err" id="dErr"></div><div class="acts"><button type="button" id="dCancel">Cancel</button>${okLabel ? `<button type="button" class="primary" id="dOk">${esc(okLabel)}</button>` : ''}</div>`;
-    dlg.showModal();
-    $('dCancel').onclick = () => { if (dlgCtl) { dlgCtl.abort(); $('dCancel').textContent = 'Stopping…'; } else dlg.close(); };
-    dlg.oncancel = e => { if (dlgCtl) { e.preventDefault(); dlgCtl.abort(); } };
-    if (onOk) $('dOk').onclick = async () => {
-      $('dErr').textContent = ''; $('dOk').disabled = true;
-      dlgCtl = new AbortController();
-      try { const keep = await onOk(dlgCtl.signal); if (!keep) dlg.close(); }
-      catch (err) { $('dErr').textContent = isAbort(err) ? 'Stopped.' : err.message; }
-      finally { dlgCtl = null; if (dlg.open) { $('dOk').disabled = false; $('dCancel').textContent = 'Cancel'; } }
-    };
-  }
-  dlg.addEventListener('close', () => { if (due && !document.hidden) { due = false; loadAll(false); } });
+  // ---------- toast ----------
   function toast(t, ms = 3500) {
     const el = $('toast');
     el.textContent = t; el.style.display = 'block';
     clearTimeout(el._t); el._t = setTimeout(() => { el.style.display = 'none'; }, ms);
-  }
-
-  // ---------- ⚙ Sources ----------
-  // A sharing link, a SharePoint address, a /sites/<site>/<library>/<path>, or a path in Production's Documents library.
-  function readLocation(text) {
-    const t = String(text || '').trim();
-    if (!t) return null;
-    if (/^\/sites\//i.test(t)) return { kind: 'path', host: HOST, path: t };
-    if (/^https?:\/\//i.test(t)) {
-      let u;
-      try { u = new URL(t); } catch (e) { return { kind: 'bad' }; }
-      const id = u.searchParams.get('id');
-      if (id && /^\/sites\//i.test(id)) return { kind: 'path', host: u.host, path: id };
-      if (/^\/:[a-z]:\//i.test(u.pathname)) return { kind: 'share', url: t };
-      const p = safeDecode(u.pathname);
-      if (/^\/sites\//i.test(p) && !/\.aspx$/i.test(p)) return { kind: 'path', host: u.host, path: p };
-      return { kind: 'share', url: t };
-    }
-    if (/^[a-z][a-z0-9+.-]*:/i.test(t)) return { kind: 'bad' };
-    return { kind: 'prod', path: t.replace(/^\/+/, '') };
-  }
-  const shareId = u => 'u!' + btoa(unescape(encodeURIComponent(u))).replace(/=+$/, '').replace(/\//g, '_').replace(/\+/g, '-');
-  const SEL = '?$select=id,name,webUrl,file,folder,parentReference';
-  const info = (driveId, it) => ({ driveId, itemId: it.id, name: it.name || '', webUrl: it.webUrl || '', isFile: !!it.file, isFolder: !!it.folder });
-  async function resolveLocation(loc, signal) {
-    if (loc.kind === 'share') {
-      // No "redeem" header: the link only resolves for people who already have access.
-      const it = await gj(`/shares/${shareId(loc.url)}/driveItem${SEL}`, { signal });
-      const d = it.parentReference && it.parentReference.driveId;
-      if (!d) throw new Error("SharePoint didn't say which library this is in.");
-      return info(d, await gj(`/drives/${d}/items/${it.id}${SEL}`, { signal }));
-    }
-    if (loc.kind === 'prod') {
-      return info(prodDrive, await gj(prodPath(loc.path) + SEL, { signal }));
-    }
-    const parts = loc.path.split('/').filter(Boolean);
-    if (parts.length < 3) throw new Error('A path needs the site, the library and the folder, like /sites/Production/Shared Documents/Folder.');
-    const sitePath = '/sites/' + encodeURIComponent(parts[1]), lib = parts[2], rest = parts.slice(3).join('/');
-    const sid = (await gj(`/sites/${loc.host}:${sitePath}?$select=id`, { signal })).id;
-    const drives = await gAll(`/sites/${sid}/drives?$select=id,name,webUrl`, signal);
-    const d = drives.find(x => tail(x.webUrl).toLowerCase() === lib.toLowerCase()) || drives.find(x => String(x.name || '').toLowerCase() === lib.toLowerCase());
-    if (!d) throw new Error(`No library called "${lib}" on /sites/${parts[1]}. Its libraries: ${drives.map(x => tail(x.webUrl)).join(', ') || 'none'}.`);
-    return info(d.id, await gj(rest ? `/drives/${d.id}/root:/${encPath(rest)}${SEL}` : `/drives/${d.id}/root${SEL}`, { signal }));
-  }
-  function resolveMessage(e) {
-    if (e && e.status === 403) return "No access: your account can't open this.";
-    if (e && e.status === 404) return 'Not found: nothing at this link or path. Check it opens in the browser.';
-    if (e && e.status === 400) return "SharePoint didn't accept this link. Copy it again (Share, then Copy link), or use a /sites/… path.";
-    return (e && e.message) || String(e);
-  }
-
-  function openSources() {
-    const cur = settings || normSettings({});
-    const admins = cur.admins.length ? cur.admins : [account.username || ''];
-    const fieldHtml = f => {
-      const v = cur.sources[f.k];
-      const res = v && v.name ? `<span>✓ ${esc(v.name)}</span>` : '';
-      const ph = f.need === 'file' ? 'SharePoint link to the file' : 'SharePoint link, or /sites/…/folder';
-      return `<div class="row"><label class="lbl" for="sf_${f.k}">${esc(f.label)} · ${f.need}</label>` +
-        `<input id="sf_${f.k}" value="${esc(v ? v.link : '')}" placeholder="${esc(f.k === 'ats' ? 'Blank = Inventory/ATS on the Production site' : ph)}" autocomplete="off" spellcheck="false">` +
-        `<div class="hint">${esc(f.hint)}</div><div class="res${res ? ' good' : ''}" id="sr_${f.k}">${res}</div></div>`;
-    };
-    const intro = settingsState === 'none'
-      ? "<p class=\"note\">Nobody has set the sources up yet. You'll be the first admin.</p>"
-      : settingsState === 'error'
-        ? `<p class="note">${esc(settingsError)} Saving replaces it.</p>`
-        : `<p class="note">Last saved${cur.updatedAt ? ' ' + esc(fmtLong(cur.updatedAt)) : ''}${cur.updatedBy ? ' by ' + esc(cur.updatedBy) : ''}.</p>`;
-    const body = intro +
-      '<p class="note">For a file, paste its SharePoint link (Share, then Copy link). For a folder, its link, the browser\'s address bar while the folder is open, or a path like /sites/Production/Shared Documents/Folder. Each one is opened and checked when you save.</p>' +
-      '<p class="note">UPC_MASTER and PO Book lines are read from the Production site\'s lists: nothing to paste for them.</p>' +
-      FIELDS.map(fieldHtml).join('') +
-      '<hr>' +
-      `<div class="row"><label class="lbl" for="sf_mail">Error email to</label><input id="sf_mail" type="email" value="${esc(cur.errorEmailTo)}" placeholder="name@company.com" autocomplete="off"><div class="res">Gets one email per source per day when a source fails or a report is too old. Needed: without it, nobody hears about a failure.</div></div>` +
-      `<div class="row"><label class="lbl" for="sf_admins">Admins (one email per line)</label><textarea id="sf_admins" rows="3" spellcheck="false">${esc(admins.join('\n'))}</textarea><div class="res">Admins can open ⚙ Sources.</div></div>`;
-    openDlg('Sources', body, 'Save', saveSources, true);
-  }
-
-  async function saveSources(signal) {
-    const prev = settings || normSettings({});
-    const mail = $('sf_mail').value.trim();
-    const adminList = [...new Set($('sf_admins').value.split(/[\s,;]+/).map(x => x.trim()).filter(Boolean))];
-    const errs = [];
-    if (!mail) errs.push("Error email to: add an address, or failures won't be emailed to anyone.");
-    else if (!EMAIL_RE.test(mail)) errs.push("Error email to: that isn't an email address.");
-    const bad = adminList.filter(a => !EMAIL_RE.test(a));
-    if (bad.length) errs.push(`Admins: not email addresses: ${bad.join(', ')}.`);
-    if (!adminList.some(a => a.toLowerCase() === me())) errs.push("Admins: add your own address, or you won't be able to open Sources again.");
-    if (errs.length) throw new Error(errs.join('\n'));
-    if (!prodDrive) await ensureSite(signal);
-
-    const sources = {};
-    let failed = 0;
-    for (const f of FIELDS) {
-      const text = $('sf_' + f.k).value.trim(), out = $('sr_' + f.k), old = prev.sources[f.k];
-      out.className = 'res';
-      if (!text) {
-        if (f.k !== 'ats') { out.textContent = 'Not set: this source stays grey until it is.'; continue; }
-        out.innerHTML = '<span class="mini"></span> Making Inventory/ATS on the Production site…';
-        try {
-          await ensureFolder(ATS_DEFAULT, signal);
-          const r = info(prodDrive, await gj(prodPath(ATS_DEFAULT) + SEL, { signal }));
-          sources.ats = { link: '', driveId: r.driveId, itemId: r.itemId, name: r.name, webUrl: r.webUrl };
-          out.className = 'res good'; out.textContent = '✓ Inventory/ATS on the Production site';
-        } catch (e) {
-          if (isAbort(e)) throw e;
-          sources.ats = { link: '' };
-          out.textContent = `Inventory/ATS on the Production site (couldn't make the folder now: ${resolveMessage(e)})`;
-        }
-        continue;
-      }
-      out.innerHTML = '<span class="mini"></span> Checking…';
-      try {
-        let r;
-        if (old && old.link === text && old.driveId && old.itemId) {
-          r = info(old.driveId, await gj(`/drives/${old.driveId}/items/${old.itemId}${SEL}`, { signal }));
-        } else {
-          const loc = readLocation(text);
-          if (!loc || loc.kind === 'bad') throw new Error("That doesn't look like a SharePoint link or a /sites/… path.");
-          r = await resolveLocation(loc, signal);
-        }
-        if (f.need === 'file' && !r.isFile) throw new Error("That's a folder: this needs the file itself.");
-        if (f.need === 'folder' && !r.isFolder) throw new Error("That's a file: this needs the folder the reports land in.");
-        sources[f.k] = { link: text, driveId: r.driveId, itemId: r.itemId, name: r.name, webUrl: r.webUrl };
-        out.className = 'res good'; out.textContent = '✓ ' + r.name;
-      } catch (e) {
-        if (isAbort(e)) throw e;
-        failed++;
-        out.className = 'res bad'; out.textContent = resolveMessage(e);
-      }
-    }
-    if (failed) throw new Error(`${plural(failed, 'source')} couldn't be opened. Fix or clear the ones marked in red, then Save again.`);
-    const obj = { ...(settingsRaw || {}), version: 1, sources, admins: adminList, errorEmailTo: mail,
-      updatedBy: account.name || account.username || '', updatedAt: new Date().toISOString() };
-    await saveSettings(obj, signal);
-    toast('Sources saved. Reading them now…');
-    setTimeout(() => loadAll(true), 0);
-    return false;
   }
 
   // ---------- start ----------
@@ -1375,12 +1250,11 @@
     $('who').innerHTML = `<b>${esc(account.name || account.username || '')}</b><button type="button" class="ghost" id="btnSignout" title="Sign out of Shalam Tool">Sign out</button>`;
     $('btnSignout').onclick = signOut;
     showTab(store.get('tab') || 'inv');
+    store.prune('loc:', text => SOURCES.some(x => locText(x.k) === text));   // locations no longer in config.js
+    scopeFatal = '';
     renderAll();
-    const scp = await tokenScopes();
-    scopeFatal = scp && !/\bSites\.ReadWrite\.All\b/i.test(scp)
-      ? `Your sign-in is missing the Sites.ReadWrite.All permission (it has: ${scp}). Saul grants it in Entra with admin consent; then click Sign in again.`
-      : '';
-    mailScopeMissing = !!scp && !/\bMail\.Send\b/i.test(scp);
+    // Every request checks its token's permissions before it is sent (g), so one that allows changes stops the load
+    // before anything is read.
     loadAll(true);
   }
 
@@ -1399,17 +1273,13 @@
     $('btnSignin').onclick = signIn;
     $('btnRefresh').onclick = () => loadAll(true);
     $('btnCancelBusy').onclick = $('btnCancelLoad').onclick = () => { if (loading) loading.abort(); };
-    $('btnSources').onclick = openSources;
-    $('banners').addEventListener('click', e => {
-      if (e.target.closest('[data-act="sources"]')) openSources();
-      else if (e.target.closest('[data-act="signin"]')) reSignIn();
-    });
+    $('banners').addEventListener('click', e => { if (e.target.closest('[data-act="signin"]')) reSignIn(); });
     $('tabs').addEventListener('click', e => { const b = e.target.closest('.tab'); if (b) showTab(b.dataset.tab); });
     let qt = null;
     $('pq').addEventListener('input', e => { clearTimeout(qt); qt = setTimeout(() => { pq = e.target.value.trim(); renderIssues(); }, 150); });
     $('issTable').addEventListener('click', e => { const b = e.target.closest('button[data-more]'); if (b) { expanded.add(b.dataset.more); renderIssues(); } });
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden && due && !dlg.open && account) { due = false; loadAll(false); }
+      if (!document.hidden && due && account) { due = false; loadAll(false); }
     });
   }
 
