@@ -25,7 +25,7 @@ test('UPC_MASTER items become lookups by style and by UPC; problems are listed, 
   ];
   const r = U.fromListItems(items);
   assert.equal(r.ok, true);
-  assert.deepEqual(r.counts, { rows: 13, used: 11, styles: 8, upcs: 7, badUpc: 3, noUpc: 1, noStyle: 3, dupUpc: 1, repeats: 1 });
+  assert.deepEqual(r.counts, { rows: 13, used: 11, styles: 8, upcs: 7, badUpc: 3, noUpc: 1, noStyle: 3, upcOnly: 2, dupUpc: 1, repeats: 1 });
 
   const ab = r.byStyle.get('AB100');
   assert.deepEqual(ab.map(e => e.upc), ['012345678905', '012345678912']);
@@ -42,10 +42,24 @@ test('UPC_MASTER items become lookups by style and by UPC; problems are listed, 
   assert.equal(r.byStyle.get('IJ501')[0].upcRaw, '12345678905');
   assert.ok(r.byStyle.has('RM 2201') && r.byStyle.has('RM2201'));
 
+  // Items 3 and 8 (a good UPC, no style) are one summary line at the end; item 9 (no style, bad UPC) is listed.
   assert.deepEqual(r.issues.map(i => `${i.row} ${i.code}`),
-    ['3 nostyle', '4 noupc', '5 badupc', '6 dupupc', '7 repeat', '8 nostyle', '9 badupc', '9 nostyle', '11 badupc']);
+    ['4 noupc', '5 badupc', '6 dupupc', '7 repeat', '9 badupc', '9 nostyle', '11 badupc', ' upconly']);
   assert.ok(r.issues.every(i => i.source === 'UPC_MASTER' && i.message));
   assert.match(r.issues.find(i => i.code === 'dupupc').message, /GH400.*AB100/);
+  const one = r.issues.find(i => i.code === 'upconly');
+  assert.equal(one.count, 2);
+  assert.match(one.message, /^2 rows have only a UPC, with no style.*012345678929, 012345678936\.$/);
+});
+
+test('thousands of UPC-only rows are one line on Problems', () => {
+  n = 0;
+  const items = [it({ Style: 'A1', UPC: '012345678905' })];
+  for (let k = 0; k < 5000; k++) items.push(it({ UPC: String(990000000000 + k) }));
+  const r = U.fromListItems(items);
+  assert.equal(r.counts.upcOnly, 5000);
+  assert.deepEqual(r.issues.map(i => i.code), ['upconly']);
+  assert.match(r.issues[0].message, /^5,000 rows have only a UPC/);
 });
 
 test('every item gets a result: used, or an issue', () => {

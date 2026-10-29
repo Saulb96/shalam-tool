@@ -53,7 +53,8 @@
 
   const LABELS = { rowsRead: 'Rows read', sectionRows: 'Round / section header rows', styleRows: 'Style rows', counted: 'Counted',
     notCounted: 'Not counted (listed on Problems)', roundRows: 'Round rows', records: 'Records', containers: 'Containers', rows: 'Rows',
-    styles: 'Styles', upcs: 'UPCs', badUpc: 'Bad UPCs (listed, not fixed)', noStyle: 'No style', dupUpc: 'UPC on two styles',
+    styles: 'Styles', upcs: 'UPCs', badUpc: 'Bad UPCs (listed, not fixed)', noStyle: 'No style',
+    upcOnly: 'Only a UPC (one line on Problems)', dupUpc: 'UPC on two styles',
     noUpc: 'No UPC', used: 'Items used', repeats: 'Same UPC and style twice', blank: 'Blank rows', blankRows: 'Blank rows',
     otherRows: 'Rows with no style (product lines listed on Problems)', blocks: 'POs', units: 'Units', rounds: 'Rounds',
     noId: 'No shipment ID', noContainer: 'No container number', duplicates: 'Repeated containers',
@@ -84,6 +85,7 @@
     'unknown-availability': 'Availability not known', 'unknown-status': 'Status not known', 'newer-file-not-read': "Newer file couldn't be read",
     // UPC_MASTER and PO Book lines
     noupc: 'No UPC', badupc: 'UPC not 12-13 digits', dupupc: 'UPC on two styles', repeat: 'Same UPC and style twice',
+    upconly: 'Rows with only a UPC',
     'no-linekey': 'Item with no LineKey',
   };
   const codeLabel = c => CODE_LABELS[c] || (c ? String(c).replace(/-/g, ' ') : '(no code)');

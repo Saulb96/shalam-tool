@@ -20,9 +20,11 @@
   // byStyle: normStyle -> [entry] (one per UPC; an item with no good UPC still gives the style its description).
   // byUpc: upc -> entry of the first item with that UPC. entry = { upc (or null), upcRaw, style, styleRaw, desc,
   // category, sub, brand, itemId }.
+  // A good UPC with no style is one summary line, not one issue per item: UPC_MASTER holds thousands of them (8,788 on
+  // Oct 29), and listing each buried the problems someone can fix (Saul, Oct 29).
   function fromListItems(items) {
-    const byStyle = new Map(), byUpc = new Map(), issues = [];
-    const counts = { rows: 0, used: 0, styles: 0, upcs: 0, badUpc: 0, noUpc: 0, noStyle: 0, dupUpc: 0, repeats: 0 };
+    const byStyle = new Map(), byUpc = new Map(), issues = [], upcOnly = [];
+    const counts = { rows: 0, used: 0, styles: 0, upcs: 0, badUpc: 0, noUpc: 0, noStyle: 0, upcOnly: 0, dupUpc: 0, repeats: 0 };
     const issue = (row, code, message) => issues.push({ source: SOURCE, code, row, message });
 
     for (const it of items || []) {
@@ -41,7 +43,10 @@
 
       if (!upcRaw) { counts.noUpc++; issue(itemId, 'noupc', `No UPC on ${where}`); }
       else if (!upc) { counts.badUpc++; issue(itemId, 'badupc', `UPC "${upcRaw}" on ${where} isn't 12 or 13 digits: left as it is, not matched`); }
-      if (!style) { counts.noStyle++; issue(itemId, 'nostyle', upc ? `No style for UPC ${upc}: matched by UPC only` : 'No style and no usable UPC: not used'); }
+      if (!style) {
+        counts.noStyle++;
+        if (upc) { counts.upcOnly++; upcOnly.push(upc); } else issue(itemId, 'nostyle', 'No style and no usable UPC: not used');
+      }
 
       let used = false;
       if (upc) {
@@ -62,6 +67,12 @@
         byStyle.set(style, list);
       }
       if (used) counts.used++;
+    }
+    if (upcOnly.length) {
+      const n = upcOnly.length.toLocaleString('en-US');
+      issues.push({ source: SOURCE, code: 'upconly', row: '', count: upcOnly.length,
+        message: `${n} ${upcOnly.length === 1 ? 'row has' : 'rows have'} only a UPC, with no style, so ${upcOnly.length === 1 ? 'it' : 'they'} can't be tied to a style. ` +
+          `For example UPC ${upcOnly.slice(0, 3).join(', ')}.` });
     }
     counts.styles = byStyle.size;
     counts.upcs = byUpc.size;
