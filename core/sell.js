@@ -8,18 +8,33 @@
 // - Pull-from date (Saul's rule) in China: 10 days before the ETD; no ETD, 5 days before the ready date (CRD); no ready
 //   date, about 75 days after the order date (an estimate). Sailed lots are available on their ETA.
 // - Arriving comes from the ERP's ATS report (Saul, Oct 30): for a style on it, each In Trans quantity with its ETA is a
-//   lot (the same snapshot as the stock). Our own on-the-water / at-port lots are matched to it: when the ERP has as much
-//   or more, ours are counted there (not again), and the rest of its In Trans is goods we still see on a vessel in China
-//   (Booked / Loaded with an ETD, earliest ETD first, taken off those lots), then landed but not received yet (on its
-//   shipments due on or before the report's day), then In Trans due after it that our shipping data doesn't show sailed.
+//   lot (the same snapshot as the stock). Its In Trans is the truth for what has left China and not been received:
+//   nothing is offered twice (as Arriving and again from China) and no unit vanishes. Our own on-the-water / at-port
+//   lots are matched to its shipments first (one of the same quantity, then the closest ETA). When the ERP has as much or
+//   more, ours are counted there (not again), and the rest of its In Trans is placed in turn:
+//   1. landed, not received yet: our Landed goods of the style with an ETA (else ETD) from 60 days before the report's
+//      day up to today take it up to their units (on its shipments due by that day, or due no more than 14 days after
+//      their own date: one due later has left China per the ERP), then its shipments due on or before the report's day
+//      (nothing comes off China for these). With an Import PO Backlog, only what's beyond our China goods the backlog no
+//      longer has (they have left China per the ERP: step 2 takes them first) is called landed;
+//   2. left China per the ERP (shipments due after the report's day, or with no ETA, and what step 1 left): taken off our
+//      lots still in China, Booked / Loaded with an ETD first (earliest ETD first), then lots on a PO whose 6-digit base
+//      is one Container Tracking shows sailed or landed for the style (or the shipment's own PO, when the report has
+//      one), then any other (earliest pull-from date first); never taking our China goods below the report's Import PO
+//      Backlog for the style (sold goods count until they're loaded: its backlog has sold goods booked or ready, never
+//      those already loaded);
+//   3. what's still unplaced stays Arriving and is listed, one line per style.
 //   When the ERP has less, a shipment and one of ours of the same quantity are matched first; of the rest, ours with an
 //   ETA on or before the report's day are received (in its In WH, dropped; never more than the style's In WH), and what's
-//   left is kept as Arriving from our data (not on the ERP's In Trans yet). A style not on the report, or no report: our
-//   own sailed lots, as before. Every unit is accounted for: each lot's units = matched + received + in the ERP's
-//   transit + taken by orders + available.
-// - Cross-checks, listed and never counted (Saul decides): In Trans our data doesn't show sailed while Container Tracking
-//   has the style sailed under a PO with no Master Sheet line and the Master Sheet still has goods in China (maybe offered
-//   twice); units taken into the ERP's transit that its Import PO Backlog says are still in China.
+//   left is kept as Arriving from our data (not on the ERP's In Trans yet). Then, as far as our China goods are beyond
+//   its backlog, its In Trans due after the report's day matched to ours with an ETA on or before that day is taken off
+//   China instead and those of ours received. A style not on the report, or no report: our own sailed lots, as before.
+//   An Import PO Backlog part below zero or that isn't a number makes the style's backlog unknown (no limit, listed).
+//   Every unit is accounted for: each lot's units = matched + received + in the ERP's transit + taken by orders +
+//   available; the ERP's In Trans = matched + landed + taken off China + unplaced.
+// - Guards (a failure is a bug, said so on Problems): nothing is In Trans landed or unplaced while our goods in China
+//   beyond the report's Import PO Backlog are still offered (offered twice; with no backlog, unplaced while any are), and
+//   nothing comes off China below that backlog.
 // - Customer orders come off stock first, then the lots in date order; what's left is oversold. Cases are whole cases.
 // Pure: no network, no DOM; today (a day number) is passed in. Loads in the page (window.InvSell, after core/common.js)
 // and in Node (module.exports).
@@ -40,7 +55,17 @@
     water: 'On the water', port: 'At port', erp: 'In transit (ERP)' };
   // In China, on a vessel already (the ERP may count it in transit): Booked or Loaded, with an ETD.
   const ON_VESSEL = ['booked', 'loaded'];
+  // The order our lots still in China come off when the ERP counts goods of the style in transit beyond ours: on a vessel,
+  // on a PO that has sailed, any other.
+  const TIERS = ['vessel', 'po', 'other'];
   const DAYS_BEFORE_ETD = 10, DAYS_BEFORE_CRD = 5, DAYS_AFTER_ORDER = 75, DISAGREE_DAYS = 7;
+  // Our Landed goods this recent (ETA, else ETD, from this many days before the report's day up to today) may be what
+  // the ERP still has In Trans: landed, not received yet.
+  const LANDED_DAYS = 60;
+  // ... on the ERP's shipments due by the report's day, or due after it but no more than this many days after their date.
+  const LANDED_LATE_DAYS = 14;
+  // Container Tracking's stages for goods that have left China.
+  const CT_GONE = ['On the water', 'At port', 'Landed'];
   // The ready date's sources, first one with a date wins.
   const READY_ORDER = ['ctReady', 'poBook', 'factoryCrd', 'crdExpected', 'shipBy'];
   const READY_LABEL = { ctReady: "Container Tracking's Ready Date", poBook: "the PO Book's date", factoryCrd: 'Factory CRD',
@@ -51,8 +76,15 @@
   // The totals counted in cases too, then (units only) Arriving by where it comes from (after customer orders) and how
   // our own lots meet the ERP's In Trans.
   const CASE_KEYS = ['now', 'fromChina', 'arriving', 'total', 'soldChina', 'oversold', 'ordersTaken'];
-  const TOTAL_KEYS = [...CASE_KEYS, 'arrivingErp', 'arrivingOurs', 'erpInTrans', 'ourIncoming', 'matchedOurs', 'receivedDropped',
-    'inErpTransitTaken', 'landedNotReceived', 'erpUnmatched', 'keptExtra', 'receivedCapped', 'maybeTwice', 'takenInBacklog'];
+  // The ERP's In Trans against our lots, per style and in total (units): matched, landed (ours, or due by the report's
+  // day; landedLater: ours on shipments due after it, within 14 days of their date), taken off China (by tier;
+  // takenDueBy: on shipments due by the report's day, as its backlog no longer has them in China), unplaced
+  // (unplacedInChina: while our sheets still show the style in China); received / kept when it has less; offeredTwice is
+  // the guard (always 0).
+  const ERP_KEYS = ['erpInTrans', 'ourIncoming', 'matchedOurs', 'receivedDropped', 'inErpTransitTaken', 'landedNotReceived',
+    'landedOurs', 'landedDue', 'landedLater', 'erpUnplaced', 'unplacedInChina', 'keptExtra', 'receivedCapped',
+    'takenOnVessel', 'takenSamePo', 'takenOther', 'takenDueBy', 'offeredTwice'];
+  const TOTAL_KEYS = [...CASE_KEYS, 'arrivingErp', 'arrivingOurs', ...ERP_KEYS];
   // Our sheets' stages for goods that have sailed or arrived (a sold line at another stage is still in China).
   const GONE_STAGES = ['On the water', 'At port', 'Landed', 'Shipped'];
   // Units of a lot the ERP's report already counts (not available here): matched to its In Trans, received, or in transit.
@@ -71,6 +103,8 @@
   const FLOOR = C.ymd(2015, 1, 1);
   const farDay = (d, today) => isDay(today) && (d > today + 366 || d < FLOOR);
   const byPo = (a, b) => String(a).localeCompare(String(b), undefined, { numeric: true });
+  // A PO's 6-digit base ("900601" of "900601A" or "900437-BCF"), '' when it has none.
+  const base6 = po => { const m = String(po ?? '').match(/^(\d{6})/); return m ? m[1] : ''; };
 
   // The synced ready date of one allocation's dates: { readyDate, readyFrom, sources: [{ key, day, far }], spread, disagree }.
   // The first source with a date wins, skipping a date more than a year ahead or before 2015 (a wrong year: kept in
@@ -139,8 +173,10 @@
       // The ERP's In Trans against our own lots (styles / lots / units):
       erpStyles: 0, erpLots: 0, erpLotsNoEta: 0, erpEtaMismatchStyles: 0, erpInTransUnknownStyles: 0, noInTransColumn: atsOk && !transKnown,
       erpMoreStyles: 0, erpLessStyles: 0, matchedLots: 0, receivedStyles: 0, receivedLots: 0, inErpTransitStyles: 0, inErpTransitLots: 0,
-      landedNotReceivedStyles: 0, keptExtraStyles: 0, keptExtraLots: 0, noReportDayStyles: 0,
-      erpUnmatchedStyles: 0, sameQtyMatchedLots: 0, receivedCappedStyles: 0, maybeTwiceStyles: 0, takenInBacklogStyles: 0,
+      inErpTransitTierLots: Object.fromEntries(TIERS.map(k => [k, 0])), landedNotReceivedStyles: 0, landedOursStyles: 0, landedDueStyles: 0,
+      landedLaterStyles: 0, keptExtraStyles: 0, keptExtraLots: 0, noReportDayStyles: 0, erpUnplacedStyles: 0, unplacedInChinaStyles: 0,
+      backlogGuardStyles: 0, sameQtyMatchedLots: 0, receivedCappedStyles: 0, offeredTwiceStyles: 0,
+      backlogUnknownStyles: 0, takenDueByStyles: 0, lessTakenStyles: 0,
       soldInOrdersStyles: 0, soldInOrdersUnits: 0, soldInOrdersOversold: 0,
     };
 
@@ -148,23 +184,31 @@
     const lots = [], soldBy = new Map(), soldCasesBy = new Map(), soldNoPackBy = new Map(), unmatchedBy = new Map();
     const latestMaster = new Map();   // style -> { row, master } of its latest Master Sheet line with a Master
     const knownStyles = new Set();    // every style on any Master Sheet Live or Container Tracking line
-    // For the cross-checks with the ERP's report: Container Tracking units on the water or at port with no Master Sheet
-    // line for them (unmatched, or more than the sheet), and sold units still in China (its backlog counts those too).
-    const ctSailedNoLineBy = new Map(), soldInChinaBy = new Map();
+    // For placing the ERP's In Trans beyond our sailed goods: our Landed goods (not sold: { po, units, day, dayFrom }),
+    // the PO bases Container Tracking shows sailed or landed, and sold units still in China before they're loaded (the
+    // report's Import PO Backlog has sold goods booked or ready, never those already loaded).
+    const landedBy = new Map(), goneBasesBy = new Map(), soldInChinaBy = new Map();
     const add = (m, k, n) => m.set(k, (m.get(k) || 0) + n);
+    const soldA = a => a.ptype === 'China Pickup' || (a.flags || []).includes('pull-section');
     for (const a of stages.allocs) {
       knownStyles.add(a.style);
       if (a.sheetRow != null && isDay(a.master) && a.master > 0) {
         const p = latestMaster.get(a.style);
         if (!p || a.sheetRow > p.row) latestMaster.set(a.style, { row: a.sheetRow, master: a.master });
       }
-      if ((a.bucket === 'unmatched' || a.bucket === 'ctMore') && (a.stage === 'On the water' || a.stage === 'At port') && a.units > 0) add(ctSailedNoLineBy, a.style, a.units);
+      // Container Tracking's own stage when the allocation has one (a line with no Container Tracking units has '').
+      if (a.units > 0 && CT_GONE.includes(a.ctStage || a.stage) && base6(a.po)) (goneBasesBy.get(a.style) || goneBasesBy.set(a.style, new Set()).get(a.style)).add(base6(a.po));
+      if (a.bucket === 'landed' && a.units > 0 && !soldA(a)) {
+        const day = isDay(a.eta) ? a.eta : isDay(a.delivered) ? a.delivered : isDay(a.etd) ? a.etd : null;
+        (landedBy.get(a.style) || landedBy.set(a.style, []).get(a.style)).push({ po: a.po, units: a.units, day,
+          dayFrom: isDay(a.eta) ? 'eta' : isDay(a.delivered) ? 'delivered' : isDay(a.etd) ? 'etd' : null });
+      }
       const lotBucket = IN_CHINA.includes(a.bucket) || SAILED.includes(a.bucket);
-      const sold = a.bucket === 'pullFromChina' || (lotBucket && (a.ptype === 'China Pickup' || (a.flags || []).includes('pull-section')));
+      const sold = a.bucket === 'pullFromChina' || (lotBucket && soldA(a));
       if (sold) {
         counts.soldAllocs++;
         add(soldBy, a.style, a.units);
-        if (IN_CHINA.includes(a.bucket) || (a.bucket === 'pullFromChina' && !GONE_STAGES.includes(a.stage))) add(soldInChinaBy, a.style, a.units);
+        if ((IN_CHINA.includes(a.bucket) || (a.bucket === 'pullFromChina' && !GONE_STAGES.includes(a.stage))) && a.bucket !== 'loaded' && a.stage !== 'Loaded') add(soldInChinaBy, a.style, a.units);
         if (a.cases != null) add(soldCasesBy, a.style, a.cases); else add(soldNoPackBy, a.style, a.units);
         continue;
       }
@@ -177,7 +221,7 @@
       const lot = {
         id: a.id, allocId: a.id, style: a.style, styleRaw: a.styleRaw, upc: a.upc || null, po: a.po, poShown: a.poShown || '',
         status: STATUS[a.bucket], bucket: a.bucket, source: 'ours', inChina, units: a.units,
-        matched: 0, received: 0, inErpTransit: 0, notOnErp: 0, taken: 0, available: a.units,
+        matched: 0, received: 0, inErpTransit: 0, erpTier: null, notOnErp: 0, taken: 0, available: a.units,
         master: isDay(a.master) && a.master > 0 ? a.master : null, cases: null,
         readyDate: r.readyDate, readyFrom: r.readyFrom, readySources: r.sources, readySpread: r.spread,
         dates: Object.assign({ ctReady: null, ctRow: null, poBook: null, factoryCrd: null, crdExpected: null, shipBy: null, orderDate: null, original: null },
@@ -223,10 +267,14 @@
     // One shipment of the report's In Trans (its i-th quantity on report row x, ETA from the ETA Date list lined up
     // with it): an Arriving lot, dated by its ETA.
     const NO_DATES = { ctReady: null, ctRow: null, poBook: null, factoryCrd: null, crdExpected: null, shipBy: null, orderDate: null, original: null };
+    // Its `place` says what the shipment is to our data (units): our goods on the water or at port (matched), landed on
+    // our sheets (landedOurs) or due by the report's day (landedDue), taken off our lots in China (offChina), unplaced.
     function erpLot(style, styleRaw, x, i, n, eta) {
-      return { id: `erp|${style}|${x.row}|${i + 1}`, allocId: null, style, styleRaw, upc: null, po: '', poShown: '',
+      const po = Array.isArray(x.poParts) && x.poParts.length === (x.inTransList || []).length ? S(x.poParts[i]) : '';
+      return { id: `erp|${style}|${x.row}|${i + 1}`, allocId: null, style, styleRaw, upc: null, po: '', poShown: '', erpPo: po,
         status: STATUS.erp, bucket: 'erp', source: 'erp', inChina: false, units: n,
-        matched: 0, received: 0, inErpTransit: 0, notOnErp: 0, taken: 0, available: n, master: null, cases: null,
+        matched: 0, received: 0, inErpTransit: 0, erpTier: null, notOnErp: 0, taken: 0, available: n, master: null, cases: null,
+        place: { matched: 0, landedOurs: 0, landedDue: 0, offChina: 0, unplaced: 0 },
         readyDate: null, readyFrom: null, readySources: [], readySpread: 0, dates: Object.assign({}, NO_DATES),
         crd: null, etd: null, eta, pullFrom: null, pullRule: null, pullRange: null, pullNow: false,
         arrival: eta, arrivalRule: eta != null ? 'eta' : 'none', availableDate: eta, estimate: false,
@@ -239,14 +287,20 @@
     const sumU = (a, f = l => l.units) => a.reduce((t, l) => t + f(l), 0);
     const etaOrder = (a, b) => (a.eta == null) - (b.eta == null) || (a.eta ?? 0) - (b.eta ?? 0) || byPo(a.po, b.po) || String(a.id).localeCompare(String(b.id));
     // Our lots of one style (ls, in date order) against its row(s) on the report (e). Sets each lot's matched / received
-    // / inErpTransit / notOnErp and available; answers { mode ('erp' | 'ours'), erpLots, erpInTrans, ourSailed,
-    // matched, received, taken (into the ERP's transit), landed (In Trans left on shipments due by the report's day:
-    // landed, not received), unmatched (In Trans left, due after it: not sailed on our data), kept, capped (received
-    // beyond In WH, kept instead), and the cross-checks maybeTwice and takenInBacklog (units, listed only), flags }.
+    // / inErpTransit (and erpTier) / notOnErp and available, and each of the ERP's shipments' place; answers { mode
+    // ('erp' | 'ours'), erpLots, erpInTrans, ourSailed, matched, received, kept, capped (received beyond In WH, kept
+    // instead), landed (= landedOurs + landedDue; landedLots: our Landed goods it took; landedLater: of those, on
+    // shipments due after the report's day), taken (off our lots in China; takenBy tier; takenDueBy: on shipments due by
+    // the report's day), unplaced (unplacedInChina of it while our sheets still show the style in China), backlog (the
+    // report's Import PO Backlog, null without the column or with a part below zero or not a number: backlogOff lists
+    // those parts), takeable (what may come off China under it, null with no backlog), chinaAll, offeredTwice (the
+    // guard: 0), flags }.
     function erpStep(style, styleRaw, e, ls) {
       const sailed = ls.filter(l => !l.inChina);
       const res = { mode: 'ours', erpLots: [], erpInTrans: null, ourSailed: sailed.reduce((t, l) => t + l.units, 0),
-        matched: 0, received: 0, taken: 0, landed: 0, unmatched: 0, kept: 0, capped: 0, maybeTwice: 0, takenInBacklog: 0, flags: [] };
+        matched: 0, received: 0, kept: 0, capped: 0, landed: 0, landedOurs: 0, landedDue: 0, landedLater: 0, landedLots: [],
+        taken: 0, takenBy: Object.fromEntries(TIERS.map(k => [k, 0])), takenDueBy: 0, unplaced: 0, unplacedInChina: 0,
+        backlog: null, backlogOff: null, takeable: null, chinaAll: null, offeredTwice: 0, flags: [] };
       if (!transKnown || !e) return res;
       // An In Trans quantity that can't be read (text that isn't a number, or below zero; core/ats.js lists it): the
       // ERP's In Trans isn't known for the style, so Arriving stays our own sailed lots.
@@ -276,46 +330,126 @@
       if (bad.length) { etaProblems.push({ style, styleRaw, rows: bad, units: bad.reduce((t, b) => t + b.units, 0) }); res.flags.push('erp-eta-mismatch'); counts.erpEtaMismatchStyles++; }
       counts.erpLots += res.erpLots.length; counts.erpLotsNoEta += res.erpLots.filter(l => l.eta == null).length;
       const E = res.erpInTrans = res.erpLots.reduce((t, l) => t + l.units, 0);
-      if (E >= res.ourSailed) {
-        // The ERP has all our sailed units In Trans: they're counted there (matched), not again. What it has beyond them
-        // is goods we still see on a vessel in China (Booked / Loaded with an ETD; earliest ETD first, taken off those
-        // lots), then landed but not received yet, then due later with nothing sailed on our data (nothing taken off).
-        if (sailed.length) counts.erpMoreStyles++;
-        for (const l of sailed) { l.matched = l.units; res.matched += l.units; l.flags.push('matched-erp'); counts.matchedLots++; }
-        let x = E - res.ourSailed;
-        const onVessel = ls.filter(l => l.inChina && ON_VESSEL.includes(l.bucket) && l.etd != null)
-          .sort((a, b) => a.etd - b.etd || byPo(a.po, b.po) || String(a.id).localeCompare(String(b.id)));
-        for (const l of onVessel) {
-          if (x <= 0) break;
-          const n = Math.min(l.units, x);
-          l.inErpTransit = n; x -= n; res.taken += n;
-          l.flags.push('in-erp-transit'); counts.inErpTransitLots++;
+      // The report's Import PO Backlog: the style's goods the ERP still has in China. A part below zero (a correction?) or
+      // one that isn't a number (core/ats.js lists both) makes it unknown for the style: no limit from it, never 0.
+      if (backlogKnown) {
+        const parts = rows.flatMap(r => r.backlogList || []);
+        const off = [...parts.filter(n => !(typeof n === 'number' && n >= 0)), ...rows.flatMap(r => r.backlogBad || [])];
+        if (off.length) { res.backlogOff = off; res.flags.push('erp-backlog-unknown'); counts.backlogUnknownStyles++; }
+        else res.backlog = sumU(parts, n => n);
+      }
+      // Our goods still in China, and how many of them the backlog no longer has there (takeable: they've left China per
+      // the ERP; with no backlog, no limit). Sold goods count until they're loaded: the report's backlog has sold goods
+      // booked or ready, never those already loaded (China Pickup or straight to the customer).
+      const china = ls.filter(l => l.inChina);
+      res.chinaAll = sumU(china) + (soldInChinaBy.get(style) || 0);
+      if (res.backlog != null) res.takeable = Math.max(0, res.chinaAll - res.backlog);
+      const offMax = Math.min(sumU(china), res.takeable == null ? Infinity : res.takeable);
+      const dueBy = s => repDay != null && s.eta != null && s.eta <= repDay;
+      // n units off our lots still in China: on a vessel (Booked / Loaded with an ETD, earliest ETD first), then on a PO
+      // whose 6-digit base is in `bases` (Container Tracking shows it sailed or landed for the style, or it's one of the
+      // ERP's shipments' own PO), then any other (earliest pull-from date first); put(units, lot) places each part on the
+      // ERP's shipments. Answers the units taken. Called once per style at most.
+      const takeOffChina = (n, bases, put) => {
+        const pullOrder = (a, b) => (a.pullFrom == null) - (b.pullFrom == null) || (a.pullFrom ?? 0) - (b.pullFrom ?? 0) || byPo(a.po, b.po) || String(a.id).localeCompare(String(b.id));
+        const vessel = china.filter(l => ON_VESSEL.includes(l.bucket) && l.etd != null).sort((a, b) => a.etd - b.etd || byPo(a.po, b.po) || String(a.id).localeCompare(String(b.id)));
+        const samePo = china.filter(l => !vessel.includes(l) && bases.has(base6(l.po))).sort(pullOrder);
+        const other = china.filter(l => !vessel.includes(l) && !samePo.includes(l)).sort(pullOrder);
+        let k = n;
+        for (const [tier, list] of [['vessel', vessel], ['po', samePo], ['other', other]]) {
+          for (const l of list) {
+            if (k <= 0) break;
+            const m = Math.min(l.units, k);
+            l.inErpTransit = m; l.erpTier = tier; k -= m; res.taken += m; res.takenBy[tier] += m;
+            l.flags.push('in-erp-transit'); counts.inErpTransitLots++; counts.inErpTransitTierLots[tier]++;
+            put(m, l);
+          }
         }
-        // What's left: landed, not received yet, as far as the ERP's shipments due on or before the report's day go
-        // (beyond our own sailed lots due by then); the rest is due after it (or has no ETA) and nothing on our shipping
-        // data has sailed for it.
-        const due = list => (repDay == null ? 0 : sumU(list.filter(l => l.eta != null && l.eta <= repDay)));
-        res.landed = Math.min(x, Math.max(0, due(res.erpLots) - due(sailed)));
-        res.unmatched = x - res.landed;
         if (res.taken) { res.flags.push('in-erp-transit'); counts.inErpTransitStyles++; }
-        if (res.landed) { res.flags.push('landed-not-received'); counts.landedNotReceivedStyles++; }
-        if (res.unmatched) { res.flags.push('erp-in-trans-unmatched'); counts.erpUnmatchedStyles++; }
-        // Cross-check (listed, never counted; Saul decides): that In Trans may be goods our Master Sheet still has in
-        // China, when Container Tracking shows the style sailed under a PO with no Master Sheet line. Then the same
-        // units are offered twice: as Arriving and from China.
-        if (res.unmatched) {
-          const held = sumU(ls.filter(l => l.inChina), l => l.units - l.inErpTransit);
-          res.maybeTwice = Math.min(res.unmatched, ctSailedNoLineBy.get(style) || 0, held);
-          if (res.maybeTwice > 0) { res.flags.push('maybe-twice'); counts.maybeTwiceStyles++; }
+        return n - k;
+      };
+      if (E >= res.ourSailed) {
+        // The ERP has all our sailed units In Trans: they're counted there (matched), not again. The rest of its In Trans
+        // (x) is placed on its shipments in turn: landed, not received yet; left China (off our lots there); unplaced.
+        if (sailed.length) counts.erpMoreStyles++;
+        const ships = res.erpLots, left = new Map(ships.map(s => [s, s.units]));
+        // A shipment our Landed goods dated `day` may be: due by the report's day, or due after it but within 14 days of
+        // their date (the same trip, the ERP's ETA behind). One due later than that has left China per the ERP (its
+        // Import PO Backlog agrees on the real files), so it's never called landed.
+        const landedFits = day => s => dueBy(s) || (s.eta != null && day != null && s.eta <= day + LANDED_LATE_DAYS);
+        // n units of our goods dated `day` placed on the shipments still unplaced (only those `fits` allows; with dueFirst,
+        // those due by the report's day before any other): one of the same quantity first, then the closest ETA, then the
+        // earliest.
+        const place = (n, day, key, dueFirst, fits = () => true) => {
+          const gap = s => (s.eta == null || day == null ? Infinity : Math.abs(s.eta - day));
+          const rank = (a, b) => gap(a) - gap(b) || etaOrder(a, b);
+          const open = ships.filter(s => left.get(s) > 0 && fits(s));
+          let k = n;
+          for (const group of dueFirst ? [open.filter(dueBy), open.filter(s => !dueBy(s))] : [open]) {
+            const same = group.filter(s => s.units === k && left.get(s) === k).sort(rank)[0];
+            for (const s of [...(same ? [same] : []), ...group.filter(s => s !== same).sort(rank)]) {
+              if (k <= 0) break;
+              const m = Math.min(left.get(s), k);
+              left.set(s, left.get(s) - m); s.place[key] += m; k -= m;
+              if (key === 'landedOurs' && !dueBy(s)) res.landedLater += m;
+            }
+          }
+        };
+        for (const l of sailed.slice().sort(etaOrder)) {
+          l.matched = l.units; res.matched += l.units; l.flags.push('matched-erp'); counts.matchedLots++;
+          place(l.units, l.eta, 'matched', false);
         }
-        // Cross-check (listed, never counted; Saul decides): the report's Import PO Backlog is the style's goods the ERP
-        // still has in China; taking more into its transit than our China goods (sold ones too) beyond that backlog
-        // contradicts it.
-        if (res.taken && backlogKnown) {
-          const backlog = sumU(rows, r => sumU((r.backlogList || []).filter(n => typeof n === 'number' && n > 0), n => n));
-          const china = sumU(ls.filter(l => l.inChina)) + (soldInChinaBy.get(style) || 0);
-          res.takenInBacklog = Math.max(0, res.taken - Math.max(0, china - backlog));
-          if (res.takenInBacklog > 0) { res.flags.push('taken-in-backlog'); counts.takenInBacklogStyles++; }
+        let x = E - res.ourSailed;
+        // 1. Landed, not received yet: our Landed goods of the style dated from 60 days before the report's day up to
+        // today (the latest first) take it, up to their units, on the shipments they can be (above); then the shipments
+        // due on or before the report's day. Nothing comes off China for these. With no report day, nothing is landed.
+        // With a backlog, the In Trans it says has left China (our China goods beyond it, as far as they go) comes off
+        // China in step 2 first: only what's beyond that may be called landed (room), so nothing is offered twice.
+        let room = res.backlog == null ? Infinity : Math.max(0, x - offMax);
+        if (repDay == null) { if (x > 0) { res.flags.push('no-report-day'); counts.noReportDayStyles++; } }
+        else {
+          const from = repDay - LANDED_DAYS, to = Math.max(repDay, today);
+          const recent = (landedBy.get(style) || []).filter(a => a.day != null && a.day >= from && a.day <= to)
+            .sort((a, b) => b.day - a.day || byPo(a.po, b.po));
+          for (const a of recent) {
+            const fits = landedFits(a.day), n = Math.min(a.units, room, sumU(ships.filter(s => fits(s)), s => left.get(s)));
+            if (n <= 0) continue;
+            place(n, a.day, 'landedOurs', true, fits); x -= n; room -= n; res.landedOurs += n;
+            res.landedLots.push({ po: a.po, units: n, day: a.day, dayFrom: a.dayFrom });
+          }
+          for (const s of ships) if (dueBy(s) && left.get(s) > 0 && room > 0) { const m = Math.min(left.get(s), room); s.place.landedDue += m; left.set(s, left.get(s) - m); x -= m; room -= m; res.landedDue += m; }
+        }
+        res.landed = res.landedOurs + res.landedDue;
+        // 2. Left China per the ERP (due after the report's day, or no ETA, and what step 1 left): off our lots still in
+        // China (above). Never below the report's Import PO Backlog: only our China goods beyond it may come off.
+        const bases = new Set(goneBasesBy.get(style) || []);
+        for (const s of ships) if (left.get(s) > 0 && base6(s.erpPo)) bases.add(base6(s.erpPo));
+        x -= takeOffChina(Math.min(x, offMax), bases, (m, l) => place(m, l.eta, 'offChina', false));
+        res.takenDueBy = sumU(ships.filter(dueBy), s => s.place.offChina);
+        // 3. Still unplaced: Arriving on the ERP's word, and listed (some our sheets may still show in China).
+        res.unplaced = x;
+        for (const s of ships) s.place.unplaced = left.get(s);
+        const held = sumU(china, l => l.units - l.inErpTransit), sold = soldInChinaBy.get(style) || 0;
+        res.unplacedInChina = Math.min(res.unplaced, held);
+        // The guard: In Trans called landed or left unplaced while our China goods the backlog no longer has are still
+        // offered would be offered twice (with no backlog: unplaced while any of ours are). The rule never leaves any; the
+        // balance check says so if it ever does.
+        res.offeredTwice = res.backlog == null ? Math.min(res.unplaced, held)
+          : Math.min(res.landed + res.unplaced, held, Math.max(0, held + sold - res.backlog));
+        if (res.landed) { res.flags.push('landed-not-received'); counts.landedNotReceivedStyles++; }
+        if (res.landedOurs) counts.landedOursStyles++;
+        if (res.landedDue) counts.landedDueStyles++;
+        if (res.landedLater) counts.landedLaterStyles++;
+        if (res.takenDueBy) counts.takenDueByStyles++;
+        if (res.unplaced) { res.flags.push('erp-transit-unplaced'); counts.erpUnplacedStyles++; }
+        if (res.unplacedInChina) { counts.unplacedInChinaStyles++; if (res.backlog != null) counts.backlogGuardStyles++; }
+        if (res.offeredTwice) counts.offeredTwiceStyles++;
+        for (const s of ships) {
+          const p = s.place;
+          if (p.matched) s.flags.push('erp-ours-sailed');
+          if (p.landedOurs || p.landedDue) s.flags.push('landed-not-received');
+          if (p.offChina) s.flags.push('erp-off-china');
+          if (p.unplaced) s.flags.push('erp-transit-unplaced');
         }
       } else {
         // The ERP has less In Trans than we have sailed. A shipment and one of our sailed lots of the same quantity are the
@@ -325,12 +459,12 @@
         counts.erpLessStyles++;
         let d = res.ourSailed - E;
         if (repDay == null) { res.flags.push('no-report-day'); counts.noReportDayStyles++; }
-        const free = sailed.slice().sort(etaOrder);
+        const free = sailed.slice().sort(etaOrder), sameShips = new Set();
         for (const s of res.erpLots.slice().sort(etaOrder)) {
           const gap = l => (s.eta == null || l.eta == null ? Infinity : Math.abs(l.eta - s.eta));
           const same = free.filter(l => l.units === s.units).sort((a, b) => gap(a) - gap(b) || etaOrder(a, b))[0];
           if (!same) continue;
-          free.splice(free.indexOf(same), 1);
+          free.splice(free.indexOf(same), 1); sameShips.add(s);
           same.matched = same.units; res.matched += same.units;
           same.flags.push('matched-erp'); counts.matchedLots++; counts.sameQtyMatchedLots++;
         }
@@ -341,15 +475,45 @@
           d -= n;
           const passed = n > 0 && repDay != null && l.eta != null && l.eta <= repDay;
           const rec = passed ? Math.min(n, room) : 0;
-          if (rec > 0) { l.received = rec; room -= rec; res.received += rec; l.flags.push('received'); counts.receivedLots++; }
-          if (n - rec > 0) { l.notOnErp = n - rec; res.kept += n - rec; l.flags.push('not-on-erp-in-trans'); counts.keptExtraLots++; }
+          l.received = rec; room -= rec;
+          l.notOnErp = n - rec; res.kept += n - rec;
           if (passed && n - rec > 0) res.capped += n - rec;
-          l.matched = l.units - n; res.matched += l.matched;
+          l.matched = l.units - n;
+        }
+        // Our China goods the backlog no longer has have left China per the ERP: as far as its In Trans due after the
+        // report's day (not a shipment of the same quantity as one of ours) was matched above to ours with an ETA on or
+        // before that day, those of ours were received instead (in its In WH, never more than it) and that In Trans comes
+        // off our lots still in China. In Trans matched to ours still on their way is left as it is (it can't be told).
+        const later = res.erpLots.filter(s => !sameShips.has(s) && !dueBy(s)).sort(etaOrder);
+        const recv = free.filter(l => l.matched > 0 && repDay != null && l.eta != null && l.eta <= repDay);
+        const k = res.backlog == null ? 0 : Math.min(offMax, sumU(later), sumU(recv, l => l.matched), room);
+        if (k > 0) {
+          let r = k;
+          for (const l of recv) { if (r <= 0) break; const m = Math.min(l.matched, r); l.matched -= m; l.received += m; room -= m; r -= m; }
+          const bases = new Set(goneBasesBy.get(style) || []);
+          for (const s of later) if (base6(s.erpPo)) bases.add(base6(s.erpPo));
+          const left = new Map(later.map(s => [s, s.units]));
+          takeOffChina(k, bases, m0 => {
+            let m = m0;
+            for (const s of later) { if (m <= 0) break; const q = Math.min(left.get(s), m); left.set(s, left.get(s) - q); s.place.offChina += q; m -= q; }
+          });
+          counts.lessTakenStyles++;
+        }
+        for (const l of free) {
+          res.received += l.received; res.matched += l.matched;
+          if (l.received) { l.flags.push('received'); counts.receivedLots++; }
+          if (l.notOnErp) { l.flags.push('not-on-erp-in-trans'); counts.keptExtraLots++; }
           if (l.matched) { l.flags.push('matched-erp'); counts.matchedLots++; }
         }
         if (res.received) { res.flags.push('received'); counts.receivedStyles++; }
         if (res.kept) { res.flags.push('not-on-erp-in-trans'); counts.keptExtraStyles++; }
         if (res.capped) { res.flags.push('received-over-in-wh'); counts.receivedCappedStyles++; }
+        // Every one of the ERP's other shipments is our goods on the water or at port.
+        for (const s of res.erpLots) {
+          s.place.matched = s.units - s.place.offChina;
+          if (s.place.matched) s.flags.push('erp-ours-sailed');
+          if (s.place.offChina) s.flags.push('erp-off-china');
+        }
       }
       for (const l of ls) l.available = l.units - replaced(l);
       return res;
@@ -459,12 +623,17 @@
         // engine's Incoming for the style) is in a lot, matched to the ERP's In Trans, received, or in its transit.
         arrivingFrom: x.mode, arrivingErp, arrivingOurs: arriving - arrivingErp,
         erpInTrans: x.erpInTrans, erpShipments: x.erpLots.length, ourIncoming: ours.reduce((t, l) => t + l.units, 0), ourSailed: x.ourSailed,
-        matchedOurs: x.matched, receivedDropped: x.received, inErpTransitTaken: x.taken, landedNotReceived: x.landed, keptExtra: x.kept,
-        erpUnmatched: x.unmatched, receivedCapped: x.capped,
-        // Cross-checks with the ERP's report (units; listed on Problems, never counted): maybe offered twice (In Trans
-        // our data doesn't show sailed, while Container Tracking has the style sailed with no Master Sheet line and the
-        // sheet still has it in China), and taken into the ERP's transit though its Import PO Backlog has it in China.
-        maybeTwice: x.maybeTwice, takenInBacklog: x.takenInBacklog,
+        matchedOurs: x.matched, receivedDropped: x.received, keptExtra: x.kept, receivedCapped: x.capped,
+        // The ERP's In Trans beyond our sailed goods: 1. landed, not received yet (ours on our sheets: landedLots, or due
+        // by the report's day); 2. taken off our lots in China (by tier: on a vessel, on a PO that sailed, other;
+        // takenDueBy: on its shipments due by the report's day), never below its Import PO Backlog (erpBacklog, null when
+        // unknown: erpBacklogOff lists a part below zero or not a number; takeable: our China goods beyond it, sold ones
+        // not loaded yet too); 3. unplaced (unplacedInChina of it while our sheets still show the style in China).
+        // offeredTwice: the guard, always 0.
+        landedNotReceived: x.landed, landedOurs: x.landedOurs, landedDue: x.landedDue, landedLater: x.landedLater, landedLots: x.landedLots,
+        inErpTransitTaken: x.taken, takenOnVessel: x.takenBy.vessel, takenSamePo: x.takenBy.po, takenOther: x.takenBy.other, takenDueBy: x.takenDueBy,
+        erpUnplaced: x.unplaced, unplacedInChina: x.unplacedInChina, erpBacklog: x.backlog, erpBacklogOff: x.backlogOff, takeable: x.takeable, chinaAll: x.chinaAll,
+        offeredTwice: x.offeredTwice,
         firstPull: first ? first.pullFrom : null, firstPullRule: first ? first.pullRule : null,
         firstPullEstimate: !!(first && first.estimate), firstPullNow: !!(first && first.pullNow),
         firstArrival: arr.length ? Math.min(...arr.map(l => l.arrival)) : null,
@@ -542,17 +711,21 @@
     };
     summary('orders-may-include-sold', s => s.soldInOrders,
       u => `the customer orders beyond the warehouse stock (${unitsText(u)}) are no more than the style's goods sold to ship from China (China Pickup or straight to the customer). If the ERP's Total Customer Orders include those orders, they are taken off twice.`);
-    // How the ERP's In Trans met our own data: what it can't be matched to, and the cross-checks (never counted).
-    summary('maybe-twice', s => s.maybeTwice,
-      u => `${unitsText(u)} may be offered twice. The ATS report has them In Trans, due after its date, beyond what our shipping data shows on the water, at port, booked or loaded; Container Tracking shows the style on the water or at port under a PO with no Master Sheet Live line (a PO written differently?), and the Master Sheet still has goods of the style in China. Both are shown (Arriving, and from China or taken by orders) until Saul decides how these count: check before selling them.`);
-    summary('erp-in-trans-unmatched', s => s.erpUnmatched,
-      u => `${unitsText(u)} In Trans on the ATS report, due after its date (or with no ETA), are more than our shipping data has on the water, at port, booked or loaded for them. They're offered as Arriving on the report's word; check Container Tracking and the Master Sheet for them.`);
-    summary('taken-in-backlog', s => s.takenInBacklog,
-      u => `${unitsText(u)} on Booked or Loaded lots were taken off Available from China because the ATS report has more In Trans than our sailed goods, but its Import PO Backlog still holds the style's goods in China, so they may still be there (From China may be short by that much, and a style called oversold). Saul decides how these count.`);
+    // The ERP's In Trans that our data can't place (not sailed, landed or taken off China): one line per style. It stays
+    // Arriving (the ERP's word); our goods in China are kept as far as the report's Import PO Backlog has them there.
+    for (const s of styles) if (s.erpUnplaced > 0) {
+      const u = s.erpUnplaced, inChina = s.unplacedInChina;
+      const off = Array.isArray(s.erpBacklogOff) && s.erpBacklogOff.length
+        ? ` The ATS report's Import PO Backlog for the style (${s.erpBacklogOff.map(v => (typeof v === 'number' ? fmtN(v) : `"${String(v).slice(0, 20)}"`)).join(', ')}) is below zero or not a number, so it isn't used; it may be the ERP's own correction of this In Trans.` : '';
+      const why = inChina > 0
+        ? `the ERP counts ${unitsText(u)} in transit that our sheets still show in China; check before offering from China. They're offered as Arriving, and our goods still in China stay available from China because the ATS report's Import PO Backlog still has ${fmtN(s.erpBacklog)} of the style there (our sheets have ${fmtN(s.chinaAll - s.inErpTransitTaken)}, sold goods not loaded yet included${s.inErpTransitTaken ? `, after ${fmtN(s.inErpTransitTaken)} came off` : ''}).`
+        : `the ERP counts ${unitsText(u)} in transit that our sheets don't have on the water, at port, landed or still to sell in China. They're offered as Arriving on the ERP's word; check Container Tracking and the Master Sheet for them.${off}`;
+      issue('erp-transit-unplaced', '', s.style, `Style ${s.styleRaw}: ${why}`, { units: u, inChina });
+    }
     summary('received-over-in-wh', s => s.receivedCapped,
       u => `${unitsText(u)} on the water or at port have an ETA on or before the ATS report's date and aren't on its In Trans, but the style's In WH is less, so they can't all be in its warehouse number: the rest are kept as Arriving from our shipping data. Check whether they were received.`);
-    summary('no-report-day', s => s.ourSailed - (s.erpInTrans || 0),
-      u => `the ATS report's date isn't known, so none of the ${unitsText(u)} on the water or at port beyond its In Trans is called received: they're all kept as Arriving.`);
+    summary('no-report-day', s => Math.max(0, s.ourSailed - (s.erpInTrans || 0)),
+      u => `the ATS report's date isn't known, so ${u ? `none of the ${unitsText(u)} on the water or at port beyond its In Trans is called received (they're all kept as Arriving), and ` : ''}none of its In Trans beyond our sailed goods is called landed, not received yet: it comes off our goods still in China instead, as far as its Import PO Backlog allows.`);
     if (atsMissing) {
       const n = counts.ordersUnknownStyles;
       if (n) issue('orders-unknown', '', '', `${ats && ats.ok === false ? "The ATS report couldn't be used" : "There's no ATS report"}, so customer orders aren't taken off: the ${fmtN(n)} style${n === 1 ? '' : 's'} with lots from China show${n === 1 ? 's' : ''} ${unitsText(counts.ordersUnknownUnits)} in full, and stock now isn't known.`,
@@ -574,18 +747,27 @@
     // ---------- every unit accounted for, style by style (a failure is a bug in this file, said so on Problems):
     // each lot's units = matched + received + in the ERP's transit + taken + available, none below 0; our lots hold the
     // stage engine's Incoming for the style and the ERP's lots its In Trans; the ERP's In Trans = our matched units +
-    // those in its transit + landed, not received + due later, not sailed on our data; received ≤ In WH; so from China +
-    // arriving + taken by orders + matched + received + in the ERP's transit = Incoming + the ERP's In Trans.
+    // landed, not received + taken off China + unplaced, and each of its shipments is placed in full; received ≤ In WH;
+    // so from China + arriving + taken by orders + matched + received + in the ERP's transit = Incoming + the ERP's In
+    // Trans. And the guards: nothing offered twice, nothing taken off China below the report's Import PO Backlog.
     const offBy = [];
+    const PLACE = ['matched', 'landedOurs', 'landedDue', 'offChina', 'unplaced'];
     for (const s of styles) {
       const bad = s.lots.filter(l => [l.matched, l.received, l.inErpTransit, l.taken, l.available].some(v => !(v >= 0)) ||
-        Math.abs(l.units - replaced(l) - l.taken - l.available) > 1e-9);
+        Math.abs(l.units - replaced(l) - l.taken - l.available) > 1e-9 ||
+        (l.source === 'erp' && (!l.place || PLACE.some(k => !(l.place[k] >= 0)) || Math.abs(PLACE.reduce((t, k) => t + l.place[k], 0) - l.units) > 1e-9)));
       const st = stageStyle.get(s.style), u = (st && st.units) || null;
       const inc = u && isDay(u.incoming) ? u.incoming : null;
       const lotU = s.lots.reduce((t, l) => t + l.units, 0);
+      const erpL = s.lots.filter(l => l.source === 'erp'), placed = k => erpL.reduce((t, l) => t + ((l.place && l.place[k]) || 0), 0);
       const why = [bad.length ? `${bad.length} lot${bad.length === 1 ? '' : 's'} don't add up` : '',
         inc != null && Math.abs(inc - s.ourIncoming) > 1e-9 ? `its lots hold ${fmtN(s.ourIncoming)}, Incoming is ${fmtN(inc)}` : '',
-        s.arrivingFrom === 'erp' && Math.abs(s.erpInTrans - s.matchedOurs - s.inErpTransitTaken - s.landedNotReceived - s.erpUnmatched) > 1e-9 ? "the ERP's In Trans isn't matched + in its transit + landed + not sailed on our data" : '',
+        s.arrivingFrom === 'erp' && (Math.abs(s.erpInTrans - s.matchedOurs - s.landedNotReceived - s.inErpTransitTaken - s.erpUnplaced) > 1e-9 ||
+          s.landedNotReceived !== s.landedOurs + s.landedDue || s.inErpTransitTaken !== s.takenOnVessel + s.takenSamePo + s.takenOther ||
+          placed('landedOurs') !== s.landedOurs || placed('landedDue') !== s.landedDue || placed('offChina') !== s.inErpTransitTaken || placed('unplaced') !== s.erpUnplaced)
+          ? "the ERP's In Trans isn't matched + landed + taken off China + unplaced" : '',
+        s.offeredTwice > 0 ? `${fmtN(s.offeredTwice)} In Trans on the ERP are still offered from China too` : '',
+        s.takeable != null && s.inErpTransitTaken > s.takeable ? `${fmtN(s.inErpTransitTaken)} came off China, below the ERP's Import PO Backlog (${fmtN(s.takeable)} could)` : '',
         isDay(s.inWh) && s.receivedDropped > Math.max(0, s.inWh) ? `received ${fmtN(s.receivedDropped)} is more than In WH ${fmtN(s.inWh)}` : '',
         Math.abs(lotU - s.ourIncoming - (s.erpInTrans || 0)) > 1e-9 ? "the lots aren't Incoming + the ERP's In Trans" : '',
         Math.abs(lotU - s.lots.reduce((t, l) => t + replaced(l), 0) - s.fromChina - s.arriving - s.ordersTaken) > 1e-9 ? "the lots aren't from China + arriving + taken" : ''].filter(Boolean);
@@ -600,8 +782,7 @@
     for (const s of styles) {
       totals.now += s.now || 0; totals.fromChina += s.fromChina; totals.arriving += s.arriving; totals.soldChina += s.soldChina;
       totals.oversold += s.oversold; totals.ordersTaken += s.ordersTaken;
-      for (const k of ['arrivingErp', 'arrivingOurs', 'erpInTrans', 'ourIncoming', 'matchedOurs', 'receivedDropped', 'inErpTransitTaken',
-        'landedNotReceived', 'erpUnmatched', 'keptExtra', 'receivedCapped', 'maybeTwice', 'takenInBacklog']) totals[k] += s[k] || 0;
+      for (const k of ['arrivingErp', 'arrivingOurs', ...ERP_KEYS]) totals[k] += s[k] || 0;
       for (const k of ['now', 'fromChina', 'arriving', 'soldChina']) { tCases[k] += s.cases[k]; tNoPack[k] += s.noCasePackUnits[k]; }
       for (const k of ['now', 'fromChina', 'arriving', 'total']) tLoose[k] += s.looseUnits[k];
     }
@@ -615,5 +796,5 @@
   }
 
   return { buildSell, readyOf, pullOf, ruleWords, SOURCE, STATUS, IN_CHINA, SAILED, READY_ORDER, READY_LABEL, READY_FILE,
-    RULES, TOTAL_KEYS, DAYS_BEFORE_ETD, DAYS_BEFORE_CRD, DAYS_AFTER_ORDER, DISAGREE_DAYS };
+    RULES, TOTAL_KEYS, ERP_KEYS, TIERS, LANDED_DAYS, LANDED_LATE_DAYS, DAYS_BEFORE_ETD, DAYS_BEFORE_CRD, DAYS_AFTER_ORDER, DISAGREE_DAYS };
 });

@@ -6,8 +6,10 @@
 // core/sell.js counts as Arriving (Saul, Oct 30): each row keeps both part for part (inTransList, etaParts; an ETA that
 // can't be read stays in its place as null). An In Trans quantity that isn't a number (a comma only as a thousands
 // separator), could be one quantity or two ("720,816" with an ETA for each part), or is below zero, is listed. The
-// Import PO Backlog list is read for cross-checks, never counted. A negative In WH or Total Customer Orders is listed
-// and used as it is.
+// Import PO Backlog list is read as the style's goods the ERP still has in China (core/sell.js never takes our China
+// goods below it), never counted; a part of it that isn't a number (backlogBad) or is below zero is listed, and
+// core/sell.js doesn't use that style's backlog. A PO column, when the report has one, is each shipment's own PO
+// (poParts). A negative In WH or Total Customer Orders is listed and used as it is.
 // Pure: no network, no DOM. Loads in the page (window.InvAts, after core/common.js) and in Node (module.exports).
 (function (root, factory) {
   const node = typeof module === 'object' && module.exports;
@@ -36,6 +38,7 @@
     backlog: { names: ['Import PO Backlog Qty', 'PO Backlog Qty'] },
     eta: { names: ['ETA Date', 'ETA'] },
     etd: { names: ['ETD Date', 'ETD'] },
+    po: { names: ['Import PO', 'PO Number', 'PO #', 'PO'] },
   };
   const LABEL = { inWh: 'In WH', orders: 'Total Customer Orders', erpAts: 'ATS from in WH', inTrans: 'In Trans Qty', backlog: 'Import PO Backlog Qty' };
 
@@ -110,7 +113,7 @@
     const issue = (code, style, row, message, extra) => issues.push(Object.assign({ source: SOURCE, code, po: '', style: style || '', row: row ?? '', message }, extra));
     const counts = base.counts = { rowsRead: 0, blankRows: 0, styleRows: 0, grandTotalRows: 0, noStyleRows: 0,
       styles: 0, multiWarehouseStyles: 0, notANumber: 0, blankNumbers: 0, unknownStyles: 0, inWh: 0, orders: 0,
-      negativeInWh: 0, negativeOrders: 0, erpAtsDiffers: 0, inTransUnreadable: 0 };
+      negativeInWh: 0, negativeOrders: 0, erpAtsDiffers: 0, inTransUnreadable: 0, backlogUnreadable: 0 };
     const styles = base.styles;
     let grand = null;
     const badNum = [];       // rows whose In WH isn't a number (the Grand Total check can't hold)
@@ -167,9 +170,11 @@
         inTrans.sum = inTrans.list.length ? inTrans.list.reduce((s, n) => s + n, 0) : null;
       }
       const wh = S(cell(r, 'warehouse'));
+      // A PO list (when the report has one), part for part like the ETA Date list: each In Trans shipment's own PO.
+      const poCell = cell(r, 'po'), poParts = poCell == null || blank(poCell) ? [] : S(poCell).split(/[;,\n]/).map(S);
       const rec = { row, warehouse: wh, inWh: nums.inWh, orders: nums.orders, erpAts: nums.erpAts,
-        inTrans: inTrans.sum, inTransList: inTrans.list, inTransBad: inTrans.bad, backlog: backlog.sum, backlogList: backlog.list,
-        eta: eta.list, etaParts: eta.parts, etd: etd.list };
+        inTrans: inTrans.sum, inTransList: inTrans.list, inTransBad: inTrans.bad, backlog: backlog.sum, backlogList: backlog.list, backlogBad: backlog.bad,
+        eta: eta.list, etaParts: eta.parts, etd: etd.list, poParts };
       // In Trans is counted as Arriving (core/sell.js): a part that isn't a number, or is below zero, is never read as 0.
       const negT = inTrans.list.filter(n => n < 0);
       if (inTrans.bad.length || negT.length) counts.inTransUnreadable++;
@@ -179,6 +184,15 @@
         issue('not-a-number', style, row, `Style ${styleRaw} (row ${row}): In Trans Qty ${what}, ${unknownTail}`);
       }
       if (negT.length) issue('negative-in-trans', style, row, `Style ${styleRaw} (row ${row}): In Trans Qty ${negT.map(n => fmtN(n)).join(' and ')} ${negT.length > 1 ? 'are' : 'is'} below zero, ${unknownTail}`);
+      // The Import PO Backlog decides how much of our goods in China may come off when the ERP counts them In Trans
+      // (core/sell.js): a part that isn't a number, or is below zero (a correction in the ERP?), is listed, and the style's
+      // backlog isn't used (never read as 0).
+      const negB = backlog.list.filter(n => n < 0);
+      if (backlog.bad.length || negB.length) {
+        counts.backlogUnreadable++;
+        const what = [...backlog.bad.map(b => `"${b.slice(0, 20)}" isn't a number`), ...(negB.length ? [`${negB.map(n => fmtN(n)).join(' and ')} ${negB.length > 1 ? 'are' : 'is'} below zero (a correction in the ERP?)`] : [])].join(' and ');
+        issue(negB.length ? 'negative-backlog' : 'not-a-number', style, row, `Style ${styleRaw} (row ${row}): Import PO Backlog Qty ${what}, so the style's goods the ERP still has in China aren't known: the backlog isn't used to keep our goods in China for the style (In Trans beyond our sailed goods comes off them without that check). Check it in the ERP.`);
+      }
       let s = styles.get(style);
       if (!s) styles.set(style, s = { style, styleRaw, desc: '', color: '', category: '', sub: '', inWh: 0, orders: 0, erpAts: null,
         inTrans: null, backlog: null, warehouses: [], rows: [], unknown: false });

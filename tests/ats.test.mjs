@@ -255,3 +255,13 @@ test("the fields found are listed, so a blank In Trans can be told from a missin
   assert.equal(res2.ok, true, res2.error);
   assert.ok(!res2.columns.includes('inTrans'));
 });
+
+test("a PO column, when the report has one, is each In Trans shipment's own PO, part for part; none, no POs", () => {
+  const head = [...HEAD, 'PO'], row = (style, inTrans, eta, po) => [...r(style, 0, 0, { inTrans, eta }), po];
+  const g = [...grand(0), null];
+  const res = parse([TITLE, head, row('AB100', '720, 816', '11/13/2026, 11/13/2026', '900601A, 900601B'), row('AB101', '500', '11/20/2026', 900602), row('AB102', '300', null, null), g]);
+  assert.equal(res.ok, true, res.error);
+  assert.ok(res.columns.includes('po'));
+  assert.deepEqual(['AB100', 'AB101', 'AB102'].map(k => res.styles.get(k).rows[0].poParts), [['900601A', '900601B'], ['900602'], []]);
+  assert.deepEqual(parse([TITLE, HEAD, r('AB100', 0, 0, { inTrans: '500' }), grand(0)]).styles.get('AB100').rows[0].poParts, []);
+});

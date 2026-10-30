@@ -123,18 +123,20 @@
     'erp-eta-mismatch': "In Trans with no ETA (the ATS report's ETA dates don't line up)",
     'no-in-trans-column': 'No In Trans column on the ATS report (Arriving from our shipping data)',
     'negative-in-trans': 'In Trans below zero',
-    'maybe-twice': 'Maybe offered twice: In Trans on the ATS report and still in China on our sheets',
-    'erp-in-trans-unmatched': "In Trans on the ATS report, due after its date, not sailed on our shipping data",
-    'taken-in-backlog': "Taken off China as In Trans, though the ATS report's Import PO Backlog has it in China",
+    'negative-backlog': 'Import PO Backlog below zero (not used for the style)',
+    'erp-backlog-unknown': "Import PO Backlog on the ATS report can't be used (below zero or not a number)",
+    'erp-transit-unplaced': "In transit on the ATS report, not on our sheets as sailed or landed: check before offering from China",
     'received-over-in-wh': "ETA passed, not on the ATS report's In Trans, more than In WH (kept as arriving)",
     // flags on a style or lot of Available to sell
     now: 'Pull-from date passed: available now', 'part-taken': 'Partly taken by customer orders', taken: 'All taken by customer orders',
     'mixed-case-pack': 'Lots in different case packs', 'stock-unknown': "Stock on the ATS report can't be read", 'not-on-report': 'Not on the ATS report',
     // how our own lots meet the ATS report's In Trans (Arriving comes from it, Saul, Oct 30)
     'matched-erp': "On the ATS report's In Trans (counted there, not again)", received: "Received: in the ATS report's In WH",
-    'in-erp-transit': 'In Trans on the ATS report (still booked or loaded on our sheets)', 'not-on-erp-in-trans': "Not on the ATS report's In Trans yet (arriving, from our data)",
-    'landed-not-received': "Landed, not received yet (In Trans on the ATS report, its ETA passed)", 'erp-in-trans-unknown': "In Trans on the ATS report can't be read (Arriving from our data)",
-    'no-report-day': "The ATS report's date isn't known (nothing called received)",
+    'in-erp-transit': 'In Trans on the ATS report (still in China on our sheets: taken off here)', 'not-on-erp-in-trans': "Not on the ATS report's In Trans yet (arriving, from our data)",
+    'landed-not-received': "Landed, not received yet (In Trans on the ATS report; landed on our sheets, or its ETA passed)", 'erp-in-trans-unknown': "In Trans on the ATS report can't be read (Arriving from our data)",
+    'no-report-day': "The ATS report's date isn't known (nothing called received or landed)",
+    // what one of the ATS report's In Trans shipments is to our sheets
+    'erp-ours-sailed': 'Ours on the water or at port (counted here, once)', 'erp-off-china': 'Left China per the ATS report: taken off our lots still in China',
   };
   // The same code from another file, where its words differ (the ATS report's rows aren't product lines).
   const SOURCE_LABELS = { 'ATS report': { 'no-style': 'Row with no style' } };
@@ -2057,7 +2059,7 @@
   function erpCountedWhen(l) {
     const u = units(l.units);
     if (units(l.received) === u) return { day: null, main: 'received', why: `in the ATS report's In WH (its ETA is on or before the report's date${savedNote()})`, none: true };
-    if (units(l.inErpTransit) === u) return { day: null, main: 'In Trans (ATS report)', why: 'still booked or loaded on our sheets; Arriving has it by the report\'s ETA', none: true };
+    if (units(l.inErpTransit) === u) return { day: null, main: 'In Trans (ATS report)', why: `${l.erpTier === 'vessel' ? 'still booked or loaded on our sheets' : l.erpTier === 'po' ? 'still in China on our sheets, but Container Tracking has its PO sailed' : 'still in China on our sheets'}; it has left China per the report, so Arriving has it by the report's ETA`, none: true };
     if (units(l.matched) === u) return { day: null, main: 'In Trans (ATS report)', why: "the same goods as the report's shipments: Arriving has them by its ETA", none: true };
     return { day: null, main: 'on the ATS report', why: lotErpWords(l), none: true };
   }
@@ -2214,15 +2216,29 @@
       w.push(n ? `In Trans on the ATS report${asOfText()}: ${fmtN(s.erpInTrans)} units in ${plural(n, 'shipment')}, each by its ETA.`
         : `Nothing In Trans on the ATS report${asOfText()}.`);
       if (units(s.matchedOurs)) w.push(`Our ${fmtN(s.matchedOurs)} on the water or at port are on it (counted there, not again).`);
-      if (units(s.inErpTransitTaken)) w.push(`${fmtN(s.inErpTransitTaken)} more on it are goods our sheets still show booked or loaded on a vessel in China: taken off those lots.`);
-      if (units(s.landedNotReceived)) w.push(`${fmtN(s.landedNotReceived)} more on it were due on or before the report's date: landed, not received yet.`);
-      if (units(s.erpUnmatched)) w.push(`${fmtN(s.erpUnmatched)} more on it, due after the report's date, aren't on our shipping data as sailed.`);
+      // Beyond ours (Saul, Oct 30): landed, not received yet; left China (taken off our lots there); unplaced.
+      if (units(s.landedOurs)) {
+        const ll = Array.isArray(s.landedLots) ? s.landedLots : [];
+        const pos = ll.slice(0, 3).map(x => `PO ${x.po}${numOr(x.day) != null ? ` ${x.dayFrom === 'etd' ? 'ETD' : 'ETA'} ${md(numOr(x.day))}` : ''}`).join(', ') + (ll.length > 3 ? ` and ${ll.length - 3} more` : '');
+        w.push(`${fmtN(s.landedOurs)} more on it are goods our sheets have landed${pos ? ` (${pos})` : ''}: landed, not received yet, so nothing comes off China for them.`);
+      }
+      if (units(s.landedDue)) w.push(`${fmtN(s.landedDue)} more on it were due on or before the report's date${savedNote()}: landed, not received yet.`);
+      if (units(s.inErpTransitTaken)) {
+        const tk = [[s.takenOnVessel, 'booked or loaded on a vessel'], [s.takenSamePo, 'on a PO Container Tracking shows sailed or landed'], [s.takenOther, 'other lots, earliest first']].filter(x => units(x[0]));
+        // Some on shipments due by the report's date: they've left China because its Import PO Backlog no longer has them there.
+        const bl = !units(s.takenDueBy) || numOr(s.erpBacklog) == null ? ''
+          : units(s.erpBacklog) ? ` (its Import PO Backlog has only ${fmtN(s.erpBacklog)} of the style left in China)` : ' (its Import PO Backlog has none of the style left in China)';
+        w.push(units(s.takenOnVessel) === units(s.inErpTransitTaken) ? `${fmtN(s.inErpTransitTaken)} more on it are goods our sheets still show booked or loaded on a vessel in China${bl}: taken off those lots.`
+          : bl ? `${fmtN(s.inErpTransitTaken)} more on it have left China per the report${bl}, though our sheets still show them there: taken off our lots still in China (${tk.map(x => `${fmtN(x[0])} ${x[1]}`).join('; ')}).`
+            : `${fmtN(s.inErpTransitTaken)} more on it are due after the report's date, so they have left China: taken off our lots still in China there (${tk.map(x => `${fmtN(x[0])} ${x[1]}`).join('; ')}).`);
+      }
+      if (units(s.erpUnplaced)) {
+        w.push(units(s.unplacedInChina) ? `Check: ${fmtN(s.erpUnplaced)} more on it aren't on our sheets as sailed or landed, and our sheets still show the style in China (the report's Import PO Backlog has ${fmtN(s.erpBacklog)} there, so they stay available from China): check before offering from China (listed on Problems).`
+          : `${fmtN(s.erpUnplaced)} more on it aren't on our sheets as sailed, landed or in China: Arriving on the report's word (listed on Problems).`);
+      }
       if (units(s.receivedDropped)) w.push(`${fmtN(s.receivedDropped)} of ours with an ETA on or before the report's date${savedNote()} aren't on it: received, so in its In WH, not arriving.`);
       if (units(s.keptExtra)) w.push(`${fmtN(s.keptExtra)} of ours aren't on it yet: arriving, from our shipping data${units(s.receivedCapped) ? ` (${fmtN(s.receivedCapped)} of them have an ETA on or before the report's date, but the style's In WH is less, so they can't all have been received)` : ''}.`);
-      if (hasFlag(s, 'no-report-day')) w.push("The report's date isn't known, so none of ours is called received.");
-      // The cross-checks (listed on Problems, never counted: Saul decides).
-      if (units(s.maybeTwice)) w.push(`Check: ${fmtN(s.maybeTwice)} of the In Trans not on our shipping data may be goods our Master Sheet still has in China (Container Tracking shows the style sailed under a PO with no Master Sheet line), so they may be offered twice.`);
-      if (units(s.takenInBacklog)) w.push(`Check: the ATS report's Import PO Backlog still has ${fmtN(s.takenInBacklog)} of the booked or loaded goods taken off China, so they may still be there.`);
+      if (hasFlag(s, 'no-report-day')) w.push("The report's date isn't known, so none of ours is called received, and none of its In Trans landed.");
     } else if (hasFlag(s, 'erp-in-trans-unknown')) w.push("Its In Trans on the ATS report can't be read: Arriving is our shipping data (on the water, at port).");
     else if (stockOk() && (units(s.ourSailed) || units(s.arriving))) {
       w.push(notOnReport(s) ? 'Not on the ATS report: Arriving is our shipping data (on the water, at port).'
@@ -2242,10 +2258,12 @@
     const maybe = [hasFlag(s, 'orders-may-include-sold') ? `${fmtN(s.soldChina)} units are sold to ship from China: the orders may be those` : ''].filter(Boolean);
     if (units(s.oversold) > 0) tags.push(`<button type="button" class="tag ov" data-b="all" title="${esc(`Oversold by ${fmtN(s.oversold)} units: customer orders are more than the stock and every lot coming${maybe.length ? '. Check first: ' + maybe.join('; ') : ''}`)}">oversold ${fmtN(s.oversold)}</button>`);
     if (hasFlag(s, 'erp-eta-mismatch')) tags.push(`<button type="button" class="tag um" data-b="all" title="${esc("Some of its In Trans on the ATS report has no ETA: the report's ETA dates don't line up with its In Trans quantities (listed on Problems)")}">no ETA</button>`);
-    // The cross-checks with the ATS report (listed on Problems, never counted: Saul decides how these count).
-    const checks = [units(s.maybeTwice) ? `${fmtN(s.maybeTwice)} units may be offered twice: In Trans on the ATS report but not sailed on our shipping data, while Container Tracking shows the style sailed under a PO with no Master Sheet line and the Master Sheet still has them in China` : '',
-      units(s.takenInBacklog) ? `${fmtN(s.takenInBacklog)} booked or loaded units were taken off Available from China as In Trans on the ATS report, but its Import PO Backlog still has them in China` : ''].filter(Boolean);
-    if (checks.length) tags.push(`<button type="button" class="tag um" data-b="all" title="${esc(`Check before selling: ${checks.join('; ')}. Listed on Problems; Saul decides how these count.`)}">check</button>`);
+    // In Trans on the ATS report our sheets can't place (not sailed, landed or taken off China): listed on Problems.
+    if (units(s.erpUnplaced)) {
+      const why = units(s.unplacedInChina) ? `the ERP counts ${fmtN(s.erpUnplaced)} units in transit that our sheets still show in China; check before offering from China`
+        : `the ERP counts ${fmtN(s.erpUnplaced)} units in transit that our sheets don't have as sailed, landed or in China (offered as Arriving on its word)`;
+      tags.push(`<button type="button" class="tag um" data-b="all" title="${esc(`Check: ${why}. Listed on Problems.`)}">check</button>`);
+    }
     if (ok && notOnReport(s)) tags.push(`<span class="tag um" title="${esc(`No row on the ATS report${asOfText()}, so its customer orders aren't known: its goods from China show in full, and its Arriving is our shipping data (on the water, at port)`)}">not on ATS report</span>`);
     else if (ok && stockUnknown(s)) tags.push(`<span class="tag um" title="${esc(`Its In WH or customer orders on the ATS report${asOfText()} can't be read, so its customer orders aren't taken off: its goods from China show in full`)}">stock can't be read</span>`);
     const upcLine = r.upcs.length ? r.upcs[0] + (r.upcs.length > 1 ? ` +${r.upcs.length - 1} more` : '') : '';
@@ -2265,10 +2283,10 @@
         `<td class="num" title="${esc(stockTip(s))}">${nb('now', numOr(s.now))}</td>`;
     }
     const aTip = arrivingTip(s);
-    // Why From China is less than the booked or loaded goods: the ATS report counts some of them In Trans already.
-    const fTip = [units(s.inErpTransitTaken) ? `${fmtN(s.inErpTransitTaken)} more are booked or loaded on our sheets, but the ATS report already counts them In Trans: they're in Arriving, by the report's ETA.` : '',
-      units(s.takenInBacklog) ? `Check: the report's Import PO Backlog still has ${fmtN(s.takenInBacklog)} of those in China (listed on Problems).` : '',
-      units(s.maybeTwice) ? `Check: ${fmtN(s.maybeTwice)} of the goods in China may also be In Trans on the ATS report (in Arriving): listed on Problems.` : ''].filter(Boolean).join(' ');
+    // Why From China is less than our goods still in China: the ATS report counts some of them In Trans already.
+    const where = units(s.takenOnVessel) === units(s.inErpTransitTaken) ? 'booked or loaded' : 'still in China';
+    const fTip = [units(s.inErpTransitTaken) ? `${fmtN(s.inErpTransitTaken)} more are ${where} on our sheets, but the ATS report already counts them In Trans: they're in Arriving, by the report's ETA.` : '',
+      units(s.unplacedInChina) ? `Check: the ATS report counts ${fmtN(s.erpUnplaced)} of the style in transit that our sheets still show in China; its Import PO Backlog has the goods here in China too (listed on Problems).` : ''].filter(Boolean).join(' ');
     h += `<td class="num"${fTip ? ` title="${esc(fTip)}"` : ''}>${nb('fromChina', numOr(s.fromChina))}</td><td class="nw">${firstPullHtml(r)}</td>` +
       `<td class="num"${aTip ? ` title="${esc(aTip)}"` : ''}>${nb('arriving', numOr(s.arriving))}</td><td class="nw">${firstArrivalHtml(r)}</td>`;
     // Without the stock (no report, or not on it) Total available would be a part only: the column says so.
@@ -2382,7 +2400,7 @@
   // ---------- its side panel: a style's lots in date order, then its stock ----------
   const SELL_PANEL_COLS = [
     { k: 'style', t: 'Style', many: 1 }, { k: 'status', t: 'Status' }, { k: 'po', t: 'PO' }, { k: 'units', t: 'Units', n: 1 },
-    { k: 'erp', t: 'Counted on the ATS report', n: 1, tip: () => `Units of ours the ATS report already counts, so they aren't available again here: In Trans on it (our goods on the water or at port, or booked or loaded on a vessel), or received into its In WH (an ETA on or before the report's date${savedNote()}, and not In Trans on it)` },
+    { k: 'erp', t: 'Counted on the ATS report', n: 1, tip: () => `Units of ours the ATS report already counts, so they aren't available again here: In Trans on it (our goods on the water or at port, or goods it has left China though our sheets still show them there), or received into its In WH (an ETA on or before the report's date${savedNote()}, and not In Trans on it)` },
     { k: 'taken', t: 'Taken by orders', n: 1 }, { k: 'available', t: 'Available', n: 1 },
     { k: 'when', t: 'Available from', date: 1, tip: "In China: the pull-from date and its rule. Arriving (In Trans on the ATS report, or ours on the water or at port): the ETA" },
     { k: 'readyDate', t: 'Ready date (CRD)', date: 1, tip: "The first of Container Tracking's Ready Date, the PO Book's own date, Factory CRD, CRD Expected and Ship by, with every source's date under it" },
@@ -2396,13 +2414,16 @@
   // What the ATS report already counts of one of our lots (units), and the words for it.
   const lotErp = l => units(l.matched) + units(l.received) + units(l.inErpTransit);
   // Under the "Counted on the ATS report" column (which names the report), short: "In Trans", "received",
-  // "In Trans, still booked or loaded here"; the cell's tooltip spells it out.
+  // "In Trans, still booked or loaded here" (or "its PO sailed", "still in China here", by why it came off China); the
+  // cell's tooltip spells it out.
+  const TIER_SHORT = { vessel: 'still booked or loaded here', po: 'its PO sailed', other: 'still in China here' };
+  const TIER_LONG = { vessel: 'booked or loaded', po: 'in China (Container Tracking has their PO sailed or landed)', other: 'in China' };
   const lotErpWords = l => [units(l.matched) ? `${l.matched === l.units ? '' : fmtN(l.matched) + ' '}In Trans` : '',
     units(l.received) ? `${l.received === l.units ? '' : fmtN(l.received) + ' '}received` : '',
-    units(l.inErpTransit) ? `${l.inErpTransit === l.units ? '' : fmtN(l.inErpTransit) + ' '}In Trans, still booked or loaded here` : ''].filter(Boolean).join(' · ');
+    units(l.inErpTransit) ? `${l.inErpTransit === l.units ? '' : fmtN(l.inErpTransit) + ' '}In Trans, ${TIER_SHORT[l.erpTier] || TIER_SHORT.other}` : ''].filter(Boolean).join(' · ');
   const lotErpLong = l => [units(l.matched) ? `${fmtN(l.matched)} are on the ATS report's In Trans (the same goods as its shipments, counted once)` : '',
     units(l.received) ? `${fmtN(l.received)} are received, in the ATS report's In WH (an ETA on or before the report's date${savedNote()})` : '',
-    units(l.inErpTransit) ? `${fmtN(l.inErpTransit)} are In Trans on the ATS report though our sheets still show them booked or loaded` : ''].filter(Boolean).join('; ');
+    units(l.inErpTransit) ? `${fmtN(l.inErpTransit)} are In Trans on the ATS report (left China) though our sheets still show them ${TIER_LONG[l.erpTier] || TIER_LONG.other}` : ''].filter(Boolean).join('; ');
   // Units in whole cases and loose units, as the tiles count them (a part case is never offered as a case).
   const casesWords = (u, p) => { const c = Math.floor(u / p + 1e-9), lo = u - c * p; return [c ? plural(c, 'case') : '', lo ? plural(lo, 'loose unit') : ''].filter(Boolean).join(' + '); };
   // Without the ATS report every lot's orders are unknown: the stock line says it once instead.
@@ -2493,7 +2514,7 @@
     if (erpL.length) parts.push(`${plural(erpL.length, 'shipment')} In Trans on the ATS report (${fmtN(sum(erpL, l => l.units))} units)`);
     const cm = sum(lots, l => l.matched), cr = sum(lots, l => l.received), ct = sum(lots, l => l.inErpTransit);
     if (cm) parts.push(`${fmtN(cm)} of ours on the water or at port are those same goods (counted once)`);
-    if (ct) parts.push(`${fmtN(ct)} of ours booked or loaded are In Trans on the ATS report (taken off China)`);
+    if (ct) parts.push(`${fmtN(ct)} of ours ${lots.every(l => !units(l.inErpTransit) || l.erpTier === 'vessel') ? 'booked or loaded' : 'still in China on our sheets'} are In Trans on the ATS report (taken off China)`);
     if (cr) parts.push(`${fmtN(cr)} of ours received (in the ATS report's In WH)`);
     if (r) {
       if (units(r.s.soldChina)) parts.push(`${fmtN(r.s.soldChina)} sold (ships from China), not available`);
@@ -2509,12 +2530,12 @@
       const S2 = k => rowsShown.reduce((q, x) => q + units(x.s[k]), 0);
       const bits = [S2('erpInTrans') ? `${fmtN(S2('erpInTrans'))} In Trans on the ATS report${asOfText()}` : '',
         S2('matchedOurs') ? `our ${fmtN(S2('matchedOurs'))} on the water or at port are on it (counted there, not again)` : '',
-        S2('inErpTransitTaken') ? `${fmtN(S2('inErpTransitTaken'))} more on it were taken off our booked or loaded lots in China` : '',
-        S2('landedNotReceived') ? `${fmtN(S2('landedNotReceived'))} more on it were due on or before the report's date: landed, not received yet` : '',
-        S2('erpUnmatched') ? `${fmtN(S2('erpUnmatched'))} more on it, due after the report's date, aren't on our shipping data as sailed` : '',
+        S2('landedOurs') ? `${fmtN(S2('landedOurs'))} more on it are goods our sheets have landed: landed, not received yet` : '',
+        S2('landedDue') ? `${fmtN(S2('landedDue'))} more on it were due on or before the report's date: landed, not received yet` : '',
+        S2('inErpTransitTaken') ? `${fmtN(S2('inErpTransitTaken'))} more on it have left China though our sheets still show them there: taken off those lots` : '',
+        S2('erpUnplaced') ? `check: ${fmtN(S2('erpUnplaced'))} more on it aren't on our sheets as sailed or landed${S2('unplacedInChina') ? ` (${fmtN(S2('unplacedInChina'))} of them while our sheets still show the style in China)` : ''}: listed on Problems` : '',
         S2('receivedDropped') ? `${fmtN(S2('receivedDropped'))} of ours with an ETA on or before the report's date${savedNote()} aren't on it: received, in its In WH` : '',
-        S2('keptExtra') ? `${fmtN(S2('keptExtra'))} of ours aren't on it yet: arriving from our shipping data` : '',
-        S2('maybeTwice') ? `check: ${fmtN(S2('maybeTwice'))} may be goods our Master Sheet still has in China (offered twice; listed on Problems)` : ''].filter(Boolean);
+        S2('keptExtra') ? `${fmtN(S2('keptExtra'))} of ours aren't on it yet: arriving from our shipping data` : ''].filter(Boolean);
       stock = arrivingFromErp() && bits.length ? `Arriving: ${bits.join('; ')}.` : '';
     } else if (p.kind === 'sellTile' && p.b === 'total' && rowsShown) stock = stockOk() ? `Plus ${fmtN(rowsShown.reduce((q, x) => q + units(x.s.now), 0))} available now from stock (not lots, so not listed).` : `Stock: ${stockWord()}. ${atsWhy()}`;
     stockEl.textContent = stock; stockEl.hidden = !stock;

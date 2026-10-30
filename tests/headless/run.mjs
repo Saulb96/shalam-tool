@@ -206,7 +206,8 @@ function buildFixtures(today) {
   //   CRD and no Ship by (about 75 days after the order date), not on the ATS report · SL-104 Ready, CRD passed ("now"),
   //   oversold · SL-105 shipped, on the water (its ETA) · SL-106 Factory CRD and CRD Expected 20 days apart (dates
   //   disagree) · SL-107 China Pickup (sold) · SL-108 on the ATS report only · SL-109 Ready, CRD passed ("now"), part
-  //   taken by orders.
+  //   taken by orders · SL-111 Ready, CRD passed, the ATS report's In Trans of it due before its date with a blank
+  //   Import PO Backlog (nothing left in China: taken off the Ready lot, never called landed).
   const sd = d => C.fmtDay(today + d), sser = d => today + d + 25569;
   const sellLines = [   // [style, PO, quantity, Master, order date, CRD Expected, Factory CRD, Ship by, order type, UPC] (days from today)
     ['SL-105', 900506, 2400, 24, -90, -40, -40, -40, 'Stock', '000000005055'],
@@ -217,7 +218,8 @@ function buildFixtures(today) {
     ['SL-104', 900505, 1200, 24, -60, -20, -20, -20, 'Stock', '000000005048'],
     ['SL-106', 900507, 960, 24, -60, 60, 40, 40, 'Stock', '000000005062'],
     ['SL-107', 900508, 720, 24, -60, 30, 30, 30, 'China Pickup', '000000005079'],
-    ['SL-109', 900509, 600, 12, -60, -12, -12, -12, 'Stock', '000000005093']];
+    ['SL-109', 900509, 600, 12, -60, -12, -12, -12, 'Stock', '000000005093'],
+    ['SL-111', 900510, 400, 12, -60, -15, -15, -15, 'Stock', '000000005116']];
   const sOpt = d => (d == null ? null : sd(d));
   bytes.set('trk-sell.xlsx', xlsxBytes({ 'PO Status Tracker': [TH, ...sellLines.map(([sty, po, , , od, exp, fcrd, , type]) =>
     [po, 'Factory S', sd(od), 'Item ' + sty, sty, 'Cosmetics', type, type === 'China Pickup' ? 'Customer 2' : 'Customer 1', sd(120), sOpt(exp), sOpt(fcrd), null])] }));
@@ -235,11 +237,15 @@ function buildFixtures(today) {
   }));
   // SL-101's "ATS from in WH" isn't In WH − Total Customer Orders (listed); SL-105's numbers are stored as text.
   // In Trans (Arriving comes from it, each quantity with its ETA): SL-105's two shipments are our 2,400 on the water
-  // (matched); SL-101's 600 are goods we still see booked on a vessel (taken off its Booked lot).
+  // (matched); SL-101's 600 are goods we still see booked on a vessel (taken off its Booked lot); SL-106's 300, due after
+  // the report's day, have left China though our sheets still show them in production (taken off that lot); SL-110's
+  // 250 are on no sheet of ours (unplaced: Arriving on the ERP's word, listed); SL-111's 400, due before the report's
+  // day with its Import PO Backlog blank, have left China: taken off its Ready lot.
   const trans = (r, q, eta) => { const x = r.slice(); x[10] = q; x[12] = eta; return x; };
   const sellAts = [trans(ar('SL-101', 1000, 200, 700), '600', sd(58)), ar('SL-102', 100, 1600), ar('SL-104', 0, 5000),
     trans(ar('SL-105', '300', '0', '300'), '1,000, 1,400', `${sd(18)}, ${sd(25)}`),
-    ar('SL-106', 0, 0), ar('SL-107', 0, 0), ar('SL-108', 50, 0), ar('SL-109', 0, 100)];
+    trans(ar('SL-106', 0, 0), '300', sd(45)), ar('SL-107', 0, 0), ar('SL-108', 50, 0), ar('SL-109', 0, 100), trans(ar('SL-110', 0, 0), '250', sd(40)),
+    trans(ar('SL-111', 0, 0), '400', sd(-5))];
   bytes.set('ats-sell.xlsx', atsBook(sellAts));
   bytes.set('ats-sell-bad.xlsx', atsBook(sellAts, { grand: 9999 }));
 
@@ -329,8 +335,8 @@ function ruleMismatches(S, today) {
 }
 // The selling engine's sums: the styles add up to the totals, each style's lots to its numbers, stock after orders,
 // customer orders taken off the earliest lots first, our lots to the stage engine's Incoming, the ERP's lots to the
-// report's In Trans (matched + in its transit + landed + not sailed on ours), received never more than In WH, and sold to
-// its Pull from China. Answers what doesn't hold.
+// report's In Trans (matched + landed + taken off China + unplaced; nothing offered twice), received never more than
+// In WH, and sold to its Pull from China. Answers what doesn't hold.
 function sellSums(S, R, A) {
   const bad = [], T = S.totals, sum = (a, f) => a.reduce((p, x) => p + (f(x) || 0), 0);
   for (const k of ['now', 'fromChina', 'arriving', 'arrivingErp', 'arrivingOurs', 'total', 'soldChina', 'oversold', 'ordersTaken']) if (sum(S.styles, x => x[k]) !== T[k]) bad.push(`styles' ${k} ${sum(S.styles, x => x[k])} ≠ total ${T[k]}`);
@@ -341,7 +347,8 @@ function sellSums(S, R, A) {
     const ls = s.lots, lu = sum(ls, l => l.taken + l.available);
     if (lu !== s.fromChina + s.arriving + s.ordersTaken) bad.push(`${s.style}: lots ${lu} ≠ from China + arriving + taken`);
     const erp = sum(ls.filter(l => l.source === 'erp'), l => l.units), e = A && A.styles && A.styles.get(s.style);
-    if (s.arrivingFrom === 'erp' && (erp !== s.erpInTrans || erp !== s.matchedOurs + s.inErpTransitTaken + s.landedNotReceived + s.erpUnmatched || !e || erp !== (e.inTrans || 0))) bad.push(`${s.style}: the ERP's lots ${erp} aren't its In Trans (matched + in its transit + landed + not sailed on ours)`);
+    if (s.arrivingFrom === 'erp' && (erp !== s.erpInTrans || erp !== s.matchedOurs + s.landedNotReceived + s.inErpTransitTaken + s.erpUnplaced || !e || erp !== (e.inTrans || 0))) bad.push(`${s.style}: the ERP's lots ${erp} aren't its In Trans (matched + landed + taken off China + unplaced)`);
+    if (s.offeredTwice) bad.push(`${s.style}: ${s.offeredTwice} In Trans on the ERP also offered from China`);
     if (isDay(s.inWh) && s.receivedDropped > Math.max(0, s.inWh)) bad.push(`${s.style}: received ${s.receivedDropped} > In WH ${s.inWh}`);
     if (s.arrivingFrom !== 'erp' && erp) bad.push(`${s.style}: ERP lots without the ERP's In Trans`);
     if (s.fromChina !== sum(ls.filter(l => l.inChina), l => l.available) || s.arriving !== sum(ls.filter(l => !l.inChina), l => l.available)) bad.push(`${s.style}: lot availability`);
@@ -1999,6 +2006,9 @@ const SCENARIOS = [
         erpLots: S.lots.filter(l => l.style === 'SL-105' && l.source === 'erp').map(l => `${l.units}@${l.eta - today}`).join() === '1000@18,1400@25',
         matched: !!L.eta && L.eta.matched === 2400 && L.eta.available === 0 && L.eta.flags.includes('matched-erp'),
         inErpTransit: !!L.etd && L.etd.inErpTransit === 600 && L.etd.available === 600 && sty('SL-101').fromChina === 600 && sty('SL-101').arriving === 600,
+        offChina: !!L.dis && L.dis.inErpTransit === 300 && L.dis.erpTier === 'other' && sty('SL-106').fromChina === 660 && sty('SL-106').arriving === 300,
+        unplaced: sty('SL-110').erpUnplaced === 250 && sty('SL-110').unplacedInChina === 0 && sty('SL-110').arriving === 250 && S.totals.offeredTwice === 0,
+        offChinaDue: sty('SL-111').inErpTransitTaken === 400 && sty('SL-111').takenDueBy === 400 && sty('SL-111').landedNotReceived === 0 && sty('SL-111').fromChina === 0 && sty('SL-111').arriving === 400,
         arriving105: sty('SL-105').arriving === 2400 && sty('SL-105').arrivingErp === 2400 && sty('SL-105').firstArrival === today + 18 };
       c('the invented files exercise every rule: ETD, CRD, the order date, "now", ETA, ready dates that disagree, orders over two lots, oversold, not on the report, report only, sold, the ERP\'s In Trans (matched, in its transit)',
         Object.values(shape).every(Boolean), JSON.stringify(shape));
@@ -2046,6 +2056,14 @@ const SCENARIOS = [
         /600 more on it are goods our sheets still show booked or loaded/.test(row('SL-101').arrivingTitle) &&
         /^600 more are booked or loaded on our sheets, but the ATS report already counts them In Trans: they're in Arriving/.test(row('SL-101').fromChinaTitle), JSON.stringify(row('SL-101')));
       c('SL-103 (not on the report): its tag says its Arriving is our shipping data', /its Arriving is our shipping data/.test(row('SL-103').tagTitles.join(' ')), JSON.stringify(row('SL-103').tagTitles));
+      c("SL-106: the ATS report's 300 due after its date have left China, taken off its lot in production; its From China and Arriving say so",
+        row('SL-106').fromChina === '660' && row('SL-106').arriving === '300' && /^300 more are still in China on our sheets, but the ATS report already counts them In Trans: they're in Arriving/.test(row('SL-106').fromChinaTitle) &&
+        /300 more on it are due after the report's date, so they have left China: taken off our lots still in China there \(300 other lots, earliest first\)/.test(row('SL-106').arrivingTitle), JSON.stringify(row('SL-106')));
+      c("SL-111: the ATS report's 400 due before its date, its Import PO Backlog blank: taken off the Ready lot (never landed); its From China and Arriving say so",
+        row('SL-111').fromChina === '' && row('SL-111').arriving === '400' && /^400 more are still in China on our sheets, but the ATS report already counts them In Trans: they're in Arriving/.test(row('SL-111').fromChinaTitle) &&
+        /400 more on it have left China per the report \(its Import PO Backlog has none of the style left in China\), though our sheets still show them there: taken off our lots still in China \(400 other lots, earliest first\)/.test(row('SL-111').arrivingTitle), JSON.stringify(row('SL-111')));
+      c("SL-110: the ATS report's 250 In Trans on no sheet of ours: Arriving, tagged \"check\" (on the ERP's word)",
+        row('SL-110').arriving === '250' && row('SL-110').tags.includes('check') && /the ERP counts 250 units in transit that our sheets don't have as sailed, landed or in China/.test(row('SL-110').tagTitles.join(' ')), JSON.stringify(row('SL-110')));
       t.shots.push(await t.shot('sell-ok'));
 
       // The side panel of every style with lots: each lot in date order, the date a buyer can have it and its rule in words.
@@ -2090,6 +2108,10 @@ const SCENARIOS = [
       const rd6 = (p.lots[0] || {})['Ready date (CRD)'] || {};
       c(`SL-106: ready date ${C.fmtDay(today + 40)} "dates disagree", Factory CRD used, CRD Expected ${md(today + 60, today)} beside it`,
         rd6.v === `${C.fmtDay(today + 40)} dates disagree` && rd6.u.includes(`Factory CRD ${md(today + 40, today)} (used)`) && rd6.u.includes(`CRD Expected ${md(today + 60, today)}`), JSON.stringify(rd6));
+      const er6 = (p.lots[0] || {})['Counted on the ATS report'] || {};
+      c('SL-106: its lot in production has 300 "In Trans, still in China here" (left China per the ATS report), the rest available; the panel says it',
+        er6.v === '300' && er6.u === '300 In Trans, still in China here' && /left China/.test(er6.title || '') && p.panelSub.includes('300 of ours still in China on our sheets are In Trans on the ATS report (taken off China)'),
+        `${JSON.stringify(er6)} · ${p.panelSub}`);
       await t.click('#btnPanelClose'); await sleep(60);
       // SL-105: the ATS report's two In Trans shipments, and our lot on the water matched to them, in plain words.
       await t.eval(`[...document.querySelectorAll('#sellTable tbody tr.r button.sb')].find(x => x.textContent.trim() === 'SL-105').click()`); await sleep(150);
@@ -2212,6 +2234,8 @@ const SCENARIOS = [
         pt.includes('Style SL-104: customer orders (5,000) are 3,800 units more') && pt.includes('PO 900507, style SL-106: the ready dates are up to 20 days apart') && /SL-108/.test(pt) && /Style SL-101 \(row \d+\): the ERP's "ATS from in WH" is 700/.test(pt),
         pt.slice(0, 300));
       c('no "page sums differ" issue (the rows add up to the engine\'s totals)', !/page adds the styles up/.test(pt));
+      c("…and SL-110's In Trans on no sheet of ours, one line", pt.includes("Style SL-110: the ERP counts 250 units in transit that our sheets don't have on the water, at port, landed or still to sell in China") &&
+        S.issues.filter(i => i.code === 'erp-transit-unplaced').length === 1, pt.slice(0, 300));
       await t.click('#tabs .tab[data-tab="sell"]'); await sleep(150);
     },
   },
@@ -2354,7 +2378,7 @@ const SCENARIOS = [
       console.log('REAL Available to sell (units / cases / units with no case pack):');
       for (const k of ['now', 'fromChina', 'arriving', 'total', 'soldChina']) console.log(`  ${k}: ${fmtN(T[k])} / ${fmtN(K[k])} / ${fmtN(N[k])}`);
       console.log(`  oversold ${fmtN(T.oversold)} units on ${fmtN(nOv)} styles · customer orders taken off lots ${fmtN(T.ordersTaken)}`);
-      console.log(`  arriving: the ATS report's In Trans ${fmtN(T.arrivingErp)} + ours ${fmtN(T.arrivingOurs)} · In Trans ${fmtN(T.erpInTrans)} = matched ${fmtN(T.matchedOurs)} + in its transit ${fmtN(T.inErpTransitTaken)} + landed, not received ${fmtN(T.landedNotReceived)} + not sailed on ours ${fmtN(T.erpUnmatched)} · maybe twice ${fmtN(T.maybeTwice)} · taken though in backlog ${fmtN(T.takenInBacklog)} · received (dropped) ${fmtN(T.receivedDropped)} · kept as ours ${fmtN(T.keptExtra)}`);
+      console.log(`  arriving: the ATS report's In Trans ${fmtN(T.arrivingErp)} + ours ${fmtN(T.arrivingOurs)} · In Trans ${fmtN(T.erpInTrans)} = matched ${fmtN(T.matchedOurs)} + landed, not received ${fmtN(T.landedNotReceived)} (ours ${fmtN(T.landedOurs)}, due ${fmtN(T.landedDue)}) + taken off China ${fmtN(T.inErpTransitTaken)} (on a vessel ${fmtN(T.takenOnVessel)}, PO sailed ${fmtN(T.takenSamePo)}, other ${fmtN(T.takenOther)}) + unplaced ${fmtN(T.erpUnplaced)} (in China ${fmtN(T.unplacedInChina)}) · offered twice ${fmtN(T.offeredTwice)} · received (dropped) ${fmtN(T.receivedDropped)} · kept as ours ${fmtN(T.keptExtra)}`);
       console.log(`REAL lots ${fmtN(cnt.lots)} (in China ${fmtN(cnt.lotsInChina)}, sailed ${fmtN(cnt.lotsSailed)}, the ATS report's In Trans ${fmtN(cnt.erpLots)}) · pull rule ${Object.entries(cnt.byRule).map(([k, v]) => `${k} ${fmtN(v)} (${fmtN(cnt.byRuleUnits[k])} units)`).join(', ')} · "now" ${fmtN(cnt.pullNow)} · sailed ${Object.entries(cnt.sailedByRule).map(([k, v]) => `${k} ${fmtN(v)}`).join(', ')}`);
       console.log(`REAL dates disagree: ${fmtN(cnt.datesDisagreeLots)} lots on ${fmtN(cnt.datesDisagreePairs)} PO + style · styles ${fmtN(S.styles.length)}, with stock now ${fmtN(cnt.stylesWithStock)}, not on the report ${fmtN(cnt.stylesNotOnReport)}, report only ${fmtN(cnt.erpOnlyStyles)}`);
       console.log('REAL Available to sell issue codes: ' + Object.entries(codes).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(', '));

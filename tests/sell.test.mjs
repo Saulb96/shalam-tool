@@ -468,16 +468,16 @@ test('ready date: a source more than a year ahead (a wrong year) is skipped for 
 
 // ---------- Arriving from the ERP's In Trans (Saul, Oct 30)
 
-// A parseAts result with In Trans shipments: { style: [inWh, orders, [[qty, ETA], …], [backlog, …]] } (one report row
-// each; an ETA of null is a part that can't be read), and the In Trans column found (the Import PO Backlog column too
-// when any style gives one).
+// A parseAts result with In Trans shipments: { style: [inWh, orders, [[qty, ETA, PO?], …], [backlog, …]] } (one report
+// row each; an ETA of null is a part that can't be read; a shipment's own PO only when the report has a PO column), and
+// the In Trans column found (the Import PO Backlog column too when any style gives one, even an empty list).
 function atsE(map, reportDay = D(10, 29)) {
   const a = atsOf(Object.fromEntries(Object.entries(map).map(([k, v]) => [k, [v[0], v[1]]])), reportDay);
   for (const [k, v] of Object.entries(map)) {
     const ships = v[2] || [], s = a.styles.get(k), bl = v[3] || [];
     s.rows = [{ row: 3, warehouse: 'WH 1', inWh: v[0], orders: v[1], inTrans: ships.length ? ships.reduce((t, x) => t + x[0], 0) : null,
       inTransList: ships.map(x => x[0]), inTransBad: [], etaParts: ships.map(x => x[1] ?? null), eta: ships.map(x => x[1]).filter(d => d != null),
-      backlog: bl.length ? bl.reduce((t, n) => t + n, 0) : null, backlogList: bl }];
+      backlog: bl.length ? bl.reduce((t, n) => t + n, 0) : null, backlogList: bl, poParts: ships.some(x => x[2]) ? ships.map(x => x[2] || '') : [] }];
     s.inTrans = s.rows[0].inTrans; s.backlog = s.rows[0].backlog;
   }
   const backlog = Object.values(map).some(v => v[3]);
@@ -488,17 +488,23 @@ const erpLots = (r, s = 'AB100') => r.lots.filter(l => l.style === s && l.source
 // Every unit accounted for, per style, against the inputs worked out here: our lots hold the stage numbers' Incoming
 // (every allocation in a counted stage that isn't sold), the ERP's lots its In Trans; what's sellable (from China +
 // arriving + taken by orders) + matched + received + in the ERP's transit = Incoming + In Trans; In Trans = matched +
-// in its transit + landed, not received + due later, not sailed on our data.
+// landed, not received + taken off China + unplaced, each of its shipments placed in full.
 // Then the checks the identities can't make (a unit counted twice or dropped still adds up), each against the inputs:
-// received never more than In WH and only with an ETA on or before the report's day; landed only as far as the ERP's
-// shipments due by then go beyond ours; maybe-twice never more than the In Trans not sailed on our data, the Container
-// Tracking units sailed with no Master Sheet line, or our goods in China; taken-in-backlog never more than taken.
+// received never more than In WH and only with an ETA on or before the report's day; landed by our Landed goods never
+// more than those (not sold) dated from 60 days before the report's day up to today, landed by its shipments never more
+// than those due by then; taken off China only from our lots still in China, never below the report's Import PO
+// Backlog (sold goods count until they're loaded; a part below zero or not a number: no backlog); with a backlog, landed
+// never more than the In Trans beyond what may come off China; In Trans left unplaced only when nothing more could come
+// off China; and never In Trans landed or unplaced while our China goods beyond the backlog are still offered (offered
+// twice; with no backlog, unplaced while any are).
+const P = ['matched', 'landedOurs', 'landedDue', 'offChina', 'unplaced'];
 function reconcile(r, allocs, ats) {
   sumsHold(r);
   const lotB = [...SELL.IN_CHINA, ...SELL.SAILED];
   const sold = a => a.ptype === 'China Pickup' || (a.flags || []).includes('pull-section');
   const sumU = (a, f = x => x.units) => a.reduce((t, x) => t + f(x), 0);
   const rep = r.reportDay;
+  const backlogCol = !!(ats && Array.isArray(ats.columns) && ats.columns.includes('backlog'));
   for (const s of r.styles) {
     const mine = allocs.filter(a => a.style === s.style);
     const incoming = sumU(mine.filter(a => lotB.includes(a.bucket) && !sold(a)));
@@ -510,24 +516,52 @@ function reconcile(r, allocs, ats) {
     assert.equal(s.lots.filter(l => l.source === 'erp').reduce((t, l) => t + l.units, 0), inTrans, `${s.style}: the ERP's lots hold its In Trans`);
     assert.equal(s.fromChina + s.arriving + s.ordersTaken + s.matchedOurs + s.receivedDropped + s.inErpTransitTaken, incoming + inTrans, `${s.style}: Incoming + In Trans`);
     if (s.arrivingFrom === 'erp') {
-      assert.equal(s.erpInTrans, s.matchedOurs + s.inErpTransitTaken + s.landedNotReceived + s.erpUnmatched, `${s.style}: In Trans = matched + in transit + landed + not sailed on our data`);
+      assert.equal(s.erpInTrans, s.matchedOurs + s.landedNotReceived + s.inErpTransitTaken + s.erpUnplaced, `${s.style}: In Trans = matched + landed + taken off China + unplaced`);
+      assert.equal(s.landedNotReceived, s.landedOurs + s.landedDue, `${s.style}: landed`);
+      assert.equal(s.inErpTransitTaken, s.takenOnVessel + s.takenSamePo + s.takenOther, `${s.style}: taken by tier`);
+      const eL = s.lots.filter(l => l.source === 'erp'), placed = k => sumU(eL, l => l.place[k]);
+      for (const l of eL) assert.equal(P.reduce((t, k) => t + l.place[k], 0), l.units, `${l.id}: placed in full`);
+      assert.deepEqual([placed('matched'), placed('landedOurs'), placed('landedDue'), placed('offChina'), placed('unplaced')],
+        [s.matchedOurs, s.landedOurs, s.landedDue, s.inErpTransitTaken, s.erpUnplaced], `${s.style}: the shipments' places`);
       // The checks the identities can't make.
       if (e && typeof e.inWh === 'number') assert.ok(s.receivedDropped <= Math.max(0, e.inWh), `${s.style}: received ${s.receivedDropped} > In WH ${e.inWh}`);
-      const sailedDue = sumU(mine.filter(a => SELL.SAILED.includes(a.bucket) && !sold(a) && a.eta != null && rep != null && a.eta <= rep));
-      const erpDue = sumU(ships.filter(x => x.eta != null && rep != null && x.eta <= rep));
-      assert.ok(s.landedNotReceived <= Math.max(0, erpDue - sailedDue), `${s.style}: landed ${s.landedNotReceived} beyond the ERP's shipments due by the report's day`);
-      const ctSailed = sumU(mine.filter(a => ['unmatched', 'ctMore'].includes(a.bucket) && ['On the water', 'At port'].includes(a.stage)));
+      const day = a => a.eta ?? a.etd ?? null;
+      const recent = rep == null ? 0 : sumU(mine.filter(a => a.bucket === 'landed' && !sold(a) && day(a) != null && day(a) >= rep - 60 && day(a) <= Math.max(rep, TODAY)));
+      assert.ok(s.landedOurs <= recent, `${s.style}: landed ${s.landedOurs} beyond our recent Landed goods ${recent}`);
+      // A shipment due after the report's day is our Landed goods' only within 14 days of the date of one of them.
+      for (const l of eL) if (l.place.landedOurs && !(l.eta != null && rep != null && l.eta <= rep)) {
+        assert.ok(l.eta != null && mine.some(a => a.bucket === 'landed' && !sold(a) && day(a) != null && day(a) >= rep - 60 && day(a) <= Math.max(rep, TODAY) && l.eta <= day(a) + SELL.LANDED_LATE_DAYS), `${l.id}: landed, due ${l.eta}`);
+      }
+      assert.equal(s.landedLater, sumU(eL.filter(l => !(l.eta != null && rep != null && l.eta <= rep)), l => l.place.landedOurs), `${s.style}: landed later`);
+      assert.ok(s.landedDue <= sumU(ships.filter(x => x.eta != null && rep != null && x.eta <= rep)), `${s.style}: landed beyond the shipments due by the report's day`);
       const china = sumU(mine.filter(a => SELL.IN_CHINA.includes(a.bucket) && !sold(a)));
-      assert.ok(s.maybeTwice <= Math.min(s.erpUnmatched, ctSailed, china), `${s.style}: maybe-twice ${s.maybeTwice}`);
-      assert.equal(s.flags.includes('maybe-twice'), s.maybeTwice > 0, s.style);
-      assert.ok(s.takenInBacklog <= s.inErpTransitTaken, `${s.style}: taken-in-backlog`);
-    } else assert.deepEqual([s.erpInTrans, s.matchedOurs, s.receivedDropped, s.inErpTransitTaken, s.landedNotReceived, s.erpUnmatched, s.keptExtra, s.arrivingErp, s.maybeTwice, s.takenInBacklog],
-      [null, 0, 0, 0, 0, 0, 0, 0, 0, 0], s.style);
+      const soldChina = sumU(mine.filter(a => ((sold(a) && SELL.IN_CHINA.includes(a.bucket)) || (a.bucket === 'pullFromChina' && !['On the water', 'At port', 'Landed', 'Shipped'].includes(a.stage))) &&
+        a.bucket !== 'loaded' && a.stage !== 'Loaded'));
+      const parts = backlogCol && e ? e.rows.flatMap(x => x.backlogList || []) : [];
+      const backlog = !backlogCol || !e || parts.some(n => !(n >= 0)) || e.rows.some(x => (x.backlogBad || []).length) ? null : sumU(parts, n => n);
+      const room = backlog == null ? Infinity : Math.max(0, china + soldChina - backlog), held = china - s.inErpTransitTaken;
+      assert.ok(s.inErpTransitTaken <= room, `${s.style}: ${s.inErpTransitTaken} taken off China, below the backlog`);
+      if (s.erpUnplaced > 0) assert.ok(held === 0 || s.inErpTransitTaken === room, `${s.style}: unplaced while more could come off China`);
+      if (backlog != null) assert.ok(s.landedNotReceived <= Math.max(0, inTrans - s.matchedOurs - Math.min(room, china)), `${s.style}: landed ${s.landedNotReceived} while the backlog says more has left China`);
+      if (s.erpInTrans < s.ourSailed) assert.equal(s.landedNotReceived + s.erpUnplaced, 0, `${s.style}: the ERP has less: nothing landed or unplaced`);
+      assert.equal(backlog == null ? Math.min(s.erpUnplaced, held) : Math.min(s.landedNotReceived + s.erpUnplaced, held, Math.max(0, held + soldChina - backlog)), 0, `${s.style}: offered twice`);
+      assert.deepEqual([s.offeredTwice, s.unplacedInChina, s.erpBacklog], [0, Math.min(s.erpUnplaced, held), backlog], s.style);
+      assert.equal(s.takenDueBy, sumU(eL.filter(l => l.eta != null && rep != null && l.eta <= rep), l => l.place.offChina), `${s.style}: taken off China on shipments due by the report's day`);
+      assert.equal(s.flags.includes('erp-backlog-unknown'), backlogCol && !!e && backlog == null, `${s.style}: backlog unknown`);
+      assert.equal(s.flags.includes('erp-transit-unplaced'), s.erpUnplaced > 0, s.style);
+      assert.equal(r.issues.filter(i => i.code === 'erp-transit-unplaced' && i.style === s.style).length, s.erpUnplaced > 0 ? 1 : 0, `${s.style}: one Problems line`);
+    } else assert.deepEqual([s.erpInTrans, s.matchedOurs, s.receivedDropped, s.inErpTransitTaken, s.landedNotReceived, s.erpUnplaced, s.keptExtra, s.arrivingErp, s.offeredTwice],
+      [null, 0, 0, 0, 0, 0, 0, 0, 0], s.style);
   }
-  for (const l of r.lots) if (l.received) assert.ok(l.eta != null && rep != null && l.eta <= rep, `${l.id}: received with an ETA after the report's day`);
+  for (const l of r.lots) {
+    if (l.received) assert.ok(l.eta != null && rep != null && l.eta <= rep, `${l.id}: received with an ETA after the report's day`);
+    if (l.inErpTransit) assert.ok(l.source === 'ours' && l.inChina && SELL.TIERS.includes(l.erpTier) && (l.erpTier !== 'vessel' || (['booked', 'loaded'].includes(l.bucket) && l.etd != null)), `${l.id}: in the ERP's transit`);
+  }
+  assert.equal(r.totals.offeredTwice, 0);
+  assert.ok(!r.issues.some(i => ['maybe-twice', 'taken-in-backlog', 'erp-in-trans-unmatched'].includes(i.code)), 'the old cross-checks are gone');
 }
 
-test('ERP In Trans ≥ our sailed units: ours are matched (not lots any more), the excess comes off Booked / Loaded lots by ETD', () => {
+test('ERP In Trans ≥ our sailed units: ours are matched (not lots any more); the excess due after the report day comes off Booked / Loaded lots by ETD first', () => {
   const as = [
     alloc({ po: '900901', bucket: 'water', units: 1000, eta: D(11, 10) }),
     alloc({ po: '900902', bucket: 'port', units: 500, eta: D(10, 25) }),
@@ -549,9 +583,12 @@ test('ERP In Trans ≥ our sailed units: ours are matched (not lots any more), t
     assert.deepEqual([l.matched, l.available, l.taken], [l.units, 0, 0], po);
     assert.ok(l.flags.includes('matched-erp') && s.lots.includes(l), po);
   }
-  // 2,800 − 1,500 = 1,300 more In Trans: off the Loaded lot (ETD 11/5) first, then the Booked one (11/20).
-  assert.deepEqual([lotOf(r, '900904').inErpTransit, lotOf(r, '900904').available], [800, 0]);
-  assert.deepEqual([lotOf(r, '900903').inErpTransit, lotOf(r, '900903').available], [500, 700]);
+  // 2,800 − 1,500 = 1,300 more In Trans, due after the report's day and nothing Landed of ours: off the Loaded lot
+  // (ETD 11/5) first, then the Booked one (11/20).
+  assert.deepEqual([lotOf(r, '900904').inErpTransit, lotOf(r, '900904').available, lotOf(r, '900904').erpTier], [800, 0, 'vessel']);
+  assert.deepEqual([lotOf(r, '900903').inErpTransit, lotOf(r, '900903').available, lotOf(r, '900903').erpTier], [500, 700, 'vessel']);
+  assert.deepEqual([s.takenOnVessel, s.takenSamePo, s.takenOther, s.erpUnplaced, s.landedNotReceived], [1300, 0, 0, 0, 0]);
+  assert.deepEqual(erpLots(r).map(l => [l.place.matched, l.place.offChina]), [[1500, 0], [0, 900], [0, 400]], 'ours on the shipment of their sum');
   assert.ok(lotOf(r, '900904').flags.includes('in-erp-transit') && lotOf(r, '900903').flags.includes('in-erp-transit'));
   assert.deepEqual([lotOf(r, '900905').inErpTransit, lotOf(r, '900905').available], [0, 600], 'Booked with no ETD: not on a vessel yet');
   assert.deepEqual([s.arrivingFrom, s.erpInTrans, s.erpShipments, s.ourSailed, s.matchedOurs, s.inErpTransitTaken, s.landedNotReceived, s.receivedDropped, s.keptExtra],
@@ -566,38 +603,102 @@ test('ERP In Trans ≥ our sailed units: ours are matched (not lots any more), t
   reconcile(r, as, ats);
 });
 
-test('ERP In Trans beyond our sailed and on-vessel units: landed (its ETA passed) or not sailed on our data (due later); orders come off the ERP lots by ETA', () => {
+test('step 1: In Trans our sheets have landed in the last 60 days is landed, not received yet; nothing comes off China', () => {
+  // A landed PO: the ERP's 5,040 In Trans due 10/22 is our Landed PO 900960 (ETA 10/22); the Booked 10,008 (ETD
+  // 11/11) is its Import PO Backlog. Until Oct 30 the rule took the 5,040 off the Booked lot.
   const as = [
-    alloc({ style: 'AB200', styleRaw: 'AB200', po: '900911', bucket: 'water', units: 300, eta: D(11, 1) }),
-    alloc({ style: 'AB200', styleRaw: 'AB200', po: '900912', bucket: 'loaded', units: 200, etd: D(11, 3) }),
+    alloc({ style: 'AB500', styleRaw: 'AB500', po: '900960', bucket: 'landed', stage: 'Landed', units: 5040, eta: D(10, 22) }),
+    alloc({ style: 'AB500', styleRaw: 'AB500', po: '900961', bucket: 'booked', stage: 'Booked', units: 10008, etd: D(11, 11) }),
+    // Five landed lots: five Landed lots (ETA 10/24) are the ERP's five shipments; the Loaded 1,344 and 480 sold (China
+    // Pickup) are its backlog.
+    ...[1248, 1440, 240, 336, 240].map((u, i) => alloc({ style: 'AB501', styleRaw: 'AB501', po: '90097' + i, bucket: 'landed', stage: 'Landed', units: u, eta: D(10, 24) })),
+    alloc({ style: 'AB501', styleRaw: 'AB501', po: '900979', bucket: 'loaded', stage: 'Loaded', units: 1344, etd: D(10, 30) }),
+    alloc({ style: 'AB501', styleRaw: 'AB501', po: '900978', bucket: 'pullFromChina', stage: 'Booked', ptype: 'China Pickup', units: 480 }),
+  ];
+  const ats = atsE({ AB500: [0, 768, [[5040, D(10, 22)]], [10008]],
+    AB501: [0, 5328, [[240, D(10, 24)], [1440, D(10, 24)], [240, D(10, 24)], [336, D(10, 24)], [1248, D(10, 24)]], [480, 1344]] });
+  const r = sell(as, ats), s = styleOf(r, 'AB500');
+  assert.deepEqual([s.landedOurs, s.landedDue, s.landedNotReceived, s.inErpTransitTaken, s.erpUnplaced, s.erpBacklog, s.takeable], [5040, 0, 5040, 0, 0, 10008, 0]);
+  assert.deepEqual(s.landedLots, [{ po: '900960', units: 5040, day: D(10, 22), dayFrom: 'eta' }]);
+  assert.deepEqual([lotOf(r, '900961').inErpTransit, lotOf(r, '900961').available], [0, 10008], 'the Booked lot stays available from China');
+  const [e] = erpLots(r, 'AB500');
+  assert.deepEqual([e.place.landedOurs, e.taken, e.available], [5040, 768, 4272]);
+  assert.ok(e.flags.includes('landed-not-received') && s.flags.includes('landed-not-received') && !s.flags.includes('in-erp-transit'));
+  assert.deepEqual([s.fromChina, s.arriving, s.total, s.oversold], [10008, 4272, 14280, 0]);
+  const s1 = styleOf(r, 'AB501');
+  assert.deepEqual([s1.landedOurs, s1.inErpTransitTaken, s1.erpUnplaced, s1.ordersTaken, s1.oversold, s1.fromChina, s1.arriving], [3504, 0, 0, 4848, 480, 0, 0]);
+  assert.deepEqual(erpLots(r, 'AB501').map(l => l.place.landedOurs), [240, 1440, 240, 336, 1248], 'each Landed lot on the shipment of its quantity');
+  assert.deepEqual([lotOf(r, '900979').inErpTransit, lotOf(r, '900979').taken], [0, 1344]);
+  assert.deepEqual([r.counts.landedOursStyles, r.counts.landedNotReceivedStyles, r.totals.landedOurs, r.totals.landedLater], [2, 2, 8544, 0]);
+  assert.ok(!codes(r).includes('erp-transit-unplaced') && !codes(r).includes('balance'));
+  reconcile(r, as, ats);
+  // The window: Landed goods dated (ETA, else ETD) from 60 days before the report's day (8/30) up to today (10/30), the
+  // latest first, never sold goods; the rest of the shipment due 10/25 is due by the report's day all the same.
+  const bs = [
+    alloc({ style: 'AB510', styleRaw: 'AB510', po: '900981', bucket: 'landed', stage: 'Landed', units: 1000, eta: D(8, 29) }),   // 61 days: no
+    alloc({ style: 'AB510', styleRaw: 'AB510', po: '900982', bucket: 'landed', stage: 'Landed', units: 400, eta: D(8, 30) }),    // 60 days: yes
+    alloc({ style: 'AB510', styleRaw: 'AB510', po: '900983', bucket: 'landed', stage: 'Landed', units: 300, etd: D(10, 1) }),    // ETD only: yes
+    alloc({ style: 'AB510', styleRaw: 'AB510', po: '900984', bucket: 'landed', stage: 'Landed', units: 200, eta: D(10, 30) }),   // after the report's day, by today: yes
+    alloc({ style: 'AB510', styleRaw: 'AB510', po: '900985', bucket: 'landed', stage: 'Landed', units: 250, eta: D(10, 31) }),   // after today: no
+    alloc({ style: 'AB510', styleRaw: 'AB510', po: '900986', bucket: 'landed', stage: 'Landed', units: 500, eta: D(10, 20), ptype: 'China Pickup' }),   // sold: no
+    alloc({ style: 'AB510', styleRaw: 'AB510', po: '900987', bucket: 'inProd', units: 3000, crd: D(12, 1), dates: { factoryCrd: D(12, 1) } }),
+    // A shipment due after the report's day is our Landed goods' only within 14 days of their date (10/27): 11/10 is,
+    // 11/11 isn't (it has left China: off the lot in production, whose 2,000 the backlog has only 1,700 of).
+    alloc({ style: 'AB511', styleRaw: 'AB511', po: '900988', bucket: 'landed', stage: 'Landed', units: 500, eta: D(10, 27) }),
+    alloc({ style: 'AB511', styleRaw: 'AB511', po: '900989', bucket: 'inProd', units: 2000, crd: D(12, 1), dates: { factoryCrd: D(12, 1) } }),
+    // A landed lot received long ago: the ERP's 20,016 due 11/11 are our 11,136 on the water and our Loaded 8,880; our 19,920 Landed on
+    // 9/29 are long received (In WH). Its backlog (96) lets 8,784 come off the Loaded lot; 96 stay unplaced, in China.
+    alloc({ style: 'AB512', styleRaw: 'AB512', po: '900990', bucket: 'landed', stage: 'Landed', units: 19920, eta: D(9, 29) }),
+    alloc({ style: 'AB512', styleRaw: 'AB512', po: '900991', bucket: 'water', stage: 'On the water', units: 11136, eta: D(11, 11) }),
+    alloc({ style: 'AB512', styleRaw: 'AB512', po: '900992', bucket: 'loaded', stage: 'Loaded', units: 8880, etd: D(10, 31) }),
+  ];
+  const ats2 = atsE({ AB510: [0, 0, [[1500, D(10, 25)]], [3000]], AB511: [0, 0, [[100, D(10, 29)], [300, D(11, 10)], [300, D(11, 11)]], [1700]],
+    AB512: [22416, 2064, [[20016, D(11, 11)]], [96]] });
+  const r2 = sell(bs, ats2), t = styleOf(r2, 'AB510');
+  assert.deepEqual([t.landedOurs, t.landedLater, t.landedDue, t.inErpTransitTaken, t.erpUnplaced, t.fromChina, t.arriving], [900, 0, 600, 0, 0, 3000, 1500]);
+  assert.deepEqual(t.landedLots.map(x => [x.po, x.units, x.dayFrom]), [['900984', 200, 'eta'], ['900983', 300, 'etd'], ['900982', 400, 'eta']]);
+  const t1 = styleOf(r2, 'AB511');
+  assert.deepEqual([t1.landedOurs, t1.landedLater, t1.landedDue, t1.takenOther, t1.erpUnplaced, t1.fromChina], [400, 300, 0, 300, 0, 1700]);
+  assert.deepEqual(erpLots(r2, 'AB511').map(l => [l.units, l.place.landedOurs, l.place.offChina]), [[100, 100, 0], [300, 300, 0], [300, 0, 300]]);
+  const t2 = styleOf(r2, 'AB512');
+  assert.deepEqual([t2.matchedOurs, t2.landedOurs, t2.takenOnVessel, t2.erpUnplaced, t2.unplacedInChina, t2.fromChina, t2.arriving, t2.now], [11136, 0, 8784, 96, 96, 96, 20016, 20352]);
+  assert.deepEqual([r2.counts.landedLaterStyles, r2.totals.landedLater], [1, 300]);
+  reconcile(r2, bs, ats2);
+});
+
+test('step 1: shipments due on or before the report day are landed, not received, even with no Landed goods of ours; ours on the water take the closest ETA', () => {
+  const as = [
+    alloc({ style: 'AB200', styleRaw: 'AB200', po: '900911', bucket: 'water', stage: 'On the water', units: 300, eta: D(11, 1) }),
+    alloc({ style: 'AB200', styleRaw: 'AB200', po: '900912', bucket: 'loaded', stage: 'Loaded', units: 200, etd: D(11, 3) }),
     alloc({ style: 'AB200', styleRaw: 'AB200', po: '900913', bucket: 'inProd', units: 1000, crd: D(12, 1), dates: { factoryCrd: D(12, 1) } }),
   ];
-  // 1,500 In Trans: our 300 on the water, 200 off the Loaded lot; of the 1,000 left, the 600 due 10/25 (before the
-  // report's day, 10/29) have landed, and 400 of the shipment due 11/20 aren't on our shipping data as sailed.
+  // 1,500 In Trans: our 300 on the water (ETA 11/1) are on the shipment due 10/25, the closest; its other 300 were due
+  // by the report's day (10/29): landed, not received. The 900 due 11/20 have left China: 200 off the Loaded lot, 700 off
+  // the one in production.
   const ats = atsE({ AB200: [100, 900, [[600, D(10, 25)], [900, D(11, 20)]]] });
   const r = sell(as, ats), s = styleOf(r, 'AB200');
-  assert.deepEqual([s.erpInTrans, s.matchedOurs, s.inErpTransitTaken, s.landedNotReceived, s.erpUnmatched, s.maybeTwice], [1500, 300, 200, 600, 400, 0]);
-  assert.ok(s.flags.includes('landed-not-received') && s.flags.includes('in-erp-transit') && s.flags.includes('erp-in-trans-unmatched') && !s.flags.includes('maybe-twice'));
-  // Customer orders beyond stock (800): the earliest lot with units left, the ERP's 10/25 shipment, then its 11/20 one
-  // (the Loaded lot's 10/24 pull-from date is earlier, but the ERP counts all of it in transit already).
+  assert.deepEqual([s.erpInTrans, s.matchedOurs, s.landedOurs, s.landedDue, s.takenOnVessel, s.takenSamePo, s.takenOther, s.erpUnplaced], [1500, 300, 0, 300, 200, 0, 700, 0]);
   const [e1, e2] = erpLots(r, 'AB200');
+  assert.deepEqual([e1.place, e2.place], [{ matched: 300, landedOurs: 0, landedDue: 300, offChina: 0, unplaced: 0 }, { matched: 0, landedOurs: 0, landedDue: 0, offChina: 900, unplaced: 0 }]);
+  assert.ok(e1.flags.includes('erp-ours-sailed') && e1.flags.includes('landed-not-received') && e2.flags.includes('erp-off-china'));
+  assert.deepEqual([lotOf(r, '900912').inErpTransit, lotOf(r, '900912').erpTier, lotOf(r, '900913').inErpTransit, lotOf(r, '900913').erpTier, lotOf(r, '900913').available],
+    [200, 'vessel', 700, 'other', 300]);
+  // Customer orders beyond stock (800): the ERP's 10/25 shipment, then its 11/20 one (before the lot in production's 11/26).
   assert.deepEqual([e1.taken, e1.available, e2.taken, e2.available], [600, 0, 200, 700]);
-  assert.ok(e1.flags.includes('taken') && e2.flags.includes('part-taken'));
-  assert.deepEqual([lotOf(r, '900912').taken, lotOf(r, '900912').available, lotOf(r, '900912').pullFrom], [0, 0, D(10, 24)]);
-  assert.deepEqual([s.now, s.ordersTaken, s.oversold, s.arriving, s.arrivingErp, s.fromChina, s.firstArrival], [0, 800, 0, 700, 700, 1000, D(11, 20)]);
-  assert.deepEqual([r.totals.landedNotReceived, r.totals.erpUnmatched, r.counts.landedNotReceivedStyles, r.counts.erpUnmatchedStyles], [600, 400, 1, 1]);
-  const un = r.issues.find(i => i.code === 'erp-in-trans-unmatched');
-  assert.match(un.message, /^1 style \(0 of them oversold\): 400 units In Trans on the ATS report, due after its date \(or with no ETA\), are more than our shipping data has/);
-  assert.ok(!codes(r).includes('maybe-twice'));
+  assert.deepEqual([s.now, s.ordersTaken, s.oversold, s.arriving, s.fromChina, s.total, s.firstArrival], [0, 800, 0, 700, 300, 1000, D(11, 20)]);
+  assert.deepEqual([r.counts.landedDueStyles, r.counts.inErpTransitTierLots.vessel, r.counts.inErpTransitTierLots.other], [1, 1, 1]);
   reconcile(r, as, ats);
-  // Styles with only In Trans on the report (none of ours): landed when its ETA has passed, else not sailed on our data;
-  // Arriving either way.
+  // Only In Trans on the report, none of ours: due by its day, landed; due later or with no ETA, unplaced (Arriving on
+  // the ERP's word, one Problems line each).
   const ats2 = atsE({ AB201: [0, 0], AB202: [0, 0, [[240, D(11, 9)]]], AB203: [0, 0, [[120, D(10, 20)], [60, null]]] });
-  const r2 = sell([alloc({ style: 'AB201', styleRaw: 'AB201', units: 50 })], ats2);
-  const s2 = styleOf(r2, 'AB202'), s3 = styleOf(r2, 'AB203');
-  assert.deepEqual([s2.arriving, s2.arrivingErp, s2.landedNotReceived, s2.erpUnmatched, s2.lots.length, s2.firstArrival], [240, 240, 0, 240, 1, D(11, 9)]);
-  assert.deepEqual([s3.arriving, s3.landedNotReceived, s3.erpUnmatched], [180, 120, 60], 'no ETA: not called landed');
-  reconcile(r2, [alloc({ style: 'AB201', styleRaw: 'AB201', units: 50 })], ats2);
+  const as2 = [alloc({ style: 'AB201', styleRaw: 'AB201', units: 50 })];
+  const r2 = sell(as2, ats2), s2 = styleOf(r2, 'AB202'), s3 = styleOf(r2, 'AB203');
+  assert.deepEqual([s2.arriving, s2.landedNotReceived, s2.erpUnplaced, s2.unplacedInChina, s2.firstArrival], [240, 0, 240, 0, D(11, 9)]);
+  assert.deepEqual([s3.arriving, s3.landedDue, s3.erpUnplaced], [180, 120, 60], 'no ETA: not called landed');
+  const un = r2.issues.filter(i => i.code === 'erp-transit-unplaced');
+  assert.deepEqual(un.map(i => [i.style, i.units, i.inChina]), [['AB202', 240, 0], ['AB203', 60, 0]]);
+  assert.match(un[0].message, /^Style AB202: the ERP counts 240 units in transit that our sheets don't have on the water, at port, landed or still to sell in China\. They're offered as Arriving on the ERP's word/);
+  reconcile(r2, as2, ats2);
 });
 
 test('ERP In Trans below our sailed units: by ETA, received on or before the report day (dropped), the rest kept as ours', () => {
@@ -686,67 +787,256 @@ test('ERP In Trans below ours: a shipment and a lot of the same quantity are mat
   reconcile(r3, bs, ats3);
 });
 
-test('cross-check maybe-twice: In Trans our data does not show sailed, Container Tracking sailed with no Master Sheet line, goods still in China', () => {
-  // The ERP has 3,000 (our lot on the water) + 1,500 due 11/13. Container Tracking shows 1,500 of the style on the water
-  // under a PO with no Master Sheet line, and the Master Sheet still has 1,500 Ready: the same goods may be offered twice.
+test('step 2: In Trans due after the report day has left China: off our lots there, on a vessel first, then a PO Container Tracking shows sailed, then by pull-from date', () => {
+  // A PO split in China: our 3,024 on the water is the ERP's shipment of that quantity; its 720 and 816 due 11/13 are the
+  // goods Container Tracking has on the water under PO 900952 (no Master Sheet line), which our sheets still show Ready
+  // on 900952A and 900952B. Until Oct 30 they were offered twice: Arriving, and from China (here taken by orders).
   const as = [
-    alloc({ style: 'AB400', styleRaw: 'AB400', po: '900951', bucket: 'water', units: 3000, eta: D(11, 13) }),
-    alloc({ style: 'AB400', styleRaw: 'AB400', po: '900952A', bucket: 'ready', units: 1500, crd: D(9, 10), dates: { factoryCrd: D(9, 10) } }),
-    alloc({ style: 'AB400', styleRaw: 'AB400', po: '900952', bucket: 'unmatched', stage: 'On the water', units: 1500, eta: D(11, 13), sheetRow: null, ptype: '', flags: ['near-miss'] }),
+    alloc({ style: 'AB400', styleRaw: 'AB400', po: '900951', bucket: 'water', stage: 'On the water', units: 3024, eta: D(11, 13) }),
+    alloc({ style: 'AB400', styleRaw: 'AB400', po: '900952A', bucket: 'ready', stage: 'Ready', units: 816, crd: D(9, 10), dates: { factoryCrd: D(9, 10) } }),
+    alloc({ style: 'AB400', styleRaw: 'AB400', po: '900952B', bucket: 'ready', stage: 'Ready', units: 720, crd: D(9, 10), dates: { factoryCrd: D(9, 10) } }),
+    alloc({ style: 'AB400', styleRaw: 'AB400', po: '900952', bucket: 'unmatched', stage: 'On the water', units: 1536, eta: D(11, 13), sheetRow: null, ptype: '', flags: ['near-miss'] }),
   ];
-  const ats = atsE({ AB400: [0, 1500, [[3000, D(11, 3)], [1500, D(11, 13)]]] });
+  const ats = atsE({ AB400: [0, 1536, [[3024, D(11, 3)], [720, D(11, 13)], [816, D(11, 13)]], []] });
   const r = sell(as, ats), s = styleOf(r, 'AB400');
-  assert.deepEqual([s.matchedOurs, s.inErpTransitTaken, s.landedNotReceived, s.erpUnmatched, s.maybeTwice], [3000, 0, 0, 1500, 1500]);
-  // Listed, never counted (Saul decides): the numbers stay as the rules give them.
-  assert.deepEqual([s.fromChina, s.arriving, s.ordersTaken, s.total], [0, 4500, 1500, 4500]);
-  assert.ok(s.flags.includes('maybe-twice') && s.flags.includes('erp-in-trans-unmatched'));
-  const mt = r.issues.find(i => i.code === 'maybe-twice');
-  assert.deepEqual([mt.units, mt.count], [1500, 1]);
-  assert.match(mt.message, /^1 style \(0 of them oversold\): 1,500 units may be offered twice\. The ATS report has them In Trans, due after its date/);
-  assert.equal(r.totals.maybeTwice, 1500);
+  assert.deepEqual([s.matchedOurs, s.landedNotReceived, s.takenOnVessel, s.takenSamePo, s.takenOther, s.erpUnplaced, s.erpBacklog, s.takeable],
+    [3024, 0, 0, 1536, 0, 0, 0, 1536]);
+  assert.deepEqual(['900952A', '900952B'].map(po => [lotOf(r, po).inErpTransit, lotOf(r, po).erpTier, lotOf(r, po).available]), [[816, 'po', 0], [720, 'po', 0]]);
+  assert.deepEqual(erpLots(r, 'AB400').map(l => [l.units, l.place.matched, l.place.offChina]), [[3024, 3024, 0], [720, 0, 720], [816, 0, 816]]);
+  assert.deepEqual([s.fromChina, s.arriving, s.ordersTaken, s.total, s.oversold], [0, 3024, 1536, 3024, 0]);
+  assert.ok(s.flags.includes('in-erp-transit') && !s.flags.includes('erp-transit-unplaced'));
   reconcile(r, as, ats);
-  // Container Tracking's extra units on the water (more than the sheet's line) count the same; at most what's in China.
+  // Every tier, in order: on a vessel (earliest ETD first), then a PO whose base Container Tracking shows sailed or
+  // landed (900975 landed in July, too long ago to be the In Trans itself), then the rest by pull-from date.
   const bs = [
-    alloc({ style: 'AB401', styleRaw: 'AB401', po: '900953', bucket: 'ctMore', stage: 'At port', units: 900, eta: D(11, 2), sheetRow: null, ptype: '' }),
-    alloc({ style: 'AB401', styleRaw: 'AB401', po: '900954', bucket: 'inProd', units: 400, crd: D(12, 1), dates: { factoryCrd: D(12, 1) } }),
-    // No Container Tracking line sailed: In Trans not on our data, but nothing says it's the goods in China.
-    alloc({ style: 'AB402', styleRaw: 'AB402', po: '900955', bucket: 'ready', units: 800, crd: D(9, 10), dates: { factoryCrd: D(9, 10) } }),
-    alloc({ style: 'AB402', styleRaw: 'AB402', po: '900956', bucket: 'unmatched', stage: 'Booked', units: 800, sheetRow: null, ptype: '' }),
+    alloc({ style: 'AB410', styleRaw: 'AB410', po: '900971', bucket: 'booked', stage: 'Booked', units: 500, etd: D(11, 20) }),
+    alloc({ style: 'AB410', styleRaw: 'AB410', po: '900972', bucket: 'loaded', stage: 'Loaded', units: 300, etd: D(11, 5) }),
+    alloc({ style: 'AB410', styleRaw: 'AB410', po: '900973', bucket: 'ready', stage: 'Ready', units: 400, crd: D(10, 1), dates: { factoryCrd: D(10, 1) } }),
+    alloc({ style: 'AB410', styleRaw: 'AB410', po: '900974', bucket: 'inProd', units: 600, crd: D(11, 15), dates: { factoryCrd: D(11, 15) } }),
+    alloc({ style: 'AB410', styleRaw: 'AB410', po: '900975A', bucket: 'inProd', units: 200, crd: D(12, 20), dates: { factoryCrd: D(12, 20) } }),
+    alloc({ style: 'AB410', styleRaw: 'AB410', po: '900975', bucket: 'landed', stage: 'Landed', units: 900, eta: D(7, 1) }),
+    // The shipment's own PO (a PO column on the report) counts too: 900982-BCF before 900981's earlier date.
+    alloc({ style: 'AB420', styleRaw: 'AB420', po: '900981', bucket: 'ready', stage: 'Ready', units: 500, crd: D(9, 1), dates: { factoryCrd: D(9, 1) } }),
+    alloc({ style: 'AB420', styleRaw: 'AB420', po: '900982-BCF', bucket: 'ready', stage: 'Ready', units: 500, crd: D(9, 20), dates: { factoryCrd: D(9, 20) } }),
   ];
-  const ats2 = atsE({ AB401: [0, 0, [[900, D(11, 2)]]], AB402: [0, 0, [[800, D(11, 9)]]] });
-  const r2 = sell(bs, ats2);
-  assert.deepEqual([styleOf(r2, 'AB401').erpUnmatched, styleOf(r2, 'AB401').maybeTwice], [900, 400]);
-  assert.deepEqual([styleOf(r2, 'AB402').erpUnmatched, styleOf(r2, 'AB402').maybeTwice], [800, 0]);
+  const ats2 = atsE({ AB410: [0, 0, [[1700, D(11, 25)]]], AB420: [0, 0, [[500, D(11, 20), '900982']]] });
+  const r2 = sell(bs, ats2), t = styleOf(r2, 'AB410');
+  assert.deepEqual([t.takenOnVessel, t.takenSamePo, t.takenOther, t.erpUnplaced, t.landedOurs], [800, 200, 700, 0, 0]);
+  assert.deepEqual(['900972', '900971', '900975A', '900973', '900974'].map(po => [lotOf(r2, po).inErpTransit, lotOf(r2, po).erpTier]),
+    [[300, 'vessel'], [500, 'vessel'], [200, 'po'], [400, 'other'], [300, 'other']]);
+  assert.deepEqual([lotOf(r2, '900982-BCF').inErpTransit, lotOf(r2, '900982-BCF').erpTier, lotOf(r2, '900981').inErpTransit, erpLots(r2, 'AB420')[0].erpPo], [500, 'po', 0, '900982']);
   reconcile(r2, bs, ats2);
 });
 
-test('cross-check taken-in-backlog: In Trans taken off Booked / Loaded lots that the report\'s Import PO Backlog still has in China', () => {
-  // The ERP's 5,000 In Trans due 10/22 is goods our sheets have landed (not lots); the rule takes it off the Booked lot
-  // (ETD 11/11). The report's backlog holds all 5,000 of our China goods: listed, never counted.
+test("the guard: never taking our China goods below the ATS report's Import PO Backlog; what's left stays Arriving, one Problems line per style", () => {
   const as = [
-    alloc({ style: 'AB500', styleRaw: 'AB500', po: '900961', bucket: 'booked', units: 5000, etd: D(11, 11) }),
-    alloc({ style: 'AB500', styleRaw: 'AB500', po: '900960', bucket: 'landed', stage: 'Landed', units: 5000, eta: D(10, 22) }),
-    // Loaded 1,344 (ETD 10/30) and 480 sold (China Pickup, Booked): the backlog has both.
-    alloc({ style: 'AB501', styleRaw: 'AB501', po: '900962', bucket: 'loaded', units: 1344, etd: D(10, 30) }),
-    alloc({ style: 'AB501', styleRaw: 'AB501', po: '900963', bucket: 'pullFromChina', stage: 'Booked', ptype: 'China Pickup', units: 480 }),
-    // The backlog is only the sold goods: the Loaded lot can be In Trans (nothing listed).
-    alloc({ style: 'AB502', styleRaw: 'AB502', po: '900964', bucket: 'loaded', units: 1344, etd: D(10, 30) }),
-    alloc({ style: 'AB502', styleRaw: 'AB502', po: '900965', bucket: 'pullFromChina', stage: 'Booked', ptype: 'China Pickup', units: 480 }),
+    // Backlog 1,000 of the 1,500 in China: only 500 may come off (the Loaded lot); 700 stay unplaced, as the Ready 1,000
+    // are still in China on our sheets and the ERP's.
+    alloc({ style: 'AB503', styleRaw: 'AB503', po: '900991', bucket: 'ready', stage: 'Ready', units: 1000, crd: D(9, 1), dates: { factoryCrd: D(9, 1) } }),
+    alloc({ style: 'AB503', styleRaw: 'AB503', po: '900992', bucket: 'loaded', stage: 'Loaded', units: 500, etd: D(11, 5) }),
+    // Sold goods count in the backlog too: 480 sold + 1,344 Loaded, backlog 480, so the 1,344 may come off.
+    alloc({ style: 'AB504', styleRaw: 'AB504', po: '900993', bucket: 'loaded', stage: 'Loaded', units: 1344, etd: D(10, 30) }),
+    alloc({ style: 'AB504', styleRaw: 'AB504', po: '900994', bucket: 'pullFromChina', stage: 'Booked', ptype: 'China Pickup', units: 480 }),
+    // The backlog has all of it in China: nothing comes off.
+    alloc({ style: 'AB506', styleRaw: 'AB506', po: '900996', bucket: 'ready', stage: 'Ready', units: 600, crd: D(9, 1), dates: { factoryCrd: D(9, 1) } }),
   ];
-  const ats = atsE({ AB500: [0, 768, [[5000, D(10, 22)]], [5000]], AB501: [0, 0, [[1344, D(10, 24)]], [480, 1344]], AB502: [0, 0, [[1344, D(11, 13)]], [480]] });
-  const r = sell(as, ats);
-  const s = styleOf(r, 'AB500');
-  assert.deepEqual([s.inErpTransitTaken, s.takenInBacklog, s.fromChina, s.arriving], [5000, 5000, 0, 4232], 'the rule as it stands; the cross-check says how much');
-  assert.ok(s.flags.includes('taken-in-backlog'));
-  assert.deepEqual([styleOf(r, 'AB501').inErpTransitTaken, styleOf(r, 'AB501').takenInBacklog], [1344, 1344]);
-  assert.deepEqual([styleOf(r, 'AB502').inErpTransitTaken, styleOf(r, 'AB502').takenInBacklog], [1344, 0]);
-  const tb = r.issues.find(i => i.code === 'taken-in-backlog');
-  assert.deepEqual([tb.units, tb.count], [6344, 2]);
-  assert.match(tb.message, /^2 styles \(0 of them oversold\): 6,344 units on Booked or Loaded lots were taken off Available from China/);
+  const ats = atsE({ AB503: [0, 0, [[1200, D(11, 20)]], [1000]], AB504: [0, 0, [[1344, D(11, 13)]], [480]],
+    AB505: [0, 0, [[800, D(11, 9)]], []], AB506: [0, 0, [[600, D(11, 9)]], [600]] });
+  const r = sell(as, ats), s = k => styleOf(r, k);
+  assert.deepEqual([s('AB503').takeable, s('AB503').takenOnVessel, s('AB503').takenOther, s('AB503').erpUnplaced, s('AB503').unplacedInChina, s('AB503').fromChina, s('AB503').arriving],
+    [500, 500, 0, 700, 700, 1000, 1200]);
+  assert.deepEqual([s('AB504').takeable, s('AB504').takenOnVessel, s('AB504').erpUnplaced], [1344, 1344, 0]);
+  assert.deepEqual([s('AB505').erpUnplaced, s('AB505').unplacedInChina, s('AB505').arriving], [800, 0, 800]);
+  assert.deepEqual([s('AB506').takeable, s('AB506').inErpTransitTaken, s('AB506').erpUnplaced, s('AB506').unplacedInChina, s('AB506').fromChina], [0, 0, 600, 600, 600]);
+  assert.deepEqual([r.counts.backlogGuardStyles, r.counts.erpUnplacedStyles, r.totals.erpUnplaced, r.totals.unplacedInChina, r.totals.offeredTwice], [2, 3, 2100, 1300, 0]);
+  const un = r.issues.filter(i => i.code === 'erp-transit-unplaced');
+  assert.deepEqual(un.map(i => [i.style, i.units, i.inChina]), [['AB503', 700, 700], ['AB505', 800, 0], ['AB506', 600, 600]]);
+  assert.match(un[0].message, /^Style AB503: the ERP counts 700 units in transit that our sheets still show in China; check before offering from China\. They're offered as Arriving, and our goods still in China stay available from China because the ATS report's Import PO Backlog still has 1,000 of the style there \(our sheets have 1,000, sold goods not loaded yet included, after 500 came off\)\.$/);
+  assert.match(un[2].message, /^Style AB506: the ERP counts 600 units in transit that our sheets still show in China; check before offering from China\. .*\(our sheets have 600, sold goods not loaded yet included\)\.$/);
+  assert.ok(erpLots(r, 'AB503')[0].flags.includes('erp-transit-unplaced') && erpLots(r, 'AB503')[0].flags.includes('erp-off-china'));
   reconcile(r, as, ats);
-  // No Import PO Backlog column: nothing to check against, nothing listed.
-  const r2 = sell(as.map(a => ({ ...a, flags: [] })), atsE({ AB500: [0, 768, [[5000, D(10, 22)]]] }));
-  assert.deepEqual([styleOf(r2, 'AB500').inErpTransitTaken, styleOf(r2, 'AB500').takenInBacklog], [5000, 0]);
+  // Without the Import PO Backlog column there's no guard: the rest comes off the Ready lot.
+  const one = as.filter(a => a.style === 'AB503'), ats2 = atsE({ AB503: [0, 0, [[1200, D(11, 20)]]] });
+  const t = styleOf(sell(one, ats2), 'AB503');
+  assert.deepEqual([t.takenOnVessel, t.takenOther, t.erpUnplaced, t.erpBacklog, t.takeable], [500, 700, 0, null, null]);
+  reconcile(sell(one, ats2), one, ats2);
+});
+
+// What the ERP itself has for a style, after its customer orders: In WH + In Trans + Import PO Backlog − orders. The
+// tool's total plus what it holds back as sold (goods the backlog counts) must come to it when our sheets and the
+// report agree.
+const erpTotal = (inWh, orders, ships, backlog) => inWh + ships.reduce((t, x) => t + x[0], 0) + backlog.reduce((t, n) => t + n, 0) - orders;
+
+test('step 1 gives way to the Import PO Backlog: In Trans it says has left China comes off China first, never offered twice', () => {
+  const as = [
+    // Booked lots the ERP has shipped: the ERP's three shipments due 10/28 are our Booked lots of those quantities (ETD 11/4); its backlog
+    // (1,536) is our fourth Booked lot. Until now they were called landed and the Booked lots stayed: 5,088 offered twice.
+    ...[['900A01', 1632], ['900A02', 1632], ['900A03', 1824]].map(([po, u]) => alloc({ style: 'AB600', styleRaw: 'AB600', po, bucket: 'booked', stage: 'Booked', units: u, etd: D(11, 4) })),
+    alloc({ style: 'AB600', styleRaw: 'AB600', po: '900A04', bucket: 'booked', stage: 'Booked', units: 1536, etd: D(11, 12) }),
+    // A landed lot already received: our Landed 5,008 (ETA 10/20) is the style's In WH, received; the ERP's 4,288 due 10/28 is our
+    // Ready lot of that quantity (its backlog is blank: nothing in China). Until now our Landed goods took it.
+    alloc({ style: 'AB601', styleRaw: 'AB601', po: '900A11', bucket: 'landed', stage: 'Landed', units: 5008, eta: D(10, 20) }),
+    alloc({ style: 'AB601', styleRaw: 'AB601', po: '900A12', bucket: 'ready', stage: 'Ready', units: 4288, crd: D(9, 20), dates: { factoryCrd: D(9, 20) } }),
+    alloc({ style: 'AB601', styleRaw: 'AB601', po: '900A13', bucket: 'water', stage: 'On the water', units: 752, eta: D(11, 11) }),
+    // A stale Ready line (its goods landed long ago) beside a blank backlog: In Trans due 10/25 has left China.
+    alloc({ style: 'AB602', styleRaw: 'AB602', po: '900A21', bucket: 'landed', stage: 'Landed', units: 900, eta: D(7, 1) }),
+    alloc({ style: 'AB602', styleRaw: 'AB602', po: '900A22', bucket: 'ready', stage: 'Ready', units: 900, crd: D(6, 1), dates: { factoryCrd: D(6, 1) } }),
+    // Only the part beyond what may come off is landed: backlog 1,000 of the 1,600 in China, 800 In Trans due 10/24 and
+    // our Landed 800 (ETA 10/24): 600 off China (the Loaded lot first), 200 landed.
+    alloc({ style: 'AB603', styleRaw: 'AB603', po: '900A31', bucket: 'landed', stage: 'Landed', units: 800, eta: D(10, 24) }),
+    alloc({ style: 'AB603', styleRaw: 'AB603', po: '900A32', bucket: 'loaded', stage: 'Loaded', units: 600, etd: D(10, 31) }),
+    alloc({ style: 'AB603', styleRaw: 'AB603', po: '900A33', bucket: 'inProd', units: 1000, crd: D(12, 1), dates: { factoryCrd: D(12, 1) } }),
+    // Sold goods not loaded yet beyond the backlog can't come off (they aren't lots): what our unsold goods can't cover is
+    // still landed, never left unplaced. 100 Ready + 500 sold (China Pickup, Booked), backlog 0, In Trans 400 due 10/25.
+    alloc({ style: 'AB604', styleRaw: 'AB604', po: '900A41', bucket: 'landed', stage: 'Landed', units: 400, eta: D(10, 20) }),
+    alloc({ style: 'AB604', styleRaw: 'AB604', po: '900A42', bucket: 'ready', stage: 'Ready', units: 100, crd: D(9, 1), dates: { factoryCrd: D(9, 1) } }),
+    alloc({ style: 'AB604', styleRaw: 'AB604', po: '900A43', bucket: 'pullFromChina', stage: 'Booked', ptype: 'China Pickup', units: 500 }),
+  ];
+  const E = { AB600: [0, 5088, [[1632, D(10, 28)], [1632, D(10, 28)], [1824, D(10, 28)]], [1536]],
+    AB601: [5008, 752, [[4288, D(10, 28)], [752, D(11, 5)]], []], AB602: [900, 0, [[900, D(10, 25)]], []],
+    AB603: [0, 0, [[800, D(10, 24)]], [1000]], AB604: [0, 0, [[400, D(10, 25)]], []] };
+  const ats = atsE(E);
+  const r = sell(as, ats), s = k => styleOf(r, k);
+  const a0 = s('AB600');
+  assert.deepEqual([a0.landedNotReceived, a0.takenOnVessel, a0.takenDueBy, a0.erpUnplaced, a0.takeable], [0, 5088, 5088, 0, 5088]);
+  assert.deepEqual(['900A01', '900A02', '900A03', '900A04'].map(po => lotOf(r, po).inErpTransit), [1632, 1632, 1824, 0], 'the earliest ETDs come off');
+  assert.deepEqual([a0.now, a0.fromChina, a0.arriving, a0.ordersTaken, a0.total, a0.oversold], [0, 1536, 0, 5088, 1536, 0]);
+  assert.equal(a0.total, erpTotal(...E.AB600), "the ERP's own total");
+  assert.ok(erpLots(r, 'AB600').every(l => l.place.offChina === l.units && l.flags.includes('erp-off-china') && !l.flags.includes('landed-not-received')));
+  const a1 = s('AB601');
+  assert.deepEqual([a1.matchedOurs, a1.landedOurs, a1.landedDue, a1.inErpTransitTaken, a1.takenDueBy, a1.erpUnplaced], [752, 0, 0, 4288, 4288, 0]);
+  assert.deepEqual([a1.now, a1.fromChina, a1.arriving, a1.total], [4256, 0, 5040, 9296]);
+  assert.equal(a1.total, erpTotal(...E.AB601));
+  const a2 = s('AB602');
+  assert.deepEqual([a2.landedDue, a2.takenOther, a2.fromChina, a2.arriving, a2.total], [0, 900, 0, 900, 1800]);
+  assert.equal(a2.total, erpTotal(...E.AB602));
+  const a3 = s('AB603');
+  assert.deepEqual([a3.takeable, a3.takenOnVessel, a3.takenOther, a3.landedOurs, a3.landedLots.map(x => x.units), a3.erpUnplaced, a3.fromChina, a3.arriving],
+    [600, 600, 0, 200, [200], 0, 1000, 800]);
+  assert.equal(a3.total, erpTotal(...E.AB603));
+  const a4 = s('AB604');
+  assert.deepEqual([a4.takeable, a4.inErpTransitTaken, a4.landedOurs, a4.erpUnplaced, a4.fromChina, a4.arriving], [600, 100, 300, 0, 0, 400]);
+  assert.ok(!codes(r).includes('erp-transit-unplaced') && !codes(r).includes('balance'));
+  assert.deepEqual([r.counts.takenDueByStyles, r.totals.takenDueBy, r.totals.offeredTwice], [5, 5088 + 4288 + 900 + 600 + 100, 0]);
+  reconcile(r, as, ats);
+  // The tradeoff: a backlog that has every China lot keeps step 1 as it was (the landed PO above); with no backlog
+  // column, nothing says the goods have left China, so step 1 is never limited.
+  const ats2 = atsE(Object.fromEntries(Object.entries(E).map(([k, v]) => [k, v.slice(0, 3)])));
+  const r2 = sell(as, ats2), b0 = styleOf(r2, 'AB600');
+  assert.deepEqual([b0.landedDue, b0.inErpTransitTaken, b0.fromChina, b0.arriving, b0.total], [5088, 0, 1536, 5088, 6624]);
+  reconcile(r2, as, ats2);
+});
+
+test('sold goods count against the Import PO Backlog only until they are loaded', () => {
+  // The report's backlog has sold goods booked or ready, never those already loaded (China Pickup or straight to the
+  // customer). Ready 500 + 500 sold already loaded, backlog 500, In Trans 500 due 11/20: the Ready lot is the backlog,
+  // so it stays; the In Trans is unplaced (listed), never taken off it.
+  const as = [
+    alloc({ style: 'AB610', styleRaw: 'AB610', po: '900B01', bucket: 'ready', stage: 'Ready', units: 500, crd: D(9, 1), dates: { factoryCrd: D(9, 1) } }),
+    alloc({ style: 'AB610', styleRaw: 'AB610', po: '900B02', bucket: 'pullFromChina', stage: 'Loaded', units: 500, flags: ['pull-section'] }),
+    // The same with the sold goods still booked: the backlog is those, so the Ready lot has left China.
+    alloc({ style: 'AB611', styleRaw: 'AB611', po: '900B11', bucket: 'ready', stage: 'Ready', units: 500, crd: D(9, 1), dates: { factoryCrd: D(9, 1) } }),
+    alloc({ style: 'AB611', styleRaw: 'AB611', po: '900B12', bucket: 'pullFromChina', stage: 'Booked', ptype: 'China Pickup', units: 500 }),
+    // A sold lot at Loaded in a counted bucket (straight to the customer) doesn't count either.
+    alloc({ style: 'AB612', styleRaw: 'AB612', po: '900B21', bucket: 'ready', stage: 'Ready', units: 300, crd: D(9, 1), dates: { factoryCrd: D(9, 1) } }),
+    alloc({ style: 'AB612', styleRaw: 'AB612', po: '900B22', bucket: 'loaded', stage: 'Loaded', units: 200, etd: D(11, 1), flags: ['pull-section'] }),
+  ];
+  const E = { AB610: [0, 0, [[500, D(11, 20)]], [500]], AB611: [0, 0, [[500, D(11, 20)]], [500]], AB612: [0, 0, [[300, D(11, 20)]], [300]] };
+  const ats = atsE(E);
+  const r = sell(as, ats), s = k => styleOf(r, k);
+  assert.deepEqual([s('AB610').chinaAll, s('AB610').takeable, s('AB610').inErpTransitTaken, s('AB610').erpUnplaced, s('AB610').unplacedInChina, s('AB610').fromChina, s('AB610').arriving],
+    [500, 0, 0, 500, 500, 500, 500]);
+  assert.equal(s('AB610').total, erpTotal(...E.AB610), "the ERP's own total (its sold goods already loaded are in neither)");
+  assert.deepEqual([s('AB611').chinaAll, s('AB611').takeable, s('AB611').inErpTransitTaken, s('AB611').fromChina, s('AB611').arriving], [1000, 500, 500, 0, 500]);
+  assert.equal(s('AB611').total + 500, erpTotal(...E.AB611), "the ERP's own total less the sold goods in its backlog");
+  assert.deepEqual([s('AB612').chinaAll, s('AB612').takeable, s('AB612').inErpTransitTaken, s('AB612').erpUnplaced, s('AB612').fromChina], [300, 0, 0, 300, 300]);
+  assert.match(r.issues.find(i => i.code === 'erp-transit-unplaced' && i.style === 'AB610').message, /Import PO Backlog still has 500 of the style there \(our sheets have 500, sold goods not loaded yet included\)/);
+  reconcile(r, as, ats);
+});
+
+test('ERP In Trans below ours: In Trans due after the report day comes off China as far as the backlog says, and ours with an ETA passed are received instead', () => {
+  // At port 1,000 (ETA 10/20, In WH 5,000) and Loaded 1,000 (ETD 11/1); the ERP has 600 In Trans due 11/15 and a backlog
+  // of 400: the 600 are off the Loaded lot, and our 1,000 at port were received. Until now 600 were offered twice.
+  const as = [
+    alloc({ style: 'AB620', styleRaw: 'AB620', po: '900C01', bucket: 'port', stage: 'At port', units: 1000, eta: D(10, 20) }),
+    alloc({ style: 'AB620', styleRaw: 'AB620', po: '900C02', bucket: 'loaded', stage: 'Loaded', units: 1000, etd: D(11, 1) }),
+    // The same, In WH 700: only 300 more can have been received, so only 300 come off China (the rest as before).
+    alloc({ style: 'AB621', styleRaw: 'AB621', po: '900C11', bucket: 'port', stage: 'At port', units: 1000, eta: D(10, 20) }),
+    alloc({ style: 'AB621', styleRaw: 'AB621', po: '900C12', bucket: 'loaded', stage: 'Loaded', units: 1000, etd: D(11, 1) }),
+    // The same, its In Trans due by the report's day: our goods at port, not received yet (nothing comes off China).
+    alloc({ style: 'AB622', styleRaw: 'AB622', po: '900C21', bucket: 'port', stage: 'At port', units: 1000, eta: D(10, 20) }),
+    alloc({ style: 'AB622', styleRaw: 'AB622', po: '900C22', bucket: 'loaded', stage: 'Loaded', units: 1000, etd: D(11, 1) }),
+  ];
+  const E = { AB620: [5000, 0, [[600, D(11, 15)]], [400]], AB621: [700, 0, [[600, D(11, 15)]], [400]], AB622: [5000, 0, [[600, D(10, 27)]], [400]] };
+  const ats = atsE(E);
+  const r = sell(as, ats), s = k => styleOf(r, k);
+  assert.deepEqual([lotOf(r, '900C01').received, lotOf(r, '900C01').matched, lotOf(r, '900C02').inErpTransit, lotOf(r, '900C02').erpTier, lotOf(r, '900C02').available], [1000, 0, 600, 'vessel', 400]);
+  assert.deepEqual([s('AB620').matchedOurs, s('AB620').receivedDropped, s('AB620').inErpTransitTaken, s('AB620').fromChina, s('AB620').arriving, s('AB620').total], [0, 1000, 600, 400, 600, 6000]);
+  assert.equal(s('AB620').total, erpTotal(...E.AB620));
+  assert.deepEqual(erpLots(r, 'AB620').map(l => [l.place.matched, l.place.offChina, l.flags.includes('erp-off-china')]), [[0, 600, true]]);
+  assert.deepEqual([s('AB621').receivedDropped, s('AB621').matchedOurs, s('AB621').inErpTransitTaken, s('AB621').fromChina], [700, 300, 300, 700]);
+  assert.deepEqual([s('AB622').receivedDropped, s('AB622').matchedOurs, s('AB622').inErpTransitTaken, s('AB622').fromChina], [400, 600, 0, 1000]);
+  assert.deepEqual([r.counts.lessTakenStyles, r.counts.erpLessStyles], [2, 3]);
+  assert.ok(!codes(r).includes('balance'));
+  reconcile(r, as, ats);
+  // No Import PO Backlog column: nothing says the Loaded lot has left China.
+  const ats2 = atsE(Object.fromEntries(Object.entries(E).map(([k, v]) => [k, v.slice(0, 3)])));
+  assert.deepEqual([styleOf(sell(as, ats2), 'AB620').inErpTransitTaken, styleOf(sell(as, ats2), 'AB620').receivedDropped], [0, 400]);
+  reconcile(sell(as, ats2), as, ats2);
+});
+
+test('an Import PO Backlog part below zero or not a number is listed, and the style has no backlog (end to end through parseAts)', () => {
+  const X = loadXLSX();
+  const HEAD = ['Style', 'Warehouse', 'In WH', 'Total Customer Orders', 'In Trans Qty', 'Import PO Backlog Qty', 'ETA Date'];
+  const rows = [['Inventory Report'], HEAD,
+    ['AB630', 'WH 1', 3456, 5088, '5040, 1632, 1632', '-1632', '10/28/2026, 11/11/2026, 11/11/2026'],
+    ['AB631', 'WH 1', 0, 0, '500', '48, soon', '11/20/2026'],
+    ['AB632', 'WH 1', 0, 0, '500', '400', '11/20/2026'],
+    ['Grand Total', null, 3456, 5088, null, null, null]];
+  const ats = A.parseAts(X, readBook(xlsxBytes({ Report: rows })), 'Inventory Report 10-29-2026.xlsx', TODAY);
+  assert.equal(ats.ok, true, ats.error);
+  const nb = ats.issues.filter(i => i.code === 'negative-backlog'), nn = ats.issues.filter(i => i.code === 'not-a-number');
+  assert.deepEqual([nb.map(i => i.style), nn.map(i => i.style), ats.counts.backlogUnreadable], [['AB630'], ['AB631'], 2]);
+  assert.match(nb[0].message, /^Style AB630 \(row 3\): Import PO Backlog Qty -1,632 is below zero \(a correction in the ERP\?\), so the style's goods the ERP still has in China aren't known/);
+  assert.match(nn[0].message, /^Style AB631 \(row 4\): Import PO Backlog Qty "soon" isn't a number/);
+  assert.deepEqual([ats.styles.get('AB631').rows[0].backlogList, ats.styles.get('AB631').rows[0].backlogBad], [[48], ['soon']]);
+  // A negative backlog: ours on the water 3,840 and 1,632, Ready 1,200; In Trans 5,040 + 1,632 + 1,632 and a backlog of
+  // −1,632 (the ERP's own correction of one 1,632?). The backlog isn't used: the Ready lot comes off, 432 are unplaced, and
+  // the Problems line names the backlog.
+  const as = [
+    alloc({ style: 'AB630', styleRaw: 'AB630', po: '900D01', bucket: 'water', stage: 'On the water', units: 3840, eta: D(10, 28) }),
+    alloc({ style: 'AB630', styleRaw: 'AB630', po: '900D02', bucket: 'water', stage: 'On the water', units: 1632, eta: D(11, 12) }),
+    alloc({ style: 'AB630', styleRaw: 'AB630', po: '900D03', bucket: 'ready', stage: 'Ready', units: 1200, crd: D(8, 15), dates: { factoryCrd: D(8, 15) } }),
+    alloc({ style: 'AB631', styleRaw: 'AB631', po: '900D11', bucket: 'ready', stage: 'Ready', units: 500, crd: D(9, 1), dates: { factoryCrd: D(9, 1) } }),
+    alloc({ style: 'AB632', styleRaw: 'AB632', po: '900D21', bucket: 'ready', stage: 'Ready', units: 500, crd: D(9, 1), dates: { factoryCrd: D(9, 1) } }),
+  ];
+  const r = sell(as, ats), s = k => styleOf(r, k);
+  assert.deepEqual([s('AB630').erpBacklog, s('AB630').erpBacklogOff, s('AB630').takeable, s('AB630').matchedOurs, s('AB630').landedDue, s('AB630').inErpTransitTaken, s('AB630').erpUnplaced],
+    [null, [-1632], null, 5472, 1200, 1200, 432]);
+  assert.ok(s('AB630').flags.includes('erp-backlog-unknown') && s('AB631').flags.includes('erp-backlog-unknown') && !s('AB632').flags.includes('erp-backlog-unknown'));
+  assert.match(r.issues.find(i => i.code === 'erp-transit-unplaced' && i.style === 'AB630').message, /The ATS report's Import PO Backlog for the style \(-1,632\) is below zero or not a number, so it isn't used; it may be the ERP's own correction of this In Trans\.$/);
+  // "48, soon": not 48. With no backlog, the 500 come off the Ready lot; with its 400, only 100 may.
+  assert.deepEqual([s('AB631').erpBacklog, s('AB631').inErpTransitTaken, s('AB632').erpBacklog, s('AB632').inErpTransitTaken, s('AB632').erpUnplaced], [null, 500, 400, 100, 400]);
+  assert.equal(r.counts.backlogUnknownStyles, 2);
+  reconcile(r, as, ats);
+});
+
+test('no report day: nothing is called landed; In Trans beyond ours comes off China, within the backlog', () => {
+  const as = [
+    alloc({ style: 'AB500', styleRaw: 'AB500', po: '900960', bucket: 'landed', stage: 'Landed', units: 5040, eta: D(10, 22) }),
+    alloc({ style: 'AB500', styleRaw: 'AB500', po: '900961', bucket: 'booked', stage: 'Booked', units: 10008, etd: D(11, 11) }),
+  ];
+  const ats = atsE({ AB500: [0, 0, [[5040, D(10, 22)]], [10008]] }, null);
+  const r = sell(as, ats), s = styleOf(r, 'AB500');
+  assert.equal(r.reportDay, null);
+  assert.deepEqual([s.landedNotReceived, s.inErpTransitTaken, s.erpUnplaced, s.unplacedInChina, s.fromChina, s.arriving], [0, 0, 5040, 5040, 10008, 5040]);
+  assert.ok(s.flags.includes('no-report-day') && s.flags.includes('erp-transit-unplaced'));
+  assert.match(r.issues.find(i => i.code === 'no-report-day').message,
+    /^1 style \(0 of them oversold\): the ATS report's date isn't known, so none of its In Trans beyond our sailed goods is called landed, not received yet: it comes off our goods still in China instead, as far as its Import PO Backlog allows/);
+  reconcile(r, as, ats);
+  const ats2 = atsE({ AB500: [0, 0, [[5040, D(10, 22)]]] }, null), t = styleOf(sell(as, ats2), 'AB500');
+  assert.deepEqual([t.takenOnVessel, t.erpUnplaced, t.fromChina], [5040, 0, 4968]);
+  reconcile(sell(as, ats2), as, ats2);
 });
 
 test('ETA Date list that does not line up with In Trans Qty: no ETA for those units, listed by row (end to end through parseAts)', () => {
@@ -847,23 +1137,28 @@ test('orders-may-include-sold stays: orders beyond stock no more than the goods 
   assert.match(r2.issues.find(i => i.code === 'oversold').message, /with no open lot from China\. Nothing is available to sell\./);
 });
 
-test('every unit accounted for on a large random mix with the ERP In Trans: Incoming, In Trans, received, in transit, landed', () => {
+test('every unit accounted for on a large random mix with the ERP In Trans: Incoming, In Trans, received, landed, off China, unplaced', () => {
   // mulberry32: every bit of it varies, so styles, buckets and sizes spread out.
   let seed = 11;
   const rnd = k => { seed = (seed + 0x6D2B79F5) | 0; let x = Math.imul(seed ^ (seed >>> 15), 1 | seed); x = (x + Math.imul(x ^ (x >>> 7), 61 | x)) ^ x; return ((x ^ (x >>> 14)) >>> 0) % k; };
-  const buckets = ['noCrd', 'inProd', 'ready', 'booked', 'loaded', 'water', 'port', 'pullFromChina', 'landed'];
+  const buckets = ['noCrd', 'inProd', 'ready', 'booked', 'loaded', 'water', 'port', 'pullFromChina', 'landed', 'unmatched'];
   const as = [], map = {};
-  for (let i = 0; i < 800; i++) {
-    const style = 'AB' + (100 + rnd(80)), bucket = buckets[rnd(buckets.length)], day = rnd(5) ? D(9, 15) + rnd(120) : null;
-    as.push(alloc({ style, styleRaw: style, po: String(900000 + rnd(400)), bucket, units: 1 + rnd(4000), master: rnd(4) ? 24 : null,
-      etd: ['booked', 'loaded'].includes(bucket) && rnd(3) ? day : null, eta: ['water', 'port'].includes(bucket) && rnd(6) ? day : null,
+  for (let i = 0; i < 900; i++) {
+    const style = 'AB' + (100 + rnd(80)), bucket = buckets[rnd(buckets.length)], day = rnd(5) ? D(8, 15) + rnd(150) : null;
+    // Stages as the engine gives them: Container Tracking's for goods that left China, a sold line's at either side.
+    const stage = { water: 'On the water', port: 'At port', landed: 'Landed', unmatched: rnd(2) ? 'On the water' : 'Booked',
+      pullFromChina: ['Booked', 'On the water', 'Loaded'][rnd(3)] }[bucket] || 'In production';
+    as.push(alloc({ style, styleRaw: style, po: String(900000 + rnd(300)) + (rnd(3) ? '' : 'A'), bucket, stage, units: 1 + rnd(4000), master: rnd(4) ? 24 : null,
+      ptype: bucket === 'landed' && !rnd(8) ? 'China Pickup' : 'LA',
+      etd: ['booked', 'loaded', 'landed'].includes(bucket) && rnd(3) ? day : null, eta: ['water', 'port', 'landed', 'unmatched'].includes(bucket) && rnd(6) ? day : null,
       crd: day, dates: { factoryCrd: day, orderDate: rnd(2) ? D(6, 1) + rnd(100) : null } }));
   }
   for (let i = 0; i < 90; i++) {
     if (!rnd(5)) continue;   // some styles not on the report
-    const n = rnd(4), ships = [];
-    for (let j = 0; j < n; j++) ships.push([1 + rnd(6000), rnd(6) ? D(10, 1) + rnd(60) : null]);
-    map['AB' + (100 + i)] = [rnd(20000), rnd(30000), ships];
+    const n = rnd(5), ships = [];
+    for (let j = 0; j < n; j++) ships.push([1 + rnd(6000), rnd(6) ? D(10, 1) + rnd(60) : null, rnd(6) ? '' : String(900000 + rnd(300))]);
+    // The Import PO Backlog: a number, blank (0), or no column for the style's row.
+    map['AB' + (100 + i)] = [rnd(20000), rnd(30000), ships, rnd(3) ? [rnd(9000)] : []];
   }
   const ats = atsE(map);
   const r = sell(as, ats);
@@ -871,15 +1166,31 @@ test('every unit accounted for on a large random mix with the ERP In Trans: Inco
   assert.ok(!codes(r).includes('balance'), 'the engine finds every unit too');
   const t = r.totals;
   assert.equal(t.arriving, t.arrivingErp + t.arrivingOurs);
-  assert.equal(t.erpInTrans, t.matchedOurs + t.inErpTransitTaken + t.landedNotReceived + t.erpUnmatched);
+  assert.equal(t.erpInTrans, t.matchedOurs + t.landedNotReceived + t.inErpTransitTaken + t.erpUnplaced);
   assert.equal(t.fromChina + t.arriving + t.ordersTaken + t.matchedOurs + t.receivedDropped + t.inErpTransitTaken, t.ourIncoming + t.erpInTrans);
-  // Every branch shows up: more, less, landed, received, kept, taken into the ERP's transit.
-  for (const k of ['erpMoreStyles', 'erpLessStyles', 'landedNotReceivedStyles', 'erpUnmatchedStyles', 'receivedStyles', 'keptExtraStyles', 'inErpTransitStyles', 'receivedCappedStyles']) assert.ok(r.counts[k] > 0, k);
-  // Received only with an ETA on or before the report's day; in the ERP's transit only Booked / Loaded with an ETD.
+  assert.equal(t.offeredTwice, 0);
+  // Every branch shows up: more, less, landed (ours, due), received, kept, taken off China (each tier; on shipments due
+  // by the report's day as the backlog says; with the ERP's less), unplaced (some kept in China by the backlog).
+  for (const k of ['erpMoreStyles', 'erpLessStyles', 'landedOursStyles', 'landedDueStyles', 'erpUnplacedStyles', 'unplacedInChinaStyles',
+    'backlogGuardStyles', 'receivedStyles', 'keptExtraStyles', 'inErpTransitStyles', 'receivedCappedStyles', 'takenDueByStyles', 'lessTakenStyles']) assert.ok(r.counts[k] > 0, k);
+  for (const k of SELL.TIERS) assert.ok(r.counts.inErpTransitTierLots[k] > 0, k);
+  // Received only with an ETA on or before the report's day; in the ERP's transit only our lots still in China.
   for (const l of r.lots) {
     if (l.received) assert.ok(l.eta != null && l.eta <= D(10, 29), l.id);
-    if (l.inErpTransit) assert.ok(['booked', 'loaded'].includes(l.bucket) && l.etd != null, l.id);
+    if (l.inErpTransit) assert.ok(l.inChina && l.source === 'ours', l.id);
   }
+  // The same mix with no Import PO Backlog column: nothing guards China, so nothing our sheets still show there is left
+  // unplaced; and nothing limits landed, so at least as much is called landed.
+  const ats2 = atsE(Object.fromEntries(Object.entries(map).map(([k, v]) => [k, v.slice(0, 3)])));
+  const r2 = sell(as, ats2);
+  reconcile(r2, as, ats2);
+  assert.deepEqual([r2.totals.unplacedInChina, r2.totals.offeredTwice, r2.counts.backlogGuardStyles, r2.counts.lessTakenStyles, r2.totals.takenDueBy], [0, 0, 0, 0, 0]);
+  assert.ok(r2.totals.landedNotReceived >= t.landedNotReceived);
+  // And with a backlog part below zero on some styles: their backlog isn't used (no guard), every unit still accounted for.
+  const ats3 = atsE(Object.fromEntries(Object.entries(map).map(([k, v], i) => [k, i % 4 ? v : [...v.slice(0, 3), [-(1 + i), ...v[3]]]])));
+  const r3 = sell(as, ats3);
+  reconcile(r3, as, ats3);
+  assert.ok(r3.counts.backlogUnknownStyles > 0 && r3.styles.filter(s => s.flags.includes('erp-backlog-unknown')).every(s => s.erpBacklog === null && s.takeable === null));
   // Customer orders: off the earliest lots with units left first.
   for (const s of r.styles) {
     let kept = false;
