@@ -2,8 +2,12 @@
 // per style, the units in the warehouse (In WH) and the customer orders against them (Total Customer Orders), summed
 // over the style's warehouse rows. Its "Grand Total" row is the check: the rows' In WH must add up to it. The tool works
 // out stock after orders itself (In WH − Total Customer Orders, Saul, Oct 29); the ERP's own "ATS from in WH" is only
-// compared with it. In Trans / Import PO Backlog lists are read for cross-checks, never counted. A negative In WH or
-// Total Customer Orders is listed and used as it is.
+// compared with it. In Trans Qty (a list, one quantity per shipment) and ETA Date (a list lined up with it) are what
+// core/sell.js counts as Arriving (Saul, Oct 30): each row keeps both part for part (inTransList, etaParts; an ETA that
+// can't be read stays in its place as null). An In Trans quantity that isn't a number (a comma only as a thousands
+// separator), could be one quantity or two ("720,816" with an ETA for each part), or is below zero, is listed. The
+// Import PO Backlog list is read for cross-checks, never counted. A negative In WH or Total Customer Orders is listed
+// and used as it is.
 // Pure: no network, no DOM. Loads in the page (window.InvAts, after core/common.js) and in Node (module.exports).
 (function (root, factory) {
   const node = typeof module === 'object' && module.exports;
@@ -52,20 +56,23 @@
     if (v == null || blank(v)) return { sum: null, list: [], bad: [] };
     if (typeof v === 'number') return Number.isFinite(v) ? { sum: v, list: [v], bad: [] } : { sum: null, list: [], bad: [String(v)] };
     const list = [], bad = [];
-    // Parts are split at ", " (or ; or a line break), so a thousands comma inside "1,200" stays in its number.
+    // Parts are split at ", " (or ; or a line break), so a thousands comma inside "1,200" stays in its number. A comma
+    // anywhere else ("1000,1400": two quantities with no space) isn't read as one number: the part is listed.
     for (const p of S(v).split(/,\s+|;|\n/).map(S).filter(Boolean)) {
-      const n = C.num(p);
+      const n = p.includes(',') && !THOUSANDS.test(p) ? NaN : C.num(p);
       if (typeof n === 'number' && Number.isFinite(n)) list.push(n); else bad.push(p);
     }
     return { sum: list.length ? list.reduce((s, n) => s + n, 0) : null, list, bad };
   }
-  // A list of dates ("11/14/2026, 12/1/2026") as day numbers (unreadable parts dropped, counted in bad).
+  const THOUSANDS = /^-?\d{1,3}(,\d{3})+(\.\d+)?$/;
+  // A list of dates ("11/14/2026, 12/1/2026") as day numbers: list (unreadable parts dropped, counted in bad) and parts
+  // (every part in its place, null where it can't be read, so it lines up with another list on the same row).
   function dayList(v, refYear) {
-    if (v == null || blank(v)) return { list: [], bad: 0 };
-    if (typeof v === 'number') { const d = C.dayOf(v); return d == null ? { list: [], bad: 1 } : { list: [d], bad: 0 }; }
-    const list = []; let bad = 0;
-    for (const p of S(v).split(/[;,\n]/).map(S).filter(Boolean)) { const d = C.dayOf(p, refYear); if (d == null) bad++; else list.push(d); }
-    return { list, bad };
+    if (v == null || blank(v)) return { list: [], parts: [], bad: 0 };
+    if (typeof v === 'number') { const d = C.dayOf(v); return d == null ? { list: [], parts: [null], bad: 1 } : { list: [d], parts: [d], bad: 0 }; }
+    const list = [], parts = []; let bad = 0;
+    for (const p of S(v).split(/[;,\n]/).map(S).filter(Boolean)) { const d = C.dayOf(p, refYear); parts.push(d ?? null); if (d == null) bad++; else list.push(d); }
+    return { list, parts, bad };
   }
 
   // XLSX: the spreadsheet library; wb: the workbook; fileName: the file's name (its day); today: a day number (dates
@@ -103,7 +110,7 @@
     const issue = (code, style, row, message, extra) => issues.push(Object.assign({ source: SOURCE, code, po: '', style: style || '', row: row ?? '', message }, extra));
     const counts = base.counts = { rowsRead: 0, blankRows: 0, styleRows: 0, grandTotalRows: 0, noStyleRows: 0,
       styles: 0, multiWarehouseStyles: 0, notANumber: 0, blankNumbers: 0, unknownStyles: 0, inWh: 0, orders: 0,
-      negativeInWh: 0, negativeOrders: 0, erpAtsDiffers: 0 };
+      negativeInWh: 0, negativeOrders: 0, erpAtsDiffers: 0, inTransUnreadable: 0 };
     const styles = base.styles;
     let grand = null;
     const badNum = [];       // rows whose In WH isn't a number (the Grand Total check can't hold)
@@ -147,9 +154,31 @@
       if (blanks.length) { counts.blankNumbers++; blankCells.push({ row, style: styleRaw, fields: blanks }); }
       const inTrans = numList(cell(r, 'inTrans')), backlog = numList(cell(r, 'backlog'));
       const eta = dayList(cell(r, 'eta'), refYear), etd = dayList(cell(r, 'etd'), refYear);
+      // "720,816" reads as one number with a thousands comma, but when the ETA Date list has one date per comma part
+      // it's two quantities with no space: neither reading is safe, so the part is listed, never counted.
+      const transText = typeof cell(r, 'inTrans') === 'string' ? S(cell(r, 'inTrans')) : '';
+      const ambiguous = [];
+      if (/,\S/.test(transText) && eta.parts.length > 1 && inTrans.list.length + inTrans.bad.length < eta.parts.length &&
+        transText.split(/[,;\n]/).map(S).filter(Boolean).length === eta.parts.length) {
+        const parts = transText.split(/,\s+|;|\n/).map(S).filter(Boolean);
+        ambiguous.push(...parts.filter(p => /,\S/.test(p) && !inTrans.bad.includes(p)));
+        inTrans.bad.push(...ambiguous);
+        inTrans.list = parts.filter(p => !/,\S/.test(p)).map(p => C.num(p)).filter(n => typeof n === 'number' && Number.isFinite(n));
+        inTrans.sum = inTrans.list.length ? inTrans.list.reduce((s, n) => s + n, 0) : null;
+      }
       const wh = S(cell(r, 'warehouse'));
       const rec = { row, warehouse: wh, inWh: nums.inWh, orders: nums.orders, erpAts: nums.erpAts,
-        inTrans: inTrans.sum, inTransList: inTrans.list, backlog: backlog.sum, backlogList: backlog.list, eta: eta.list, etd: etd.list };
+        inTrans: inTrans.sum, inTransList: inTrans.list, inTransBad: inTrans.bad, backlog: backlog.sum, backlogList: backlog.list,
+        eta: eta.list, etaParts: eta.parts, etd: etd.list };
+      // In Trans is counted as Arriving (core/sell.js): a part that isn't a number, or is below zero, is never read as 0.
+      const negT = inTrans.list.filter(n => n < 0);
+      if (inTrans.bad.length || negT.length) counts.inTransUnreadable++;
+      const unknownTail = "so the ERP's In Trans for the style isn't known: its Arriving comes from our shipping data (on the water, at port) instead.";
+      if (inTrans.bad.length) {
+        const what = inTrans.bad.map(b => (ambiguous.includes(b) ? `"${b.slice(0, 20)}" could be one quantity or two (the ETA Date list has a date for each comma part)` : `"${b.slice(0, 20)}" isn't a number`)).join(' and ');
+        issue('not-a-number', style, row, `Style ${styleRaw} (row ${row}): In Trans Qty ${what}, ${unknownTail}`);
+      }
+      if (negT.length) issue('negative-in-trans', style, row, `Style ${styleRaw} (row ${row}): In Trans Qty ${negT.map(n => fmtN(n)).join(' and ')} ${negT.length > 1 ? 'are' : 'is'} below zero, ${unknownTail}`);
       let s = styles.get(style);
       if (!s) styles.set(style, s = { style, styleRaw, desc: '', color: '', category: '', sub: '', inWh: 0, orders: 0, erpAts: null,
         inTrans: null, backlog: null, warehouses: [], rows: [], unknown: false });

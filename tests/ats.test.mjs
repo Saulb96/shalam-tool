@@ -190,10 +190,12 @@ test("the report's day comes from its file name (m-d-yyyy, with or without the t
   assert.equal(res.reportDayFrom, 'none');
 });
 
-test('In Trans and Import PO Backlog lists are read for cross-checks only, never added to stock', () => {
+test('In Trans (with its ETA Date list, part for part) and Import PO Backlog lists are read, never added to stock', () => {
   const rows = [TITLE, HEAD,
     r('AB100', 100, 0, { inTrans: '1200, 3400', backlog: '5000', eta: '11/14/2026, 12/1/2026', etd: '10/20/2026' }),
     r('AB101', 0, 0, { inTrans: '1,200, 300' }),
+    r('AB102', 0, 0, { inTrans: '700, 800', eta: '11/14/2026, soon' }),
+    r('AB103', 0, 0, { inTrans: '700, n/a', eta: '11/14/2026, 12/1/2026' }),
     grand(100)];
   const res = parse(rows);
   assert.equal(res.ok, true, res.error);
@@ -201,9 +203,20 @@ test('In Trans and Import PO Backlog lists are read for cross-checks only, never
   assert.equal(s.inWh, 100);
   assert.equal(s.inTrans, 4600);
   assert.equal(s.backlog, 5000);
+  assert.deepEqual(s.rows[0].inTransList, [1200, 3400]);
   assert.deepEqual(s.rows[0].eta, [C.ymd(2026, 11, 14), C.ymd(2026, 12, 1)]);
+  assert.deepEqual(s.rows[0].etaParts, [C.ymd(2026, 11, 14), C.ymd(2026, 12, 1)]);
   assert.deepEqual(s.rows[0].etd, [C.ymd(2026, 10, 20)]);
   assert.equal(res.styles.get('AB101').inTrans, 1500, 'a thousands comma stays inside its number');
+  assert.deepEqual(res.styles.get('AB101').rows[0].etaParts, [], 'no ETA at all: nothing to line up');
+  // A date that can't be read keeps its place, so the list still lines up with In Trans.
+  assert.deepEqual(res.styles.get('AB102').rows[0].etaParts, [C.ymd(2026, 11, 14), null]);
+  // An In Trans part that isn't a number is listed, never read as 0 (Arriving can't come from it).
+  assert.deepEqual(res.styles.get('AB103').rows[0].inTransBad, ['n/a']);
+  const nn = res.issues.filter(i => i.code === 'not-a-number');
+  assert.deepEqual(nn.map(i => i.style), ['AB103']);
+  assert.match(nn[0].message, /In Trans Qty "n\/a" isn't a number, so the ERP's In Trans for the style isn't known/);
+  assert.equal(res.counts.inTransUnreadable, 1);
 });
 
 test('a Grand Total (or Total) row is never a style, whichever cell holds the label', () => {

@@ -11,7 +11,9 @@
 // UPC_MASTER are left out, so open/shipped and descriptions can differ from the page.
 // --ats: the ERP's "Inventory Report - On Hand_In Transit_In Production" (sheet "Report"), read with core/ats.js as the
 // page reads it (its date from the file name, else the day the file was saved, as on the page), then Available to sell
-// (core/sell.js) with it; and compared per style with Incoming: In Trans Qty vs On the water + At port, Import PO
+// (core/sell.js) with it: Arriving from its In Trans, and how our own lots meet it (matched, received, in the ERP's
+// transit, landed, kept), reconciled per style with Incoming and the report's In Trans (a failure if they don't add up);
+// and compared per style with Incoming: In Trans Qty vs On the water + At port, Import PO
 // Backlog Qty vs In China (LA POs only). Available to sell is also worked out without the report (as when it's missing),
 // with or without --ats. Its sums, Saul's pull-from date rule and the ready dates are checked lot by lot here, on their
 // own, not with the engine's code.
@@ -467,28 +469,123 @@ else {
   }
 }
 
+// The checks the reconciliation can't make (a unit counted twice, or dropped, still adds up), worked out here from the
+// files on their own and set against the engine's numbers (its cross-checks are listed on Problems, never counted:
+// Saul decides). Per style on the report with In Trans read:
+// - In Trans beyond our sailed and on-vessel goods, due after the report date, while Container Tracking has the style
+//   on the water or at port with no Master Sheet line and the sheet still has goods in China: maybe offered twice;
+// - taken into the ERP's transit although its Import PO Backlog holds that many of the style's China goods (sold too);
+// - our own Landed goods due shortly before the report date, which could be that In Trans instead of China goods;
+// - received never more than In WH, and the engine's split of In Trans the same as worked out here.
+// Style codes and numbers only.
+function erpCrossChecks(S, R, erpS) {
+  const rep = S.reportDay, isD = v => typeof v === 'number' && Number.isFinite(v);
+  const IN = ['noCrd', 'inProd', 'ready', 'booked', 'loaded'], SAIL = ['water', 'port'], GONE = ['On the water', 'At port', 'Landed', 'Shipped'];
+  const soldA = a => a.bucket === 'pullFromChina' || ((IN.includes(a.bucket) || SAIL.includes(a.bucket)) && (a.ptype === 'China Pickup' || (a.flags || []).includes('pull-section')));
+  const by = new Map();
+  for (const a of R.allocs) (by.get(a.style) || by.set(a.style, []).get(a.style)).push(a);
+  const sum = (a, f = x => x.units) => a.reduce((p, x) => p + (f(x) || 0), 0);
+  const backlogCol = !!(atsR && Array.isArray(atsR.columns) && atsR.columns.includes('backlog'));
+  const L = { twice: [], loose: [], backlog: [], landedOurs: [], received: [], differ: [] };
+  for (const s of erpS) {
+    const e = atsR.styles.get(s.style), al = by.get(s.style) || [];
+    const ships = e.rows.flatMap(x => (x.inTransList || []).map((q, i) => ({ units: q, eta: (x.etaParts || [])[i] ?? null })));
+    const E = sum(ships);
+    const sailed = al.filter(a => SAIL.includes(a.bucket) && !soldA(a) && a.units > 0), china = al.filter(a => IN.includes(a.bucket) && !soldA(a) && a.units > 0);
+    const ours = sum(sailed), due = list => sum(list.filter(y => isD(y.eta) && isD(rep) && y.eta <= rep));
+    let taken = 0, landed = 0, unm = 0;
+    if (E >= ours) {
+      let x = E - ours;
+      taken = Math.min(x, sum(china.filter(a => ['booked', 'loaded'].includes(a.bucket) && isD(a.etd))));
+      x -= taken;
+      landed = Math.min(x, Math.max(0, due(ships) - due(sailed)));
+      unm = x - landed;
+    }
+    const held = sum(china) - taken;
+    const ctSailed = sum(al.filter(a => ['unmatched', 'ctMore'].includes(a.bucket) && ['On the water', 'At port'].includes(a.stage)));
+    const twice = Math.min(unm, ctSailed, held);
+    const soldChina = sum(al.filter(a => soldA(a) && (IN.includes(a.bucket) || (a.bucket === 'pullFromChina' && !GONE.includes(a.stage)))));
+    const backlog = sum(e.rows.flatMap(r => (r.backlogList || []).filter(v => typeof v === 'number' && v > 0)), v => v);
+    const inBacklog = backlogCol && taken ? Math.max(0, taken - Math.max(0, sum(china) + soldChina - backlog)) : 0;
+    const ourLanded = sum(al.filter(a => a.bucket === 'landed' && isD(a.eta) && isD(rep) && a.eta <= rep && a.eta > rep - 45));
+    if (twice) L.twice.push([s.style, twice]);
+    if (Math.min(unm, held)) L.loose.push([s.style, Math.min(unm, held)]);
+    if (inBacklog) L.backlog.push([s.style, inBacklog]);
+    if (taken && ourLanded) L.landedOurs.push([s.style, Math.min(taken, ourLanded)]);
+    if (isD(s.inWh) && s.receivedDropped > Math.max(0, s.inWh)) L.received.push([s.style, s.receivedDropped - Math.max(0, s.inWh)]);
+    if (taken !== s.inErpTransitTaken || landed !== s.landedNotReceived || unm !== s.erpUnmatched || twice !== s.maybeTwice || inBacklog !== s.takenInBacklog) {
+      L.differ.push(`${s.style} (here taken ${n(taken)} landed ${n(landed)} not sailed ${n(unm)} twice ${n(twice)} backlog ${n(inBacklog)}; engine ${n(s.inErpTransitTaken)} ${n(s.landedNotReceived)} ${n(s.erpUnmatched)} ${n(s.maybeTwice)} ${n(s.takenInBacklog)})`);
+    }
+  }
+  const line = list => `${n(sum(list, x => x[1]))} units on ${n(list.length)} styles${list.length ? ` (most: ${list.slice().sort((a, b) => b[1] - a[1]).slice(0, 6).map(x => `${x[0]} ${n(x[1])}`).join(' · ')})` : ''}`;
+  console.log("    cross-checks the reconciliation can't make (worked out here from the files; listed on Problems, never counted, Saul decides):");
+  console.log(`      maybe offered twice: In Trans due after the report date beyond our sailed and on-vessel goods, with Container Tracking on the water / at port under a PO with no Master Sheet line and goods still in China: ${line(L.twice)}`);
+  console.log(`        for scale, the same without Container Tracking's word (In Trans not sailed on ours that goods still in China could be): ${line(L.loose)}`);
+  console.log(`      taken into the ERP's transit although its Import PO Backlog holds that many of the style's China goods: ${backlogCol ? line(L.backlog) : 'no Import PO Backlog column'}`);
+  console.log(`        for scale, taken where our own Landed goods due in the 45 days before the report date could be that In Trans instead: ${line(L.landedOurs)}`);
+  console.log(`      received more than the style's In WH (never allowed): ${line(L.received)}`);
+  console.log(`      the engine's split of In Trans and its cross-checks against these, style by style: ${L.differ.length ? `DIFFER on ${n(L.differ.length)} (e.g. ${L.differ.slice(0, 3).join(' | ')})` : 'the same on every style'}`);
+  if (L.received.length) fails(`Available to sell: ${n(L.received.length)} styles have more received than In WH`);
+  if (L.differ.length) fails(`Available to sell: the engine's split of the ERP's In Trans differs from the one worked out here on ${n(L.differ.length)} styles`);
+  const T = S.totals;
+  if (T.maybeTwice !== sum(L.twice, x => x[1]) || T.takenInBacklog !== sum(L.backlog, x => x[1])) fails("Available to sell: the engine's cross-check totals aren't the ones worked out here");
+}
+
 // The selling engine's numbers, and their checks: every sum, Saul's rule and the ready date, lot by lot, worked out here
 // on their own. Style codes and PO numbers next to numbers only.
 function sellReport(S, R, noReport) {
   const T = S.totals, K = T.cases || {}, NP = T.noCasePackUnits || {}, LO = T.looseUnits || {}, cnt = S.counts || {};
-  const ROWS = [['now', 'Available now'], ['fromChina', 'Available from China'], ['arriving', 'Arriving (water, port)'], ['total', 'Total available'],
-    ['soldChina', 'Sold, ships from China'], ['oversold', 'Oversold'], ['ordersTaken', 'Orders taken off lots']];
+  const ROWS = [['now', 'Available now'], ['fromChina', 'Available from China'], ['arriving', 'Arriving'], ['arrivingErp', '  of it ERP In Trans'],
+    ['arrivingOurs', '  of it ours'], ['total', 'Total available'], ['soldChina', 'Sold, ships from China'], ['oversold', 'Oversold'], ['ordersTaken', 'Orders taken off lots']];
   console.log(`    ${'Totals'.padEnd(24)} ${'units'.padStart(12)} ${'whole cases'.padStart(12)} ${'loose units'.padStart(12)} ${'units, no case pack'.padStart(20)}`);
   for (const [k, w] of ROWS) {
-    const hasCases = !['oversold', 'ordersTaken'].includes(k), hasLoose = ['now', 'fromChina', 'arriving', 'total'].includes(k);
+    const hasCases = ['now', 'fromChina', 'arriving', 'total', 'soldChina'].includes(k), hasLoose = ['now', 'fromChina', 'arriving', 'total'].includes(k);
     console.log(`    ${w.padEnd(24)} ${n(T[k]).padStart(12)} ${(hasCases ? n(K[k]) : '').padStart(12)} ${(hasLoose ? n(LO[k]) : '').padStart(12)} ${(hasCases ? n(NP[k]) : '').padStart(20)}`);
   }
+  const sumU = (a, f = l => l.units) => a.reduce((p, l) => p + (f(l) || 0), 0);
   if (!noReport) {
-    console.log('    cross-checks with the ATS report (listed on Problems, never counted; Saul decides how these should count):');
-    console.log(`      sailed, ETA on or before the report date, not In Trans on it (probably received already, so maybe counted twice): ${n(cnt.erpReceivedStyles)} styles, ${n(cnt.erpReceivedUnits)} units (${n(cnt.erpReceivedAvailable)} still shown in Arriving)`);
-    console.log(`      orders beyond stock with ERP In Trans beyond our water / port / booked-with-ETD (landed, not received?): ${n(cnt.erpInTransStyles)} styles (${n(cnt.erpInTransOversold)} oversold), up to ${n(cnt.erpInTransUnits)} units of those orders`);
-    console.log(`      orders beyond stock no more than the units sold to ship from China (maybe the same orders): ${n(cnt.soldInOrdersStyles)} styles (${n(cnt.soldInOrdersOversold)} oversold), ${n(cnt.soldInOrdersUnits)} units`);
+    // Arriving from the ERP's In Trans, and how our own lots meet it (Saul, Oct 30), worked out here as well.
+    const st0 = S.styles, erpS = st0.filter(s => s.arrivingFrom === 'erp'), erpL = S.lots.filter(l => l.source === 'erp');
+    const sumS = (a, k) => a.reduce((p, s) => p + (s[k] || 0), 0);
+    console.log("    Arriving from the ATS report's In Trans (each quantity with its ETA, the same snapshot as the stock):");
+    console.log(`      styles on the report with In Trans read: ${n(cnt.erpStyles)} (In Trans can't be read on ${n(cnt.erpInTransUnknownStyles)}${cnt.noInTransColumn ? '; NO In Trans column' : ''}) · ERP shipments ${n(erpL.length)}, ${n(sumU(erpL))} units (${n(cnt.erpLotsNoEta)} with no ETA: the ETA list doesn't line up on ${n(cnt.erpEtaMismatchStyles)} styles)`);
+    console.log(`      ERP In Trans ≥ our sailed units: ${n(cnt.erpMoreStyles)} styles (with sailed lots of ours) · less: ${n(cnt.erpLessStyles)} styles`);
+    console.log(`      our sailed units matched to the ERP's In Trans (counted there, not again): ${n(T.matchedOurs)} units on ${n(cnt.matchedLots)} lots`);
+    console.log(`      In Trans beyond ours, taken off Booked / Loaded lots with an ETD (earliest ETD first): ${n(T.inErpTransitTaken)} units on ${n(cnt.inErpTransitLots)} lots, ${n(cnt.inErpTransitStyles)} styles`);
+    console.log(`      In Trans beyond that on shipments due on or before the report date: landed, not received yet: ${n(T.landedNotReceived)} units on ${n(cnt.landedNotReceivedStyles)} styles`);
+    console.log(`      In Trans beyond that, due after the report date (or no ETA): not sailed on our shipping data: ${n(T.erpUnmatched)} units on ${n(cnt.erpUnmatchedStyles)} styles`);
+    console.log(`      ERP In Trans < ours: shipments matched first to one of ours of the same quantity: ${n(cnt.sameQtyMatchedLots)} lots`);
+    console.log(`      ours with an ETA on or before the report date, not on its In Trans: received (in In WH), dropped: ${n(T.receivedDropped)} units on ${n(cnt.receivedLots)} lots, ${n(cnt.receivedStyles)} styles`);
+    console.log(`      ours not on its In Trans yet (a later ETA or none, or more than the style's In WH): kept as Arriving from our data: ${n(T.keptExtra)} units on ${n(cnt.keptExtraLots)} lots, ${n(cnt.keptExtraStyles)} styles` +
+      ` (ETA passed but more than In WH: ${n(T.receivedCapped)} units on ${n(cnt.receivedCappedStyles)} styles)${cnt.noReportDayStyles ? ` (${n(cnt.noReportDayStyles)} styles with no report date)` : ''}`);
+    // Reconciliation, per style and in total: our lots = Incoming; the ERP's lots = its In Trans; In Trans = matched +
+    // in its transit + landed; sellable (from China + arriving + taken) + matched + received + in its transit = Incoming + In Trans.
+    const inTransOf = s => { const e = atsR && atsR.styles.get(s.style); return e && s.arrivingFrom === 'erp' ? e.rows.reduce((p, x) => p + (x.inTransList || []).reduce((q, v) => q + v, 0), 0) : 0; };
+    const incOf = new Map(R.styles.map(s => [s.style, s.units.incoming]));
+    const recBad = [];
+    for (const s of st0) {
+      const inc = incOf.get(s.style) || 0, it = inTransOf(s);
+      const why = [sumU(s.lots.filter(l => l.source === 'ours')) !== inc ? 'our lots ≠ Incoming' : '', sumU(s.lots.filter(l => l.source === 'erp')) !== it ? "the ERP's lots ≠ its In Trans" : '',
+        s.arrivingFrom === 'erp' && s.erpInTrans !== s.matchedOurs + s.inErpTransitTaken + s.landedNotReceived + s.erpUnmatched ? 'In Trans ≠ matched + in transit + landed + not sailed on ours' : '',
+        s.fromChina + s.arriving + s.ordersTaken + s.matchedOurs + s.receivedDropped + s.inErpTransitTaken !== inc + it ? 'sellable + matched + received + in transit ≠ Incoming + In Trans' : ''].filter(Boolean);
+      if (why.length) recBad.push(`${s.style} (${why.join(', ')})`);
+    }
+    const inc = R.totals.units.incoming, it = sumS(erpS, 'erpInTrans'), sell = T.fromChina + T.arriving + T.ordersTaken;
+    console.log(`      reconciliation: Incoming ${n(inc)} + ERP In Trans ${n(it)} = ${n(inc + it)} = sellable ${n(sell)} (from China + arriving + taken by orders) + matched ${n(T.matchedOurs)} + received ${n(T.receivedDropped)} + in the ERP's transit ${n(T.inErpTransitTaken)}` +
+      ` (= ${n(sell + T.matchedOurs + T.receivedDropped + T.inErpTransitTaken)}): ${sell + T.matchedOurs + T.receivedDropped + T.inErpTransitTaken === inc + it ? 'yes' : 'NO'}`);
+    const itParts = T.matchedOurs + T.inErpTransitTaken + T.landedNotReceived + T.erpUnmatched;
+    console.log(`      ERP In Trans ${n(it)} = matched ${n(T.matchedOurs)} + in its transit ${n(T.inErpTransitTaken)} + landed, not received ${n(T.landedNotReceived)} + not sailed on ours ${n(T.erpUnmatched)}: ${it === itParts ? 'yes' : 'NO'}` +
+      ` · per style, all four hold on every style: ${recBad.length ? `NO on ${n(recBad.length)} (e.g. ${recBad.slice(0, 3).join(' | ')})` : 'yes'}`);
+    if (recBad.length || sell + T.matchedOurs + T.receivedDropped + T.inErpTransitTaken !== inc + it || it !== itParts) fails("Available to sell: the ERP's In Trans and our lots don't reconcile");
+    if (atsR && it !== sumS([...atsR.styles.values()].filter(e => erpS.some(s => s.style === e.style)), 'inTrans')) fails("Available to sell: the ERP's lots aren't the report's In Trans for those styles");
+    erpCrossChecks(S, R, erpS);
+    console.log(`    orders beyond stock no more than the units sold to ship from China (maybe the same orders; listed, open question): ${n(cnt.soldInOrdersStyles)} styles (${n(cnt.soldInOrdersOversold)} oversold), ${n(cnt.soldInOrdersUnits)} units`);
   }
   if (noReport) console.log('    (no report: the page shows Available now, Total available and Oversold as "no report yet"; From China and Arriving are before customer orders)');
 
-  // Lots: where they are, their rule, "now", ready dates.
-  const lots = S.lots, china = lots.filter(l => l.inChina), sailed = lots.filter(l => !l.inChina), sumU = (a, f = l => l.units) => a.reduce((p, l) => p + (f(l) || 0), 0);
-  console.log(`    lots ${n(lots.length)}: in China ${n(china.length)} (${n(sumU(china))} units), on the water or at port ${n(sailed.length)} (${n(sumU(sailed))} units)`);
+  // Lots: where they are, their rule, "now", ready dates (ours; the ERP's shipments have only their ETA).
+  const lots = S.lots.filter(l => l.source !== 'erp'), china = lots.filter(l => l.inChina), sailed = lots.filter(l => !l.inChina);
+  console.log(`    our lots ${n(lots.length)}: in China ${n(china.length)} (${n(sumU(china))} units), on the water or at port ${n(sailed.length)} (${n(sumU(sailed))} units) · the ERP's In Trans lots ${n(S.lots.length - lots.length)}`);
   const RULE = { etd: '10 days before the ETD', crd: '5 days before the CRD', order: 'about 75 days after the order date', none: 'no date' };
   console.log('    lots in China by pull-from rule (lots / units):');
   for (const k of ['etd', 'crd', 'order', 'none']) {
@@ -522,21 +619,23 @@ function sellReport(S, R, noReport) {
     ` · stock can't be read ${n(flag('stock-unknown').length)} · on the report only ${n(flag('erp-only').length)}`);
   const ov = st.filter(s => s.oversold > 0).sort((a, b) => b.oversold - a.oversold);
   console.log(`    with stock now ${n(st.filter(s => s.now > 0).length)} · with something to sell ${n(st.filter(s => s.total > 0).length)} · oversold ${n(ov.length)}${ov.length ? ` (most: ${ov.slice(0, 5).map(s => `${s.style} ${n(s.oversold)}`).join(' · ')})` : ''}`);
-  console.log(`    lots taken by customer orders ${n(lots.filter(l => l.taken > 0).length)} (all of it ${n(lots.filter(l => l.taken > 0 && !l.available).length)}) · orders not known on ${n(flag('orders-unknown').length)} styles`);
+  const all = S.lots;
+  console.log(`    lots taken by customer orders ${n(all.filter(l => l.taken > 0).length)} (all of it ${n(all.filter(l => l.taken > 0 && !l.available).length)}; the ERP's In Trans ${n(all.filter(l => l.taken > 0 && l.source === 'erp').length)}) · orders not known on ${n(flag('orders-unknown').length)} styles`);
 
   // The checks: sums, and Saul's rule worked out here, lot by lot.
   const bad = [], isD = v => typeof v === 'number' && Number.isFinite(v), sumS = k => st.reduce((p, s) => p + (s[k] || 0), 0);
-  for (const k of ['now', 'fromChina', 'arriving', 'total', 'soldChina', 'oversold', 'ordersTaken']) if (sumS(k) !== T[k]) bad.push(`the styles add up to ${k} ${n(sumS(k))}, not ${n(T[k])}`);
+  for (const k of ['now', 'fromChina', 'arriving', 'arrivingErp', 'arrivingOurs', 'total', 'soldChina', 'oversold', 'ordersTaken']) if (sumS(k) !== T[k]) bad.push(`the styles add up to ${k} ${n(sumS(k))}, not ${n(T[k])}`);
   if (T.total !== T.now + T.fromChina + T.arriving) bad.push('Total available isn\'t now + from China + arriving');
+  if (T.arriving !== T.arrivingErp + T.arrivingOurs) bad.push("Arriving isn't the ERP's In Trans + ours");
   for (const k of ['now', 'fromChina', 'arriving']) if (st.reduce((p, s) => p + ((s.cases || {})[k] || 0), 0) !== K[k]) bad.push(`the styles' cases add up to another ${k}`);
-  if (sumU(lots) !== R.totals.units.incoming) bad.push(`the lots hold ${n(sumU(lots))} units, Incoming is ${n(R.totals.units.incoming)}`);
+  if (sumU(lots) !== R.totals.units.incoming) bad.push(`our lots hold ${n(sumU(lots))} units, Incoming is ${n(R.totals.units.incoming)}`);
   if (T.soldChina !== R.totals.units.pullFromChina) bad.push(`sold ${n(T.soldChina)} isn't the stage engine's Pull from China ${n(R.totals.units.pullFromChina)}`);
-  if (new Set(lots.map(l => l.id)).size !== lots.length) bad.push('two lots share an id');
-  if (st.reduce((p, s) => p + s.lots.length, 0) !== lots.length) bad.push("the styles' lots aren't every lot once");
+  if (new Set(all.map(l => l.id)).size !== all.length) bad.push('two lots share an id');
+  if (st.reduce((p, s) => p + s.lots.length, 0) !== all.length) bad.push("the styles' lots aren't every lot once");
   const lotDay = l => (l.availableDate == null ? Infinity : l.availableDate);
   const styleBad = { lots: [], stock: [], order: [] };
   for (const s of st) {
-    if (sumU(s.lots) !== s.fromChina + s.arriving + s.ordersTaken || s.fromChina !== sumU(s.lots.filter(l => l.inChina), l => l.available) ||
+    if (sumU(s.lots, l => l.taken + l.available) !== s.fromChina + s.arriving + s.ordersTaken || s.fromChina !== sumU(s.lots.filter(l => l.inChina), l => l.available) ||
       s.arriving !== sumU(s.lots.filter(l => !l.inChina), l => l.available) || sumU(s.lots, l => l.taken) !== s.ordersTaken) styleBad.lots.push(s.style);
     const known = isD(s.inWh) && isD(s.orders) && !s.flags.includes('stock-unknown');
     if (known ? s.now !== Math.max(0, s.inWh - s.orders) || s.ordersTaken + s.oversold !== Math.max(0, s.orders - s.inWh) : s.ordersTaken || s.oversold || s.now) styleBad.stock.push(s.style);
@@ -550,12 +649,16 @@ function sellReport(S, R, noReport) {
   if (styleBad.stock.length) bad.push(`${n(styleBad.stock.length)} styles whose stock after orders is off (e.g. ${styleBad.stock.slice(0, 3).join(', ')})`);
   if (styleBad.order.length) bad.push(`${n(styleBad.order.length)} styles where orders took a later lot before an earlier one (e.g. ${styleBad.order.slice(0, 3).join(', ')})`);
   const ruleBad = [];
-  for (const l of lots) {
+  // Every lot (ours and the ERP's): units = matched + received + in the ERP's transit + taken + available, none below 0.
+  const KEEP = ['matched', 'received', 'inErpTransit', 'taken', 'available'];
+  for (const l of all) {
     const d = l.dates || {}, src = l.dates ? ['ctReady', 'poBook', 'factoryCrd', 'crdExpected', 'shipBy'].map(k => d[k]).filter(isD) : isD(l.crd) ? [l.crd] : [];
     // A source more than a year ahead or before 2015 (a wrong year) isn't used, unless every source is.
     const ready = src.find(x => !(x > today + 366 || x < C.ymd(2015, 1, 1))) ?? (src.length ? src[0] : null), why = [];
     if ((l.readyDate ?? null) !== ready) why.push('ready date');
-    if (l.units !== l.taken + l.available || l.taken < 0 || l.available < 0) why.push('units ≠ taken + available');
+    if (l.units !== KEEP.reduce((p, k) => p + (l[k] || 0), 0) || KEEP.some(k => l[k] < 0)) why.push('units ≠ matched + received + in transit + taken + available');
+    if (l.received && !(isD(l.eta) && l.eta <= S.reportDay)) why.push('received with an ETA after the report date');
+    if (l.inErpTransit && !(['booked', 'loaded'].includes(l.bucket) && isD(l.etd))) why.push("in the ERP's transit but not Booked / Loaded with an ETD");
     if (l.inChina) {
       const w = isD(l.etd) ? [l.etd - 10, 'etd'] : ready != null ? [ready - 5, 'crd'] : isD(d.orderDate) ? [d.orderDate + 75, 'order'] : [null, 'none'];
       if ((l.pullFrom ?? null) !== w[0] || l.pullRule !== w[1] || !!l.estimate !== (w[1] === 'order') || (l.availableDate ?? null) !== w[0]) why.push(`pull-from ${C.fmtDay(l.pullFrom) || 'none'} (${l.pullRule}), not ${C.fmtDay(w[0]) || 'none'} (${w[1]})`);
@@ -566,9 +669,9 @@ function sellReport(S, R, noReport) {
     if (why.length) ruleBad.push(`${l.style} PO ${l.po}: ${why.join(', ')}`);
   }
   console.log(`    sums hold (styles = totals; each style's lots = from China + arriving + taken; stock after orders; earliest lots first;` +
-    ` lots = Incoming ${n(R.totals.units.incoming)}; sold = Pull from China ${n(R.totals.units.pullFromChina)}): ${bad.length ? 'NO' : 'yes'}`);
-  console.log(`    Saul's rule, the ready date and taken + available, worked out here for each of the ${n(lots.length)} lots: ${ruleBad.length ? `${n(ruleBad.length)} DIFFER` : 'all the same'}`);
-  if (ruleBad.length) bad.push(`${n(ruleBad.length)} lots break Saul's rule, the ready-date order or taken + available (e.g. ${ruleBad.slice(0, 3).join(' | ')})`);
+    ` our lots = Incoming ${n(R.totals.units.incoming)}; sold = Pull from China ${n(R.totals.units.pullFromChina)}): ${bad.length ? 'NO' : 'yes'}`);
+  console.log(`    Saul's rule, the ready date and units = matched + received + in transit + taken + available, worked out here for each of the ${n(all.length)} lots: ${ruleBad.length ? `${n(ruleBad.length)} DIFFER` : 'all the same'}`);
+  if (ruleBad.length) bad.push(`${n(ruleBad.length)} lots break Saul's rule, the ready-date order or their units (e.g. ${ruleBad.slice(0, 3).join(' | ')})`);
   for (const x of bad) fails(`Available to sell: ${x}`);
   console.log('');
   issueLines(S.issues, i => [i.style, i.po ? `PO ${i.po}` : ''].filter(Boolean).join(' '));

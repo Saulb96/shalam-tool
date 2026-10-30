@@ -234,7 +234,11 @@ function buildFixtures(today) {
     Complete: [CONT, row(CONT, { 'ID#': 'Complete Shipments' }), row(CONT, { 'ID#': 3, 'Container #': 'EEEU3333333', 'Round #': 300, ETD: ser(2026, 6, 5), ETA: ser(2026, 7, 5) })],
   }));
   // SL-101's "ATS from in WH" isn't In WH − Total Customer Orders (listed); SL-105's numbers are stored as text.
-  const sellAts = [ar('SL-101', 1000, 200, 700), ar('SL-102', 100, 1600), ar('SL-104', 0, 5000), ar('SL-105', '300', '0', '300'),
+  // In Trans (Arriving comes from it, each quantity with its ETA): SL-105's two shipments are our 2,400 on the water
+  // (matched); SL-101's 600 are goods we still see booked on a vessel (taken off its Booked lot).
+  const trans = (r, q, eta) => { const x = r.slice(); x[10] = q; x[12] = eta; return x; };
+  const sellAts = [trans(ar('SL-101', 1000, 200, 700), '600', sd(58)), ar('SL-102', 100, 1600), ar('SL-104', 0, 5000),
+    trans(ar('SL-105', '300', '0', '300'), '1,000, 1,400', `${sd(18)}, ${sd(25)}`),
     ar('SL-106', 0, 0), ar('SL-107', 0, 0), ar('SL-108', 50, 0), ar('SL-109', 0, 100)];
   bytes.set('ats-sell.xlsx', atsBook(sellAts));
   bytes.set('ats-sell-bad.xlsx', atsBook(sellAts, { grand: 9999 }));
@@ -295,7 +299,9 @@ function sellFor(fx, today, f = {}) {
 // before the ETD; no ETD, 5 days before the ready date (the first of Container Tracking's Ready Date, the PO Book's own
 // date, Factory CRD, CRD Expected, Ship by); no ready date, 75 days after the order date (an estimate, its range from the
 // order date). Sailed: the ETA. A date before today is "now"; ready dates more than 7 days apart disagree (in China).
-// Also each lot's units = taken + available. Answers one line per lot that breaks a rule.
+// Also each lot's units = matched + received + in the ERP's transit + taken + available (none below 0); the ERP's own
+// In Trans lots are dated by their ETA. Answers one line per lot that breaks a rule.
+const KEEP = ['matched', 'received', 'inErpTransit', 'taken', 'available'];
 const READY_KEYS = ['ctReady', 'poBook', 'factoryCrd', 'crdExpected', 'shipBy'];
 const isDay = v => typeof v === 'number' && Number.isFinite(v);
 // A source more than a year ahead or before 2015 (a wrong year) isn't used, unless every source is.
@@ -316,22 +322,28 @@ function ruleMismatches(S, today) {
       const spread = src.length > 1 ? Math.max(...src) - Math.min(...src) : 0;
       if (l.flags.includes('dates-disagree') !== spread > 7) why.push(`dates-disagree with a spread of ${spread} days`);
     } else if ((l.availableDate ?? null) !== (isDay(l.eta) ? l.eta : null) || l.flags.includes('dates-disagree')) why.push('sailed: not its ETA');
-    if (l.units !== l.taken + l.available || l.taken < 0 || l.available < 0) why.push(`units ${l.units} ≠ taken ${l.taken} + available ${l.available}`);
+    if (l.units !== KEEP.reduce((p, k) => p + (l[k] || 0), 0) || KEEP.some(k => l[k] < 0)) why.push(`units ${l.units} ≠ ${KEEP.map(k => `${k} ${l[k]}`).join(' + ')}`);
     if (why.length) bad.push(`${l.style} PO ${l.po}: ${why.join('; ')}`);
   }
   return bad;
 }
 // The selling engine's sums: the styles add up to the totals, each style's lots to its numbers, stock after orders,
-// customer orders taken off the earliest lots first, the lots to the stage engine's Incoming and sold to its Pull from
-// China. Answers what doesn't hold.
-function sellSums(S, R) {
+// customer orders taken off the earliest lots first, our lots to the stage engine's Incoming, the ERP's lots to the
+// report's In Trans (matched + in its transit + landed + not sailed on ours), received never more than In WH, and sold to
+// its Pull from China. Answers what doesn't hold.
+function sellSums(S, R, A) {
   const bad = [], T = S.totals, sum = (a, f) => a.reduce((p, x) => p + (f(x) || 0), 0);
-  for (const k of ['now', 'fromChina', 'arriving', 'total', 'soldChina', 'oversold', 'ordersTaken']) if (sum(S.styles, x => x[k]) !== T[k]) bad.push(`styles' ${k} ${sum(S.styles, x => x[k])} ≠ total ${T[k]}`);
+  for (const k of ['now', 'fromChina', 'arriving', 'arrivingErp', 'arrivingOurs', 'total', 'soldChina', 'oversold', 'ordersTaken']) if (sum(S.styles, x => x[k]) !== T[k]) bad.push(`styles' ${k} ${sum(S.styles, x => x[k])} ≠ total ${T[k]}`);
   if (T.total !== T.now + T.fromChina + T.arriving) bad.push('total ≠ now + from China + arriving');
+  if (T.arriving !== T.arrivingErp + T.arrivingOurs) bad.push("arriving ≠ the ERP's In Trans + ours");
   const lotDay = l => (l.availableDate == null ? Infinity : l.availableDate);
   for (const s of S.styles) {
-    const ls = s.lots, lu = sum(ls, l => l.units);
+    const ls = s.lots, lu = sum(ls, l => l.taken + l.available);
     if (lu !== s.fromChina + s.arriving + s.ordersTaken) bad.push(`${s.style}: lots ${lu} ≠ from China + arriving + taken`);
+    const erp = sum(ls.filter(l => l.source === 'erp'), l => l.units), e = A && A.styles && A.styles.get(s.style);
+    if (s.arrivingFrom === 'erp' && (erp !== s.erpInTrans || erp !== s.matchedOurs + s.inErpTransitTaken + s.landedNotReceived + s.erpUnmatched || !e || erp !== (e.inTrans || 0))) bad.push(`${s.style}: the ERP's lots ${erp} aren't its In Trans (matched + in its transit + landed + not sailed on ours)`);
+    if (isDay(s.inWh) && s.receivedDropped > Math.max(0, s.inWh)) bad.push(`${s.style}: received ${s.receivedDropped} > In WH ${s.inWh}`);
+    if (s.arrivingFrom !== 'erp' && erp) bad.push(`${s.style}: ERP lots without the ERP's In Trans`);
     if (s.fromChina !== sum(ls.filter(l => l.inChina), l => l.available) || s.arriving !== sum(ls.filter(l => !l.inChina), l => l.available)) bad.push(`${s.style}: lot availability`);
     if (sum(ls, l => l.taken) !== s.ordersTaken) bad.push(`${s.style}: taken ≠ orders taken`);
     const known = isDay(s.inWh) && isDay(s.orders) && !s.flags.includes('stock-unknown');
@@ -345,7 +357,10 @@ function sellSums(S, R) {
     }
   }
   if (R && R.ok) {
-    if (sum(S.lots, l => l.units) !== R.totals.units.incoming) bad.push(`lots ${sum(S.lots, l => l.units)} ≠ Incoming ${R.totals.units.incoming}`);
+    const ours = S.lots.filter(l => l.source !== 'erp');
+    if (sum(ours, l => l.units) !== R.totals.units.incoming) bad.push(`our lots ${sum(ours, l => l.units)} ≠ Incoming ${R.totals.units.incoming}`);
+    const it = sum(S.styles, s => s.erpInTrans);
+    if (T.fromChina + T.arriving + T.ordersTaken + T.matchedOurs + T.receivedDropped + T.inErpTransitTaken !== R.totals.units.incoming + it) bad.push("sellable + matched + received + in the ERP's transit ≠ Incoming + In Trans");
     if (T.soldChina !== R.totals.units.pullFromChina) bad.push(`sold ${T.soldChina} ≠ Pull from China ${R.totals.units.pullFromChina}`);
   }
   return bad;
@@ -944,7 +959,7 @@ const SL = `(() => {
     note: txt(q('#sellNote')), noteCls: (q('#sellNote .banner') || {}).className || '',
     tiles: [...document.querySelectorAll('#sellTiles .tile')].map(t => ({ k: t.dataset.t || '', btn: t.tagName === 'BUTTON', cls: t.className, n: txt(t.querySelector('.n')),
       cs: [...t.querySelectorAll('.cs')].map(txt), lbl: txt(t.querySelector('.lbl')), title: t.title || '' })),
-    heads: [...document.querySelectorAll('#sellTable thead th')].map(th => ({ t: plain(th), sort: th.getAttribute('aria-sort') || '' })),
+    heads: [...document.querySelectorAll('#sellTable thead th')].map(th => ({ t: plain(th), sort: th.getAttribute('aria-sort') || '', sub: sub(th) })),
     tr: document.querySelectorAll('#sellTable tbody tr.r').length, first: q('#sellTable tbody tr.r') ? +q('#sellTable tbody tr.r').dataset.i : -1,
     empty: txt(q('#sellTable tbody td.empty')),
     rows: [...document.querySelectorAll('#sellTable tbody tr.r')].slice(0, 80).map(tr => {
@@ -952,7 +967,8 @@ const SL = `(() => {
       return { i: +tr.dataset.i, style: txt(tr.querySelector('button.sb')), upc: sub(tds[0]), tags: [...tr.querySelectorAll('.tag')].map(txt), cells: tds.length,
         span: sp ? plain(sp) : null, inWh: sp ? null : plain(tds[3]), orders: sp ? null : plain(tds[4]), nowCell: sp ? null : plain(tds[5]), casePack: plain(tds[2]),
         now: b('now'), fromChina: b('fromChina'), arriving: b('arriving'), total: b('total'), sold: b('soldChina'),
-        totalCell: plain(tot), totalCls: tot.className, totalTitle: tot.title || '', firstPull: plain(tds[sp ? 5 : 7]), firstArrival: plain(tds[sp ? 7 : 9]) };
+        totalCell: plain(tot), totalCls: tot.className, totalTitle: tot.title || '', firstPull: plain(tds[sp ? 5 : 7]), firstArrival: plain(tds[sp ? 7 : 9]),
+        arrivingTitle: (tds[sp ? 6 : 8] || {}).title || '', fromChinaTitle: (tds[sp ? 4 : 6] || {}).title || '', tagTitles: [...tr.querySelectorAll('.tag')].map(x => x.title || '') };
     }),
     info: txt(q('#fInfo')), fbarIn: (q('#fbar').parentElement || {}).id || '', availShown: shown(q('#fAvailWrap')), stageShown: shown(q('#fStage')), typeShown: shown(q('#fType')),
     panel: shown(q('#panel')), panelLbl: txt(q('#panelLbl')), panelTitle: txt(q('#panelTitle')), panelSub: txt(q('#panelSub')), panelNote: txt(q('#panelNote')),
@@ -975,6 +991,9 @@ const md = (d, today) => (new Date(d * 864e5).getUTCFullYear() === new Date(toda
 // What the side panel's "Available from" cell must say for a lot (Saul's rule in words), worked out here: the date
 // shown (or "now"), and the words that must be in its tooltip.
 function whenSays(l, today) {
+  if (l.source !== 'erp' && !l.available && l.units && l.matched + l.received + l.inErpTransit >= l.units) {
+    return { main: l.received === l.units ? 'received' : l.inErpTransit === l.units || l.matched === l.units ? 'In Trans (ATS report)' : 'on the ATS report', words: [] };
+  }
   if (!l.inChina) return l.eta == null ? { main: 'no ETA yet', words: [] } : { main: C.fmtDay(l.eta), words: [`ETA ${md(l.eta, today)}`] };
   if (l.pullFrom == null) return { main: 'no date', words: [] };
   const date = (l.pullRule === 'order' ? 'about ' : '') + C.fmtDay(l.pullFrom);
@@ -1974,10 +1993,16 @@ const SCENARIOS = [
         eta: !!L.eta && !L.eta.inChina && L.eta.status === 'On the water' && L.eta.availableDate === today + 20,
         dis: !!L.dis && L.dis.flags.includes('dates-disagree') && L.dis.readyFrom === 'factoryCrd',
         oversold: sty('SL-104').oversold === 3800, notOnReport: (sty('SL-103').flags || []).includes('not-on-report'),
-        erpOnly: (sty('SL-108').flags || []).includes('erp-only'), sold: sty('SL-107').soldChina === 720, atsIssue: A.issues.some(i => i.code === 'erp-ats-differs') };
-      c('the invented files exercise every rule: ETD, CRD, the order date, "now", ETA, ready dates that disagree, orders over two lots, oversold, not on the report, report only, sold',
+        erpOnly: (sty('SL-108').flags || []).includes('erp-only'), sold: sty('SL-107').soldChina === 720, atsIssue: A.issues.some(i => i.code === 'erp-ats-differs'),
+        // Arriving from the ATS report's In Trans: SL-105's two shipments match our 2,400 on the water; SL-101's 600 come
+        // off its Booked lot (the ERP counts them in transit).
+        erpLots: S.lots.filter(l => l.style === 'SL-105' && l.source === 'erp').map(l => `${l.units}@${l.eta - today}`).join() === '1000@18,1400@25',
+        matched: !!L.eta && L.eta.matched === 2400 && L.eta.available === 0 && L.eta.flags.includes('matched-erp'),
+        inErpTransit: !!L.etd && L.etd.inErpTransit === 600 && L.etd.available === 600 && sty('SL-101').fromChina === 600 && sty('SL-101').arriving === 600,
+        arriving105: sty('SL-105').arriving === 2400 && sty('SL-105').arrivingErp === 2400 && sty('SL-105').firstArrival === today + 18 };
+      c('the invented files exercise every rule: ETD, CRD, the order date, "now", ETA, ready dates that disagree, orders over two lots, oversold, not on the report, report only, sold, the ERP\'s In Trans (matched, in its transit)',
         Object.values(shape).every(Boolean), JSON.stringify(shape));
-      const rules = ruleMismatches(S, today), sums = sellSums(S, R);
+      const rules = ruleMismatches(S, today), sums = sellSums(S, R, A);
       c("Saul's pull-from rule and the ready date hold on every lot (worked out here on their own)", !rules.length, rules.join(' | '));
       c('the selling sums hold (styles, lots, stock after orders, earliest lots first, Incoming, sold)', !sums.length, sums.join(' | '));
 
@@ -1999,6 +2024,9 @@ const SCENARIOS = [
       c('From China, Arriving and Total open a panel; Available now and Oversold do not', ['fromChina', 'arriving', 'total'].every(k => sellTile(p, k).btn) && !sellTile(p, 'now').btn && !sellTile(p, 'oversold').btn,
         JSON.stringify(p.tiles.map(x => [x.k, x.btn])));
       c('the columns, in order', p.heads.map(h => h.t).join('|') === SELL_HEADS.join('|'), p.heads.map(h => h.t).join('|'));
+      const ah = p.heads.find(h => h.t === 'Arriving') || {}, at = sellTile(p, 'arriving');
+      c('Arriving says it comes from the ATS report: "ATS report In Trans" under the column, "from the ATS report\'s In Trans" on the tile',
+        ah.sub === 'ATS report In Trans' && at.cs.some(x => /^from the ATS report's In Trans/.test(x)) && /In transit on the weekly ATS report/.test(at.title), `${ah.sub} · ${at.cs.join(' | ')}`);
       c(`one row per style (${S.styles.length}), sorted by style`, p.tr === S.styles.length && p.rows.map(r => r.style).join() === S.styles.map(x => x.styleRaw).sort().join(), p.rows.map(r => r.style).join());
       const diff = sellRowsDiffer(p, S, today, 'ok');
       c("every row: in warehouse, customer orders, available now, from China, first pull date, arriving, first arrival, total and sold are the engine's (blank for 0)", !diff.length, diff.join(' | '));
@@ -2012,6 +2040,12 @@ const SCENARIOS = [
       c('SL-104: tagged "oversold 3,800", Available now blank', row('SL-104').tags.includes('oversold 3,800') && row('SL-104').now === '' && row('SL-104').nowCell === '', JSON.stringify(row('SL-104')));
       c('SL-108 (on the report only): a row with its stock, nothing coming', row('SL-108').inWh === '50' && row('SL-108').now === '50' && !row('SL-108').fromChina && !row('SL-108').arriving, JSON.stringify(row('SL-108')));
       c('SL-102: case pack 12, its UPC under the style', row('SL-102').casePack === '12' && row('SL-102').upc === '000000005024', JSON.stringify(row('SL-102')));
+      c("SL-105's Arriving says where it comes from: the ATS report's 2 shipments, our 2,400 on the water on it", row('SL-105').arriving === '2,400' &&
+        /2,400 units in 2 shipments/.test(row('SL-105').arrivingTitle) && /Our 2,400 on the water or at port are on it/.test(row('SL-105').arrivingTitle), row('SL-105').arrivingTitle);
+      c("SL-101's Arriving: the ATS report's 600, taken off its Booked lot; its From China says why it's 600", row('SL-101').arriving === '600' && row('SL-101').fromChina === '600' &&
+        /600 more on it are goods our sheets still show booked or loaded/.test(row('SL-101').arrivingTitle) &&
+        /^600 more are booked or loaded on our sheets, but the ATS report already counts them In Trans: they're in Arriving/.test(row('SL-101').fromChinaTitle), JSON.stringify(row('SL-101')));
+      c('SL-103 (not on the report): its tag says its Arriving is our shipping data', /its Arriving is our shipping data/.test(row('SL-103').tagTitles.join(' ')), JSON.stringify(row('SL-103').tagTitles));
       t.shots.push(await t.shot('sell-ok'));
 
       // The side panel of every style with lots: each lot in date order, the date a buyer can have it and its rule in words.
@@ -2024,12 +2058,13 @@ const SCENARIOS = [
         if (p.lots.length !== st.lots.length) panelBad.push(`${st.style}: ${p.lots.length} lots shown, ${st.lots.length} in the engine`);
         st.lots.forEach((l, j) => {
           const r = p.lots[j] || {}, cell = h => r[h] || { v: '', u: '', title: '' }, w2 = whenSays(l, today), af = cell('Available from');
-          const got = { status: cell('Status').v, po: cell('PO').v, units: cell('Units').v, taken: cell('Taken by orders').v, avail: cell('Available').v };
-          const want = { status: l.status, po: String(l.po), units: fmtN(l.units), taken: nz(l.taken), avail: nz(l.available) };
+          const got = { status: cell('Status').v, po: cell('PO').v, units: cell('Units').v, erp: cell('Counted on the ATS report').v, taken: cell('Taken by orders').v, avail: cell('Available').v };
+          const want = { status: l.status, po: l.source === 'erp' ? 'ATS report' : String(l.po), units: fmtN(l.units), erp: nz(l.matched + l.received + l.inErpTransit),
+            taken: nz(l.taken), avail: nz(l.available) };
           for (const k of Object.keys(want)) if (got[k] !== want[k]) panelBad.push(`${st.style} lot ${j + 1} ${k}: "${got[k]}", not "${want[k]}"`);
           if (af.v !== w2.main || !w2.words.every(x => af.title.includes(x))) panelBad.push(`${st.style} PO ${l.po} Available from: "${af.v}" / "${af.title}", not "${w2.main}" with ${JSON.stringify(w2.words)}`);
           const rd = cell('Ready date (CRD)');
-          if (!rd.v.startsWith(l.readyDate == null ? 'none' : C.fmtDay(l.readyDate)) || /dates disagree/.test(rd.v) !== l.flags.includes('dates-disagree')) panelBad.push(`${st.style} PO ${l.po} ready date: "${rd.v}"`);
+          if (l.source === 'erp' ? rd.v !== '' : !rd.v.startsWith(l.readyDate == null ? 'none' : C.fmtDay(l.readyDate)) || /dates disagree/.test(rd.v) !== l.flags.includes('dates-disagree')) panelBad.push(`${st.style} PO ${l.po} ready date: "${rd.v}"`);
           if (l.readySources.length > 1 && !l.readySources.every(x => rd.u.includes(md(x.day, today)))) panelBad.push(`${st.style} PO ${l.po} ready date sources: "${rd.u}"`);
           if (cell('ETD').v !== (l.etd == null ? '' : C.fmtDay(l.etd)) || cell('ETA').v !== (l.eta == null ? '' : C.fmtDay(l.eta))) panelBad.push(`${st.style} PO ${l.po} ETD "${cell('ETD').v}", ETA "${cell('ETA').v}"`);
         });
@@ -2056,6 +2091,39 @@ const SCENARIOS = [
       c(`SL-106: ready date ${C.fmtDay(today + 40)} "dates disagree", Factory CRD used, CRD Expected ${md(today + 60, today)} beside it`,
         rd6.v === `${C.fmtDay(today + 40)} dates disagree` && rd6.u.includes(`Factory CRD ${md(today + 40, today)} (used)`) && rd6.u.includes(`CRD Expected ${md(today + 60, today)}`), JSON.stringify(rd6));
       await t.click('#btnPanelClose'); await sleep(60);
+      // SL-105: the ATS report's two In Trans shipments, and our lot on the water matched to them, in plain words.
+      await t.eval(`[...document.querySelectorAll('#sellTable tbody tr.r button.sb')].find(x => x.textContent.trim() === 'SL-105').click()`); await sleep(150);
+      p = await sl(t);
+      const by = h => p.lots.map(r => (r[h] || {}).v), byU = h => p.lots.map(r => (r[h] || {}).u);
+      c("SL-105: the ATS report's 2 shipments (1,000 and 1,400, by ETA) and our 2,400 on the water, on its In Trans (counted there, not again); the words under the lots say so",
+        by('Status').join('|') === 'In transit (ERP)|On the water|In transit (ERP)' && by('PO').join('|') === 'ATS report|900506|ATS report' && by('Units').join('|') === '1,000|2,400|1,400' &&
+        by('Counted on the ATS report').join('|') === '|2,400|' && byU('Counted on the ATS report')[1] === 'In Trans' && byU('Available')[1] === 'on the ATS report' &&
+        p.panelSub.includes('2 shipments In Trans on the ATS report (2,400 units)') && p.panelSub.includes('2,400 of ours on the water or at port are those same goods (counted once)') &&
+        /Arriving: In Trans on the ATS report[^:]*: 2,400 units in 2 shipments, each by its ETA\. Our 2,400 on the water or at port are on it \(counted there, not again\)\./.test(p.panelStock),
+        `${JSON.stringify([by('Status'), by('PO'), by('Units'), by('Counted on the ATS report'), byU('Counted on the ATS report'), byU('Available')])} · ${p.panelSub} · ${p.panelStock}`);
+      // The ATS report's shipments: whole cases plus loose units (as the tiles count), no ready date or ETD (blank, not
+      // "none"), the warehouse named; our lot it counts in full has no date to sell from.
+      c('SL-105: the shipments in whole cases + loose units ("41 cases + 16 loose units" for 1,000 at 24), ready date and ETD blank, "warehouse LA"; our matched lot "In Trans (ATS report)" with no date',
+        byU('Units').join('|') === '41 cases + 16 loose units|100 cases|58 cases + 8 loose units' && by('Ready date (CRD)')[0] === '' && by('ETD')[0] === '' &&
+        byU('PO')[0] === 'warehouse LA' && by('Available from')[1] === 'In Trans (ATS report)', JSON.stringify([byU('Units'), by('Ready date (CRD)'), by('ETD'), byU('PO'), by('Available from')]));
+      t.shots.push(await t.shot('sell-ok-panel-erp'));
+      await key(t, 'Escape'); await sleep(60);
+      await t.eval(`[...document.querySelectorAll('#sellTable tbody tr.r button.sb')].find(x => x.textContent.trim() === 'SL-101').click()`); await sleep(150);
+      p = await sl(t);
+      c("SL-101: its Booked lot's 600 the ATS report counts In Trans (\"600 In Trans, still booked or loaded here\"), 600 still available from China; the report's 600 arriving",
+        p.lots.length === 2 && (p.lots.find(r => r['PO'].v === '900501') || {})['Counted on the ATS report'].v === '600' && (p.lots.find(r => r['PO'].v === '900501') || {})['Counted on the ATS report'].u === '600 In Trans, still booked or loaded here' &&
+        (p.lots.find(r => r['PO'].v === '900501') || {})['Available'].v === '600' && p.panelSub.includes("600 of ours booked or loaded are In Trans on the ATS report (taken off China)") &&
+        /600 more on it are goods our sheets still show booked or loaded on a vessel in China: taken off those lots/.test(p.panelStock),
+        `${JSON.stringify(p.lots.map(r => [r['PO'].v, r['Counted on the ATS report'], r['Available'].v]))} · ${p.panelSub} · ${p.panelStock}`);
+      await key(t, 'Escape'); await sleep(60);
+      // The Arriving tile: every shipment and our lots on the water, with how they met the report.
+      await t.click('#sellTiles button.tile[data-t="arriving"]'); await sleep(150);
+      p = await sl(t);
+      const arrL = S.lots.filter(l => !l.inChina);
+      c(`the Arriving tile lists the ATS report's shipments and our sailed lots (${arrL.length}), adding up to the tile, and says how they met`, p.panel && p.panelTr === arrL.length &&
+        p.panelSub.includes(`${fmtN(S.totals.arriving)} arriving`) && p.panelStock.startsWith(`Arriving: ${fmtN(S.totals.erpInTrans)} In Trans on the ATS report`) && p.panelStock.includes('our 2,400 on the water or at port are on it'),
+        `${p.panelTr} · ${p.panelSub} · ${p.panelStock}`);
+      await key(t, 'Escape'); await sleep(60);
 
       // The tiles' panels, and Sold (ships from China), which isn't lots: its number opens the stage lines behind it.
       await t.click('#sellTiles button.tile[data-t="fromChina"]'); await sleep(150);
@@ -2117,7 +2185,7 @@ const SCENARIOS = [
           when: ix('Pull-from date') < 0 ? null : plain(tr.children[ix('Pull-from date')]), avail: ix('Available after orders') < 0 ? null : plain(tr.children[ix('Available after orders')]) })) }; })()`);
       const pr = (k, po) => pull.rows.find(r => r.style === k && r.po === String(po)) || {};
       c('Pull from China: the Pull-from date and Available after orders columns', pull.hs.includes('Pull-from date') && pull.hs.includes('Available after orders'), pull.hs.join('|'));
-      const pullWant = [['SL-101', 900501, whenSays(L.etd, today).main, '1,200'], ['SL-102', 900502, whenSays(L.crd, today).main, 'all taken'], ['SL-102', 900503, whenSays(L.crd2, today).main, '180'],
+      const pullWant = [['SL-101', 900501, whenSays(L.etd, today).main, '600'], ['SL-102', 900502, whenSays(L.crd, today).main, 'all taken'], ['SL-102', 900503, whenSays(L.crd2, today).main, '180'],
         ['SL-103', 900504, whenSays(L.order, today).main, '600'], ['SL-104', 900505, 'now', 'all taken'], ['SL-109', 900509, 'now', '500'], ['SL-107', 900508, 'Sold', 'Sold']];
       const pullBad = pullWant.filter(([k, po, wh, av]) => pr(k, po).when !== wh || pr(k, po).avail !== av).map(([k, po, wh, av]) => `${k} PO ${po}: "${pr(k, po).when}" / "${pr(k, po).avail}", not "${wh}" / "${av}"`);
       c('…each open line: its pull-from date ("now" once passed, "about" for an estimate) and what is left after orders ("all taken"); the China Pickup line "Sold"', !pullBad.length, pullBad.join(' | '));
@@ -2161,6 +2229,9 @@ const SCENARIOS = [
         JSON.stringify(p.tiles.map(x => [x.k, x.n, x.cs])));
       c(`From China and Arriving: the lots in full (${fmtN(S.totals.fromChina)}, ${fmtN(S.totals.arriving)}), marked "customer orders not taken off"`,
         ['fromChina', 'arriving'].every(k => unitsIs(sellTile(p, k).n, S.totals[k]) && sellTile(p, k).cs.includes('customer orders not taken off')), sellTilesSay(p, S));
+      const ah = p.heads.find(h => h.t === 'Arriving') || {};
+      c('without the report, Arriving says it comes from our shipping data (column and tile)', ah.sub === 'our shipping data' &&
+        sellTile(p, 'arriving').cs.includes('from our shipping data (on the water, at port)') && S.styles.every(s => s.arrivingFrom === 'ours'), `${ah.sub} · ${sellTile(p, 'arriving').cs.join(' | ')}`);
       const diff = sellRowsDiffer(p, S, today, 'no report yet');
       c('every row: "no report yet" across the stock columns and in Total; from China and arriving in full', p.tr === S.styles.length && !diff.length, `${p.tr} rows · ${diff.join(' | ')}`);
       await t.eval(`[...document.querySelectorAll('#sellTable tbody tr.r button.sb')].find(x => x.textContent.trim() === 'SL-102').click()`); await sleep(150);
@@ -2208,7 +2279,7 @@ const SCENARIOS = [
       const { R, A, S } = sellFor(w.fx, today, { ...BIG_FILES, ats: w.o.ats });
       c('the engines (run here): over 2,400 styles, customer orders taken off lots, some oversold, three on the report only', R.ok && A.ok && !!S && S.ok && S.styles.length > 2400 && S.totals.ordersTaken > 0 &&
         S.totals.oversold > 0 && S.counts.erpOnlyStyles === 3, JSON.stringify({ styles: S && S.styles.length, taken: S && S.totals.ordersTaken, oversold: S && S.totals.oversold, erp: S && S.counts.erpOnlyStyles }));
-      const rules = ruleMismatches(S, today), sums = sellSums(S, R);
+      const rules = ruleMismatches(S, today), sums = sellSums(S, R, A);
       c("Saul's pull-from rule and the ready date hold on every lot (worked out here on their own)", !rules.length, rules.slice(0, 5).join(' | '));
       c('the selling sums hold', !sums.length, sums.slice(0, 5).join(' | '));
       let p = await sl(t);
@@ -2255,7 +2326,7 @@ const SCENARIOS = [
       const { R, A, S } = sellFor(w.fx, today, f);
       c('the engines (run here) on the real files: balance 0, the ATS report adds up', R.ok && R.balance.diff === 0 && R.balance.ct.diff === 0 && !!A && A.ok && !!S && S.ok && !S.atsMissing,
         JSON.stringify({ R: R.ok && R.balance.diff, A: A && (A.ok || A.error), S: S && S.ok }));
-      const rules = ruleMismatches(S, today), sums = sellSums(S, R);
+      const rules = ruleMismatches(S, today), sums = sellSums(S, R, A);
       c("Saul's pull-from rule and the ready date hold on every real lot (worked out here on their own)", !rules.length, `${rules.length} lots, e.g. ${rules.slice(0, 3).join(' | ')}`);
       c('the selling sums hold on the real files', !sums.length, sums.slice(0, 5).join(' | '));
       let p = await sl(t);
@@ -2283,7 +2354,8 @@ const SCENARIOS = [
       console.log('REAL Available to sell (units / cases / units with no case pack):');
       for (const k of ['now', 'fromChina', 'arriving', 'total', 'soldChina']) console.log(`  ${k}: ${fmtN(T[k])} / ${fmtN(K[k])} / ${fmtN(N[k])}`);
       console.log(`  oversold ${fmtN(T.oversold)} units on ${fmtN(nOv)} styles · customer orders taken off lots ${fmtN(T.ordersTaken)}`);
-      console.log(`REAL lots ${fmtN(cnt.lots)} (in China ${fmtN(cnt.lotsInChina)}, sailed ${fmtN(cnt.lotsSailed)}) · pull rule ${Object.entries(cnt.byRule).map(([k, v]) => `${k} ${fmtN(v)} (${fmtN(cnt.byRuleUnits[k])} units)`).join(', ')} · "now" ${fmtN(cnt.pullNow)} · sailed ${Object.entries(cnt.sailedByRule).map(([k, v]) => `${k} ${fmtN(v)}`).join(', ')}`);
+      console.log(`  arriving: the ATS report's In Trans ${fmtN(T.arrivingErp)} + ours ${fmtN(T.arrivingOurs)} · In Trans ${fmtN(T.erpInTrans)} = matched ${fmtN(T.matchedOurs)} + in its transit ${fmtN(T.inErpTransitTaken)} + landed, not received ${fmtN(T.landedNotReceived)} + not sailed on ours ${fmtN(T.erpUnmatched)} · maybe twice ${fmtN(T.maybeTwice)} · taken though in backlog ${fmtN(T.takenInBacklog)} · received (dropped) ${fmtN(T.receivedDropped)} · kept as ours ${fmtN(T.keptExtra)}`);
+      console.log(`REAL lots ${fmtN(cnt.lots)} (in China ${fmtN(cnt.lotsInChina)}, sailed ${fmtN(cnt.lotsSailed)}, the ATS report's In Trans ${fmtN(cnt.erpLots)}) · pull rule ${Object.entries(cnt.byRule).map(([k, v]) => `${k} ${fmtN(v)} (${fmtN(cnt.byRuleUnits[k])} units)`).join(', ')} · "now" ${fmtN(cnt.pullNow)} · sailed ${Object.entries(cnt.sailedByRule).map(([k, v]) => `${k} ${fmtN(v)}`).join(', ')}`);
       console.log(`REAL dates disagree: ${fmtN(cnt.datesDisagreeLots)} lots on ${fmtN(cnt.datesDisagreePairs)} PO + style · styles ${fmtN(S.styles.length)}, with stock now ${fmtN(cnt.stylesWithStock)}, not on the report ${fmtN(cnt.stylesNotOnReport)}, report only ${fmtN(cnt.erpOnlyStyles)}`);
       console.log('REAL Available to sell issue codes: ' + Object.entries(codes).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(', '));
       console.log(`REAL page: ${p.tr} rows drawn; only available ${ms.map(x => x.toFixed(0)).join('/')} ms, scroll ${sm.toFixed(0)} ms, From China panel ${tm.toFixed(0)} ms`);

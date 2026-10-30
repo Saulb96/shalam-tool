@@ -149,6 +149,7 @@ button.tile.go .n{color:var(--accentink)}
 button.tile.go:hover{background:rgba(255,255,255,.7)}
 .tile.flat.bad .n{color:var(--red)}
 .tile .cs.wn{color:var(--amb);min-height:0}
+.tile .cs.src{min-height:0;font-size:10.5px}
 .fbar{margin:4px 0 8px}
 .fbar input[type=search]{width:280px;max-width:100%}
 .vpane{height:calc(100vh - 330px);min-height:360px}
@@ -160,6 +161,7 @@ button.tile.go:hover{background:rgba(255,255,255,.7)}
 .grid.vt th[data-s]{cursor:pointer;user-select:none}
 .grid.vt th[data-s]:hover{color:var(--ink)}
 .grid th .ar{font-size:9px;margin-left:3px}
+.grid th .u.hs{display:block;font-weight:600;font-size:10px;line-height:1.2}
 .grid tr.spc td{padding:0;border:0;background:transparent}
 .grid.vt td.empty{white-space:normal;text-align:left;padding:22px 28px}
 .grid td.desc{max-width:300px;overflow:hidden;text-overflow:ellipsis}
