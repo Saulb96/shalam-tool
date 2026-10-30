@@ -6,6 +6,8 @@
 // straight to the customer (Pull from China), planning sections aren't booked yet (the Master Sheet stage stands, their
 // units are 'planning'), ignore sections are 'ignored'. Lines on POs below the PO Status Tracker's lowest PO are
 // 'belowTracker'. Those three are Container Tracking-only outcomes, outside every total.
+// Each allocation carries `dates`: every source's date for it (Container Tracking's Ready Date, the PO Book's own date,
+// Factory CRD, CRD Expected, Ship by, order date), for core/sell.js to sync the ready date and list disagreements.
 // Pure: no network, no DOM; today (a day number) is passed in. Loads in the page (window.InvStages, after
 // core/common.js) and in Node (module.exports).
 (function (root, factory) {
@@ -442,6 +444,56 @@
       return x.tr && (x.tr.crd ?? x.tr.exp) != null && (x.tr.crd ?? x.tr.exp) === l.crd ? F.trk : F.msl;
     };
     const factoryFrom = x => (x.tr === undefined ? (x.l.tracked ? F.trk : F.msl) : x.tr && x.tr.sup ? F.trk : F.msl);
+
+    // ---------- every source's dates for an allocation (core/sell.js picks the ready date and lists disagreements)
+    // Ship by sits on a Master Sheet Live PO block's first row, as the PO Book reads it; each line takes its block's.
+    const MSL_BLOCK = { po: { names: ['Po Number', 'PO Number'] }, shipBy: { names: ['Ship by'] }, name: { names: ['Product name'] } };
+    let shipByRows = null;
+    function shipByOf(row) {
+      if (!shipByRows) {
+        shipByRows = new Map();
+        const bc = mrows && mrows.length ? C.findColumns(mrows[0] || [], MSL_BLOCK).cols : {};
+        if (bc.po != null && bc.shipBy != null) {
+          let cur;   // undefined: no PO block yet (or a Round row ended it)
+          for (let i = 1; i < mrows.length; i++) {
+            const r = mrows[i];
+            if (!r) continue;
+            if (bc.name != null && /^\s*Round/i.test(S(r[bc.name]))) { cur = undefined; continue; }
+            if (S(r[bc.po])) cur = C.dayOf(r[bc.shipBy]);
+            if (cur !== undefined) shipByRows.set(i + 1, cur);
+          }
+        }
+      }
+      return shipByRows.get(row) ?? null;
+    }
+    // Container Tracking's Ready Date (on a Booking/Loaded block's PO row): the latest of the blocks given, with its row.
+    function ctReadyOf(cs) {
+      let best = null;
+      for (const c of cs) if (c && c.b && isDay(c.b.readyDate) && (!best || c.b.readyDate > best.day)) best = { day: c.b.readyDate, sheet: c.b.sheet, row: c.b.row };
+      return best;
+    }
+    const noDates = () => ({ ctReady: null, ctRow: null, poBook: null, factoryCrd: null, crdExpected: null, shipBy: null, orderDate: null, original: null });
+    // A Master Sheet line's dates. A date the PO Book set itself (a split, or a backorder's CRD override) is `poBook`; a
+    // backorder PO typed on Master Sheet Live takes its own Ship by (the PO Book's rule). In both cases the tracker's
+    // Factory CRD and CRD Expected (and, for a PO Book date, Ship by) belong to the original PO: kept under `original`,
+    // never used as this line's ready date.
+    function lineDates(x, cs) {
+      const l = x.l, tr = x.tr || null, ct = ctReadyOf(cs);
+      const own = { factoryCrd: tr && isDay(tr.crd) ? tr.crd : null, crdExpected: tr && isDay(tr.exp) ? tr.exp : null, shipBy: shipByOf(l.row) };
+      const d = Object.assign(noDates(), { ctReady: ct ? ct.day : null, ctRow: ct ? { sheet: ct.sheet, row: ct.row } : null,
+        orderDate: isDay(l.od) ? l.od : null });
+      const keep = o => (Object.values(o).some(v => v != null) ? o : null);
+      if (l.crd != null && crdFrom(x) === F.pob) { d.poBook = l.crd; d.original = keep(own); }
+      else if (/-\d+$/.test(x.origRaw)) { d.shipBy = own.shipBy; d.original = keep({ factoryCrd: own.factoryCrd, crdExpected: own.crdExpected }); }
+      else Object.assign(d, own);
+      return d;
+    }
+    // Container Tracking units with no Master Sheet line: the block's own Ready Date and Order Date only.
+    function ctDates(c) {
+      const ct = ctReadyOf([c]);
+      return Object.assign(noDates(), { ctReady: ct ? ct.day : null, ctRow: ct ? { sheet: ct.sheet, row: ct.row } : null,
+        orderDate: isDay(c.b.orderDate) ? c.b.orderDate : null });
+    }
     function addAlloc(a) {
       const base = [a.bucket, a.po, a.style, a.sheetRow ?? '', a.ctRows.length ? a.ctRows[0].sheet + a.ctRows[0].row : ''].join('|');
       const n = (ids.get(base) || 0) + 1;
@@ -471,7 +523,7 @@
         containers: c ? c.bi.containers : [], etd: c ? c.bi.etd : null, eta: c ? c.bi.eta : null, stage: stageName,
         ctStage: c ? STAGE[c.stage] : '', section: c ? c.section : '', sheetRow: l.row, lineKey: l.key, status: x.status,
         ctRows: c ? [{ sheet: c.b.sheet, row: c.ln.row }, ...c.bi.ctRows] : [], flags: uniq([...(flags || []), ...(c ? c.bi.flags : [])]),
-        from, group: g.key,
+        from, group: g.key, dates: lineDates(x, c ? [c] : []),
       });
     }
     // An allocation of Container Tracking units no Master Sheet line takes (more than the sheet, or unmatched).
@@ -487,7 +539,7 @@
         from: { units: F.ct, po: F.ct, factory: F.ct, stage: c.bi.stageFrom, round: F.ct, containers: F.ct,
           etd: c.bi.etdFrom, eta: c.bi.etaFrom, upc: c.ln.upc ? F.ct : '',
           cases: goodMaster(c.ln.master) ? F.ct : master ? F.msl : '' },
-        group: g ? g.key : '',
+        group: g ? g.key : '', dates: ctDates(c),
       });
     }
     // Lines (in order) take units from chunks (in order) until either runs out.
@@ -552,6 +604,11 @@
         const st = x.l.crd == null ? 'noCrd' : x.l.crd >= today ? 'inProd' : 'ready';
         const a = lineAlloc(g, x, null, n, bucketOf(st), STAGE[st], plan, x.l.crd == null ? F.msl : crdFrom(x) || F.msl);
         if (planSec) a.section = planSec;
+        // Container Tracking has this PO and style only in a planning section: its Ready Date there is this line's.
+        if (g.planning.length) {
+          const ct = ctReadyOf(g.planning);
+          if (ct) Object.assign(a.dates, { ctReady: ct.day, ctRow: { sheet: ct.sheet, row: ct.row } });
+        }
       }
     }
     // Container Tracking units with no Master Sheet line: Unmatched, at their stage (Landed ones are outside everything).

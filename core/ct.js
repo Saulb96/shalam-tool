@@ -169,6 +169,12 @@
           for (const f of ['orderDate', 'shipBy', 'readyDate']) {
             if (cols[f] == null) { dates[f] = null; continue; }
             const d = readDate(at(r, f), todayYear);
+            // A Ready Date typed without a year (Booking and Loaded are goods still to ship) takes the year that puts it
+            // nearest today: "1/20" typed in November is next January's, "12/20" typed in January is last December's.
+            if (f === 'readyDate' && d.yearless && d.day != null) {
+              if (d.day < today - 182) d.day = addYears(d.day, 1);
+              else if (d.day > today + 182) d.day = addYears(d.day, -1);
+            }
             dates[f] = d.day;
             if (d.bad) issue('not-a-date', sheet, row, `${sheet} row ${row}, PO ${po}: ${LABELS[f]} "${d.text.slice(0, 30)}" is not a date.`, { po });
             else if (d.yearless) issue('yearless-date', sheet, row, `${sheet} row ${row}, PO ${po}: ${LABELS[f]} "${d.text}" has no year; read as ${C.fmtDay(d.day)}.`, { po });

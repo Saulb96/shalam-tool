@@ -34,16 +34,17 @@
   <section id="app" hidden aria-busy="false">
     <div class="glass gridcard">
       <div class="tabs" id="tabs" role="tablist">
-        <button class="tab on" type="button" role="tab" data-tab="inv">Inventory</button>
+        <button class="tab on" type="button" role="tab" data-tab="sell">Available to sell</button>
+        <button class="tab" type="button" role="tab" data-tab="inv">Where it is</button>
         <button class="tab" type="button" role="tab" data-tab="pull">Pull from China<span class="c" id="cPull" hidden></span></button>
         <button class="tab iss" type="button" role="tab" data-tab="problems">Problems<span class="c" id="cProb">0</span></button>
       </div>
 
-      <div class="tabpane" id="tab-inv">
-        <div class="card lead" id="invState">
-          <div class="lbl">Incoming</div>
-          <h2 id="invStateH">Loading the sources…</h2>
-          <div class="note" id="invStateP"></div>
+      <div class="tabpane" id="tab-sell">
+        <div class="card lead" id="sellState">
+          <div class="lbl">Available to sell</div>
+          <h2 id="sellStateH">Loading the sources…</h2>
+          <div class="note" id="sellStateP"></div>
           <div class="inload" id="invLoad" hidden>
             <svg width="120" height="70" viewBox="0 0 150 86" aria-hidden="true">
               <g class="ship">
@@ -58,6 +59,17 @@
             <button type="button" id="btnCancelLoad">Cancel</button>
           </div>
         </div>
+        <div id="sellNote"></div>
+        <div class="tiles" id="sellTiles"></div>
+        <div class="pane vpane" id="sellPane"><table class="grid vt two" id="sellTable"><thead></thead><tbody></tbody></table></div>
+      </div>
+
+      <div class="tabpane" id="tab-inv" hidden>
+        <div class="card lead" id="invState">
+          <div class="lbl">Where it is</div>
+          <h2 id="invStateH">Loading the sources…</h2>
+          <div class="note" id="invStateP"></div>
+        </div>
         <div class="tiles" id="tiles"></div>
         <div class="toolbar fbar" id="fbar">
           <input type="search" id="fq" placeholder="Search style, UPC, description, PO…" autocomplete="off" spellcheck="false" aria-label="Search style, UPC, description or PO">
@@ -65,6 +77,7 @@
           <select id="fCat" aria-label="Category"></select>
           <select id="fStage" aria-label="Stage"></select>
           <select id="fType" aria-label="PO type"></select>
+          <label class="chk" id="fAvailWrap" hidden><input type="checkbox" id="fAvail"> Only styles with something available</label>
           <button type="button" class="ghost" id="btnClearF" hidden>Clear filters</button>
           <span class="sp"></span>
           <span class="selinfo" id="fInfo"></span>
@@ -102,10 +115,11 @@
 </div>
 <aside class="glass panel" id="panel" hidden aria-labelledby="panelTitle">
   <div class="ph">
-    <div class="pt"><div class="lbl">Behind this number</div><h3 id="panelTitle"></h3><div class="note" id="panelSub"></div></div>
+    <div class="pt"><div class="lbl" id="panelLbl">Behind this number</div><h3 id="panelTitle"></h3><div class="note" id="panelSub"></div></div>
     <button type="button" class="ghost px" id="btnPanelX" title="Close (Esc)" aria-label="Close">✕</button>
   </div>
   <div class="pane" id="panelPane"><table class="grid vt two" id="panelTable"><thead></thead><tbody></tbody></table></div>
+  <div class="pstock" id="panelStock" hidden></div>
   <div class="pf"><span class="note" id="panelNote"></span><span class="sp"></span><button type="button" id="btnPanelClose">Close</button></div>
 </aside>
 <div id="toast" class="glass" role="status" aria-live="polite"></div>
@@ -118,6 +132,8 @@
 <script src="core/ct.js"></script>
 <script src="core/shipping.js"></script>
 <script src="core/stages.js"></script>
+<script src="core/ats.js"></script>
+<script src="core/sell.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

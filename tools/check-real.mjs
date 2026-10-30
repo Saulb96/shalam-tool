@@ -1,7 +1,7 @@
-// Runs the page's parsers and the stage engine on local copies of the real source files and prints only their
-// structure and numbers: each header row, the counts, issue codes with up to 3 row numbers, the Incoming totals and
-// balance, and whether core/pobook.js still matches the PO Book. Nothing else from the files is printed (no cell
-// values, no issue messages); the ERP cross-check names style codes next to numbers, nothing more.
+// Runs the page's parsers, the stage engine and the selling engine on local copies of the real source files and prints
+// only their structure and numbers: each header row, the counts, issue codes with up to 3 row numbers, the Incoming
+// totals and balance, Available to sell, and whether core/pobook.js still matches the PO Book. Nothing else from the
+// files is printed (no cell values, no issue messages); style codes and PO numbers appear next to numbers, nothing more.
 //   node tools/check-real.mjs <folder> [po-book index.html] [--lists <lists.json>] [--ats <ERP report.xlsx>]
 //                             [--today yyyy-mm-dd] [--no-reports | --no-forwarder | --no-drayage]
 // <folder> holds Master Sheet Live.xlsx, PO Status Tracker.xlsx, Container Tracking Sheet.xlsx, Forwarder.xlsx and
@@ -9,17 +9,22 @@
 // --lists: the SharePoint lists the page reads, saved as JSON { UPC_MASTER: [items], PO_Book_Lines: [items] } (Graph
 // list items with their fields); defaults to <folder>/lists.json when it's there. Without it the PO Book's marks and
 // UPC_MASTER are left out, so open/shipped and descriptions can differ from the page.
-// --ats: the ERP's "Inventory Report - On Hand_In Transit_In Production" (sheet "Report"), compared per style with
-// Incoming: In Trans Qty vs On the water + At port, Import PO Backlog Qty vs In China (LA POs only).
+// --ats: the ERP's "Inventory Report - On Hand_In Transit_In Production" (sheet "Report"), read with core/ats.js as the
+// page reads it (its date from the file name, else the day the file was saved, as on the page), then Available to sell
+// (core/sell.js) with it; and compared per style with Incoming: In Trans Qty vs On the water + At port, Import PO
+// Backlog Qty vs In China (LA POs only). Available to sell is also worked out without the report (as when it's missing),
+// with or without --ats. Its sums, Saul's pull-from date rule and the ready dates are checked lot by lot here, on their
+// own, not with the engine's code.
 // --no-reports: the stages without the forwarder and drayage reports, as the page shows them when both are missing;
 // --no-forwarder / --no-drayage: without that one report only (as when it is too old, or fails to read).
 // The Container Tracking section lists come from config.js (run with a stand-in window), as the page passes them;
 // --no-sections leaves them out (sections with no round all Booked/Loaded; POs below the tracker's lowest still apart).
-// Exit code 1 when a file is missing or fails to parse, counts don't add up, the balance is off, or the PO Book's
-// rules changed. Differences from the ERP are printed, never a failure.
-import { readFileSync, existsSync } from 'node:fs';
+// Exit code 1 when a file is missing or fails to parse (the ATS report too), counts don't add up, the balance is off,
+// Available to sell doesn't add up or breaks a rule, or the PO Book's rules changed. Differences from the ERP are
+// printed, never a failure.
+import { readFileSync, existsSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { join, resolve } from 'node:path';
+import { join, resolve, basename } from 'node:path';
 import { loadXLSX, core, root } from '../tests/load.mjs';
 
 const XOPT = { type: 'array', cellFormula: false, cellHTML: false, cellStyles: false };   // as app.js reads files
@@ -49,6 +54,7 @@ const folder = resolve(folderArg);
 
 const XLSX = loadXLSX();
 const C = core('common'), PB = core('pobook'), CT = core('ct'), SH = core('shipping'), UPC = core('upc'), ST = core('stages');
+const ATS = core('ats'), SELL = core('sell');
 const today = opt.today ? C.dayFromIso(opt.today) : C.todayNY(Date.now());
 if (today == null) { console.log(`--today ${opt.today} isn't a yyyy-mm-dd date.`); process.exit(2); }
 const listsPath = opt.lists ? resolve(opt.lists) : existsSync(join(folder, 'lists.json')) ? join(folder, 'lists.json') : null;
@@ -399,6 +405,173 @@ if (R) {
   console.log('');
   issueLines(R.issues, i => [i.sheet, i.row == null || i.row === '' ? '' : `row ${i.row}`].filter(Boolean).join(' '));
   if (R.issues.some(i => i.code === 'balance')) fails('the engine raised a balance issue');
+}
+
+// ---------------- the ATS report, read as the page reads it (core/ats.js)
+let atsR = null, atsDayUsed = null;   // the report, and its day (file name, else saved) as the page takes it
+if (atsPath) {
+  head(`ATS report (core/ats.js, ${basename(atsPath)})`);
+  if (!existsSync(atsPath)) fails(`${atsPath} isn't there`);
+  else {
+    try {
+      const t0 = performance.now();
+      const buf = readFileSync(atsPath);
+      const wb = readBook(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
+      const r = ATS.parseAts(XLSX, wb, basename(atsPath), today);
+      console.log(`  sheet "${r.sheet || '(none)'}" of ${wb.SheetNames.length}; read in ${secs(t0)}`);
+      if (r.headerRow) console.log(`  header row ${r.headerRow}: ${headerLine(C.sheetRows(XLSX, wb.Sheets[r.sheet])[r.headerRow - 1])}`);
+      // Its date: from the file name, else the day the file was saved, as on the page (amber after 8 days, an email after 10).
+      const saved = C.todayNY(statSync(atsPath).mtimeMs), day = r.reportDay ?? saved, age = today - day;
+      atsDayUsed = day;
+      console.log(`  report date ${C.fmtDay(day)} (${r.reportDay != null ? 'from the file name' : 'the day the file was saved: no date in the file name'}) · ${n(age)} day${age === 1 ? '' : 's'} old` +
+        (age > 10 ? ': the page would email Saul (over 10 days)' : age > 8 ? ': amber on the page (over 8 days)' : ''));
+      const x = r.counts || {};
+      if (r.headerRow) {
+        sumLine('rows read', x.rowsRead, [['blank', x.blankRows], ['Grand Total', x.grandTotalRows], ['no style', x.noStyleRows], ['style', x.styleRows]]);
+        const known = [...r.styles.values()].filter(s => typeof s.inWh === 'number' && typeof s.orders === 'number');
+        console.log(`  styles ${n(x.styles)} (${n(x.multiWarehouseStyles)} on more than one row, summed; ${n(x.unknownStyles)} whose stock can't be read) · In WH ${n(x.inWh)} · Total Customer Orders ${n(x.orders)}`);
+        console.log(`  In WH − Total Customer Orders per style: above 0 on ${n(known.filter(s => s.inWh > s.orders).length)} styles, below 0 on ${n(known.filter(s => s.inWh < s.orders).length)} (sold ahead of stock)`);
+        const g = r.grandTotal;
+        if (g) {
+          const gt = typeof g.inWh === 'number' && !Number.isNaN(g.inWh) ? g.inWh : null;
+          console.log(`  Grand Total (row ${g.row}): In WH ${gt == null ? 'blank or not a number' : n(gt)} · the rows add up to it: ${gt === x.inWh ? 'yes' : 'NO'}`);
+        } else console.log('  no Grand Total row: nothing to check the rows against');
+      }
+      issueLines(r.issues, i => [i.style, i.row == null || i.row === '' ? '' : `row ${i.row}`].filter(Boolean).join(' '));
+      if (!r.ok) fails(r.error || "the ATS report couldn't be read");
+      else { console.log('  result: ok'); atsR = r; }
+    } catch (e) { fails(`can't read it: ${e.message}`); }
+  }
+}
+
+// ---------------- Available to sell (core/sell.js): with the report and without it
+head('Available to sell (core/sell.js)');
+console.log("  Saul's pull-from date for goods still in China: 10 days before the ETD; no ETD, 5 days before the ready date (CRD);");
+console.log('  no CRD, about 75 days after the order date (an estimate). Goods on the water or at port: their ETA.');
+if (!R) fails('not worked out: the stage numbers did not load');
+else {
+  const runs = [];
+  if (atsPath) runs.push(atsR ? ['with the ATS report', atsR] : null);
+  runs.push(['without the ATS report (as the page shows it when the report is missing or red)', null]);
+  for (const run of runs) {
+    if (!run) { console.log("\n  with the ATS report: not worked out, the report didn't load (above)"); continue; }
+    let S = null;
+    try {
+      const t0 = performance.now();
+      // As the page: the report's day from its file name, else the day it was saved.
+      S = SELL.buildSell({ stages: R, ats: run[1], today, upc: used.upc, reportDay: run[1] ? atsDayUsed : null });
+      console.log(`\n  ${run[0]}: built in ${secs(t0)}${S.ok && !S.atsMissing ? ` · report date ${S.reportDay != null ? C.fmtDay(S.reportDay) : 'not known'}${run[1] && run[1].reportDay == null ? ' (the day it was saved: no date in the file name)' : ''}` : ''}`);
+    } catch (e) { fails(`the selling engine stopped: ${e.message}`); continue; }
+    if (!S || !S.ok) { fails(`the selling engine gave no numbers (${(S && (S.notLoaded || []).join(', ')) || 'no answer'})`); continue; }
+    sellReport(S, R, !run[1]);
+  }
+}
+
+// The selling engine's numbers, and their checks: every sum, Saul's rule and the ready date, lot by lot, worked out here
+// on their own. Style codes and PO numbers next to numbers only.
+function sellReport(S, R, noReport) {
+  const T = S.totals, K = T.cases || {}, NP = T.noCasePackUnits || {}, LO = T.looseUnits || {}, cnt = S.counts || {};
+  const ROWS = [['now', 'Available now'], ['fromChina', 'Available from China'], ['arriving', 'Arriving (water, port)'], ['total', 'Total available'],
+    ['soldChina', 'Sold, ships from China'], ['oversold', 'Oversold'], ['ordersTaken', 'Orders taken off lots']];
+  console.log(`    ${'Totals'.padEnd(24)} ${'units'.padStart(12)} ${'whole cases'.padStart(12)} ${'loose units'.padStart(12)} ${'units, no case pack'.padStart(20)}`);
+  for (const [k, w] of ROWS) {
+    const hasCases = !['oversold', 'ordersTaken'].includes(k), hasLoose = ['now', 'fromChina', 'arriving', 'total'].includes(k);
+    console.log(`    ${w.padEnd(24)} ${n(T[k]).padStart(12)} ${(hasCases ? n(K[k]) : '').padStart(12)} ${(hasLoose ? n(LO[k]) : '').padStart(12)} ${(hasCases ? n(NP[k]) : '').padStart(20)}`);
+  }
+  if (!noReport) {
+    console.log('    cross-checks with the ATS report (listed on Problems, never counted; Saul decides how these should count):');
+    console.log(`      sailed, ETA on or before the report date, not In Trans on it (probably received already, so maybe counted twice): ${n(cnt.erpReceivedStyles)} styles, ${n(cnt.erpReceivedUnits)} units (${n(cnt.erpReceivedAvailable)} still shown in Arriving)`);
+    console.log(`      orders beyond stock with ERP In Trans beyond our water / port / booked-with-ETD (landed, not received?): ${n(cnt.erpInTransStyles)} styles (${n(cnt.erpInTransOversold)} oversold), up to ${n(cnt.erpInTransUnits)} units of those orders`);
+    console.log(`      orders beyond stock no more than the units sold to ship from China (maybe the same orders): ${n(cnt.soldInOrdersStyles)} styles (${n(cnt.soldInOrdersOversold)} oversold), ${n(cnt.soldInOrdersUnits)} units`);
+  }
+  if (noReport) console.log('    (no report: the page shows Available now, Total available and Oversold as "no report yet"; From China and Arriving are before customer orders)');
+
+  // Lots: where they are, their rule, "now", ready dates.
+  const lots = S.lots, china = lots.filter(l => l.inChina), sailed = lots.filter(l => !l.inChina), sumU = (a, f = l => l.units) => a.reduce((p, l) => p + (f(l) || 0), 0);
+  console.log(`    lots ${n(lots.length)}: in China ${n(china.length)} (${n(sumU(china))} units), on the water or at port ${n(sailed.length)} (${n(sumU(sailed))} units)`);
+  const RULE = { etd: '10 days before the ETD', crd: '5 days before the CRD', order: 'about 75 days after the order date', none: 'no date' };
+  console.log('    lots in China by pull-from rule (lots / units):');
+  for (const k of ['etd', 'crd', 'order', 'none']) {
+    const ls = china.filter(l => l.pullRule === k);
+    console.log(`      ${k.padEnd(6)} ${RULE[k].padEnd(36)} ${n(ls.length).padStart(7)} / ${n(sumU(ls)).padStart(11)}`);
+  }
+  const nowL = china.filter(l => l.flags.includes('now')), byStatus = {};
+  for (const l of nowL) byStatus[l.status] = (byStatus[l.status] || 0) + 1;
+  console.log(`    pull-from date already passed ("now"): ${n(nowL.length)} lots, ${n(sumU(nowL))} units (${n(sumU(nowL, l => l.available))} left after orders) · ${Object.entries(byStatus).map(([k, v]) => `${k} ${n(v)}`).join(' · ') || 'none'}`);
+  const noEta = sailed.filter(l => l.availableDate == null);
+  console.log(`    sailed lots by arrival: ETA ${n(sailed.length - noEta.length)} · no ETA ${n(noEta.length)}`);
+  const RF = { ctReady: "Container Tracking's Ready Date", poBook: "the PO Book's own date", factoryCrd: 'Factory CRD', crdExpected: 'CRD Expected', shipBy: 'Ship by', crd: 'CRD', none: 'none' };
+  const rf = {};
+  for (const l of lots) rf[l.readyFrom || 'none'] = (rf[l.readyFrom || 'none'] || 0) + 1;
+  console.log(`    ready date taken from (lots): ${['ctReady', 'poBook', 'factoryCrd', 'crdExpected', 'shipBy', 'crd', 'none'].filter(k => rf[k]).map(k => `${RF[k]} ${n(rf[k])}`).join(' · ')}` +
+    ` · a source more than a year ahead or before 2015 skipped on ${n(cnt.readyFarSkipped)} lots`);
+  const dis = china.filter(l => l.flags.includes('dates-disagree')), pairs = new Set(dis.map(l => l.po + '|' + l.style));
+  const spreads = dis.map(l => l.readySpread).sort((a, b) => a - b), pct = q => spreads[Math.min(spreads.length - 1, Math.floor(spreads.length * q))];
+  const sailedDis = sailed.filter(l => l.readySources.length > 1 && Math.max(...l.readySources.map(x => x.day)) - Math.min(...l.readySources.map(x => x.day)) > 7).length;
+  console.log(`    ready dates more than 7 days apart (dates-disagree): ${n(dis.length)} lots in China on ${n(pairs.size)} PO + style pairs` +
+    (spreads.length ? ` · spread median ${n(pct(0.5))} days, 90th percentile ${n(pct(0.9))}, most ${n(spreads[spreads.length - 1])}` : '') + ` · sailed lots that disagree (not listed) ${n(sailedDis)}`);
+  for (const k of ['etd', 'crd', 'order']) {
+    const l = china.find(x => x.pullRule === k && !x.flags.includes('now')) || china.find(x => x.pullRule === k);
+    if (l) console.log(`    e.g. ${k}: ${l.style} PO ${l.po} ${l.status} ${n(l.units)} units → ${l.pullNow ? 'now (' : ''}${C.fmtDay(l.pullFrom)}${l.pullNow ? ')' : ''}: ${SELL.ruleWords(l)}`);
+  }
+
+  // Styles: a few sanity numbers.
+  const st = S.styles, flag = f => st.filter(s => s.flags.includes(f));
+  const nor = flag('not-on-report'), norLots = nor.filter(s => s.lots.length);
+  console.log(`    styles ${n(st.length)}: on the ATS report ${n(cnt.stylesOnReport)} · not on it ${n(nor.length)} (${n(norLots.length)} with lots, ${n(norLots.reduce((p, s) => p + sumU(s.lots), 0))} units shown in full${norLots.length ? ': ' + norLots.slice(0, 5).map(s => s.style).join(', ') + (norLots.length > 5 ? '…' : '') : ''})` +
+    ` · stock can't be read ${n(flag('stock-unknown').length)} · on the report only ${n(flag('erp-only').length)}`);
+  const ov = st.filter(s => s.oversold > 0).sort((a, b) => b.oversold - a.oversold);
+  console.log(`    with stock now ${n(st.filter(s => s.now > 0).length)} · with something to sell ${n(st.filter(s => s.total > 0).length)} · oversold ${n(ov.length)}${ov.length ? ` (most: ${ov.slice(0, 5).map(s => `${s.style} ${n(s.oversold)}`).join(' · ')})` : ''}`);
+  console.log(`    lots taken by customer orders ${n(lots.filter(l => l.taken > 0).length)} (all of it ${n(lots.filter(l => l.taken > 0 && !l.available).length)}) · orders not known on ${n(flag('orders-unknown').length)} styles`);
+
+  // The checks: sums, and Saul's rule worked out here, lot by lot.
+  const bad = [], isD = v => typeof v === 'number' && Number.isFinite(v), sumS = k => st.reduce((p, s) => p + (s[k] || 0), 0);
+  for (const k of ['now', 'fromChina', 'arriving', 'total', 'soldChina', 'oversold', 'ordersTaken']) if (sumS(k) !== T[k]) bad.push(`the styles add up to ${k} ${n(sumS(k))}, not ${n(T[k])}`);
+  if (T.total !== T.now + T.fromChina + T.arriving) bad.push('Total available isn\'t now + from China + arriving');
+  for (const k of ['now', 'fromChina', 'arriving']) if (st.reduce((p, s) => p + ((s.cases || {})[k] || 0), 0) !== K[k]) bad.push(`the styles' cases add up to another ${k}`);
+  if (sumU(lots) !== R.totals.units.incoming) bad.push(`the lots hold ${n(sumU(lots))} units, Incoming is ${n(R.totals.units.incoming)}`);
+  if (T.soldChina !== R.totals.units.pullFromChina) bad.push(`sold ${n(T.soldChina)} isn't the stage engine's Pull from China ${n(R.totals.units.pullFromChina)}`);
+  if (new Set(lots.map(l => l.id)).size !== lots.length) bad.push('two lots share an id');
+  if (st.reduce((p, s) => p + s.lots.length, 0) !== lots.length) bad.push("the styles' lots aren't every lot once");
+  const lotDay = l => (l.availableDate == null ? Infinity : l.availableDate);
+  const styleBad = { lots: [], stock: [], order: [] };
+  for (const s of st) {
+    if (sumU(s.lots) !== s.fromChina + s.arriving + s.ordersTaken || s.fromChina !== sumU(s.lots.filter(l => l.inChina), l => l.available) ||
+      s.arriving !== sumU(s.lots.filter(l => !l.inChina), l => l.available) || sumU(s.lots, l => l.taken) !== s.ordersTaken) styleBad.lots.push(s.style);
+    const known = isD(s.inWh) && isD(s.orders) && !s.flags.includes('stock-unknown');
+    if (known ? s.now !== Math.max(0, s.inWh - s.orders) || s.ordersTaken + s.oversold !== Math.max(0, s.orders - s.inWh) : s.ordersTaken || s.oversold || s.now) styleBad.stock.push(s.style);
+    let kept = false;   // customer orders come off the earliest lots first (no date last)
+    for (const l of s.lots.slice().sort((a, b) => (lotDay(a) > lotDay(b)) - (lotDay(a) < lotDay(b)))) {
+      if (kept && l.taken) { styleBad.order.push(s.style); break; }
+      if (l.available > 0) kept = true;
+    }
+  }
+  if (styleBad.lots.length) bad.push(`${n(styleBad.lots.length)} styles whose lots don't add up to from China + arriving + taken (e.g. ${styleBad.lots.slice(0, 3).join(', ')})`);
+  if (styleBad.stock.length) bad.push(`${n(styleBad.stock.length)} styles whose stock after orders is off (e.g. ${styleBad.stock.slice(0, 3).join(', ')})`);
+  if (styleBad.order.length) bad.push(`${n(styleBad.order.length)} styles where orders took a later lot before an earlier one (e.g. ${styleBad.order.slice(0, 3).join(', ')})`);
+  const ruleBad = [];
+  for (const l of lots) {
+    const d = l.dates || {}, src = l.dates ? ['ctReady', 'poBook', 'factoryCrd', 'crdExpected', 'shipBy'].map(k => d[k]).filter(isD) : isD(l.crd) ? [l.crd] : [];
+    // A source more than a year ahead or before 2015 (a wrong year) isn't used, unless every source is.
+    const ready = src.find(x => !(x > today + 366 || x < C.ymd(2015, 1, 1))) ?? (src.length ? src[0] : null), why = [];
+    if ((l.readyDate ?? null) !== ready) why.push('ready date');
+    if (l.units !== l.taken + l.available || l.taken < 0 || l.available < 0) why.push('units ≠ taken + available');
+    if (l.inChina) {
+      const w = isD(l.etd) ? [l.etd - 10, 'etd'] : ready != null ? [ready - 5, 'crd'] : isD(d.orderDate) ? [d.orderDate + 75, 'order'] : [null, 'none'];
+      if ((l.pullFrom ?? null) !== w[0] || l.pullRule !== w[1] || !!l.estimate !== (w[1] === 'order') || (l.availableDate ?? null) !== w[0]) why.push(`pull-from ${C.fmtDay(l.pullFrom) || 'none'} (${l.pullRule}), not ${C.fmtDay(w[0]) || 'none'} (${w[1]})`);
+      if (w[1] === 'order' && !(l.pullRange && l.pullRange.from === d.orderDate && l.pullRange.to === w[0])) why.push('range');
+      if (l.flags.includes('now') !== (w[0] != null && w[0] < today)) why.push('"now"');
+      if (l.flags.includes('dates-disagree') !== (src.length > 1 && Math.max(...src) - Math.min(...src) > 7)) why.push('dates-disagree');
+    } else if ((l.availableDate ?? null) !== (isD(l.eta) ? l.eta : null)) why.push('not its ETA');
+    if (why.length) ruleBad.push(`${l.style} PO ${l.po}: ${why.join(', ')}`);
+  }
+  console.log(`    sums hold (styles = totals; each style's lots = from China + arriving + taken; stock after orders; earliest lots first;` +
+    ` lots = Incoming ${n(R.totals.units.incoming)}; sold = Pull from China ${n(R.totals.units.pullFromChina)}): ${bad.length ? 'NO' : 'yes'}`);
+  console.log(`    Saul's rule, the ready date and taken + available, worked out here for each of the ${n(lots.length)} lots: ${ruleBad.length ? `${n(ruleBad.length)} DIFFER` : 'all the same'}`);
+  if (ruleBad.length) bad.push(`${n(ruleBad.length)} lots break Saul's rule, the ready-date order or taken + available (e.g. ${ruleBad.slice(0, 3).join(' | ')})`);
+  for (const x of bad) fails(`Available to sell: ${x}`);
+  console.log('');
+  issueLines(S.issues, i => [i.style, i.po ? `PO ${i.po}` : ''].filter(Boolean).join(' '));
 }
 
 // ---------------- the ERP's report, per style, against Incoming

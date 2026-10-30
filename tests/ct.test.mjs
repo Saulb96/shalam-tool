@@ -361,3 +361,18 @@ test('the page can load it after common.js', () => {
   assert.equal(typeof globalThis.InvCT.parseContainerTracking, 'function');
   assert.throws(() => CT.parseContainerTracking(X, book(), undefined), /today must be a day number/);
 });
+
+test('a Ready Date typed without a year on Booking or Loaded takes the year nearest today', () => {
+  const nov15 = C.ymd(2026, 11, 15), jan10 = C.ymd(2027, 1, 10);
+  const booking = [{ Category: 'Round 350' }, { Style: 'AB-1', Quantity: 1, 'PO Number': 900107, 'ready Date': '1/20' },
+    { Style: 'AB-2', Quantity: 1, 'PO Number': 900108, 'ready Date': '11/30' }];
+  const loaded = [{ Category: 'Round 350' }, { Style: 'AB-3', Quantity: 1, 'Po Number': 900109, 'Ready Date': '12/20' }];
+  const ready = (r, po) => r.blocks.find(b => b.po === po).readyDate;
+  const r = parse({ booking, loaded }, nov15);
+  assert.equal(ready(r, '900107'), day('1/20/2027'), 'typed in November: next January');
+  assert.equal(ready(r, '900108'), day('11/30/2026'), 'near today: this year');
+  assert.match(r.issues.find(i => i.code === 'yearless-date' && i.po === '900107').message, /read as 1\/20\/2027/);
+  const r2 = parse({ booking, loaded }, jan10);
+  assert.equal(ready(r2, '900109'), day('12/20/2026'), 'typed in January: last December');
+  assert.equal(ready(r2, '900107'), day('1/20/2027'));
+});

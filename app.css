@@ -129,8 +129,9 @@ table.grid{border-collapse:separate;border-spacing:0;font-size:12.5px;width:max-
 select{font:inherit;border-radius:11px;border:1px solid var(--edge);background:rgba(255,255,255,.85);color:var(--ink);padding:6px 10px;outline:none;max-width:190px}
 select:focus{box-shadow:0 0 0 3px rgba(47,155,214,.18)}
 select:focus-visible{outline:2px solid var(--sel);outline-offset:1px}
-.tiles{display:grid;grid-template-columns:repeat(6,minmax(0,1fr)) repeat(3,minmax(0,.75fr));gap:8px;margin-bottom:10px}
-@media (max-width:1280px){.tiles{grid-template-columns:repeat(auto-fill,minmax(160px,1fr))}}
+.tiles{display:grid;grid-template-columns:repeat(6,minmax(0,1fr)) minmax(0,1.15fr);gap:8px;margin-bottom:10px}
+#sellTiles{grid-template-columns:repeat(5,minmax(0,1fr))}
+@media (max-width:1280px){.tiles,#sellTiles{grid-template-columns:repeat(auto-fill,minmax(160px,1fr))}}
 .tile{display:block;width:100%;padding:10px 12px;border-radius:14px;text-align:left;cursor:pointer;color:var(--ink);font:inherit;white-space:normal;min-width:0}
 button.tile:hover{background:rgba(255,255,255,.82)}
 .tile.on{outline:2px solid var(--sel);outline-offset:-2px}
@@ -138,15 +139,22 @@ button.tile:hover{background:rgba(255,255,255,.82)}
 .tile .n small{font-size:11.5px;font-weight:600;color:var(--muted);margin-left:3px}
 .tile .cs{font-size:11.5px;color:var(--muted);min-height:16px;overflow-wrap:anywhere}
 .tile .lbl i{font-style:normal;font-weight:600;text-transform:none;letter-spacing:0;color:var(--accentink);margin-left:4px}
-.tile.nl,.tile.off{cursor:default}
+.tile.nl,.tile.off,.tile.flat{cursor:default}
 .tile.nl .n{font-size:15px;color:var(--muted);padding:3px 0}
 .tile.off{background:rgba(255,255,255,.4);box-shadow:none}
 .tile.off .n{font-size:15px;color:var(--off);padding:3px 0}
 .tile.off .cs{color:var(--off)}
+button.tile.go{cursor:pointer}
+button.tile.go .n{color:var(--accentink)}
+button.tile.go:hover{background:rgba(255,255,255,.7)}
+.tile.flat.bad .n{color:var(--red)}
+.tile .cs.wn{color:var(--amb);min-height:0}
 .fbar{margin:4px 0 8px}
 .fbar input[type=search]{width:280px;max-width:100%}
 .vpane{height:calc(100vh - 330px);min-height:360px}
 #pullPane{height:calc(100vh - 250px)}
+#sellNote:empty{display:none}
+#sellNote .banner{margin-bottom:10px}
 .grid.vt td{white-space:nowrap;vertical-align:middle}
 .grid.vt th{vertical-align:bottom}
 .grid.vt th[data-s]{cursor:pointer;user-select:none}
@@ -188,6 +196,17 @@ button.sb{font-weight:600;color:var(--ink)}
 .tag{display:inline-block;font:inherit;font-size:10.5px;line-height:1.5;padding:0 6px;border-radius:6px;border:0;background:rgba(95,108,125,.12);color:var(--muted);margin-left:6px;cursor:pointer;vertical-align:1px;white-space:nowrap}
 button.tag:hover{background:rgba(95,108,125,.2)}
 .tag.um{background:var(--ambbg);color:var(--amb)}
+.tag.ov{background:var(--redbg);color:var(--red)}
+button.tag.ov:hover{background:#f6cdc5}
+/* Available to sell: a word where a number can't be ("not on report", "no report yet"), negatives, estimates */
+.grid td.nr{color:var(--off);font-size:11px;text-align:center}
+.grid td.num.nr{text-align:right}
+.grid td.neg{color:var(--red)}
+.est{font-style:italic}
+/* the ready date's sources in full: every source's date readable (one line, so the windowed rows keep one height) */
+.grid td.rd{white-space:nowrap}
+.grid td.rd.flag b{font-weight:600;font-size:11px;margin-left:4px}
+.grid td.flag .u{color:var(--muted)}
 .flag{color:var(--amb)}
 .nt{color:var(--muted)}
 .srcbox{margin-top:12px}
@@ -212,6 +231,7 @@ button.tag:hover{background:rgba(95,108,125,.2)}
 .panel .px{font-size:16px;line-height:1;padding:4px 8px}
 .panel .pane{flex:1;min-height:0}
 .panel .pf{display:flex;align-items:center;gap:8px}
+.panel .pstock{padding:8px 12px;border-radius:12px;background:rgba(236,243,250,.8);border:1px solid var(--edge);font-size:12.5px;overflow-wrap:anywhere}
 
 /* toast, spinners */
 #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);z-index:20;padding:9px 16px;display:none;max-width:min(680px,92vw)}
@@ -223,6 +243,7 @@ button.tag:hover{background:rgba(95,108,125,.2)}
 @keyframes spin{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){.ship,.wave,.mini,.chip.load .dot,.scard.load .sh .dot{animation:none}}
 @media (max-width:760px){.wrap{padding:10px}.health{max-width:100%;white-space:normal}.chip.src{max-width:100%}
-  .tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.fbar input[type=search]{width:100%}select{max-width:48%}
+  .tiles,#sellTiles{grid-template-columns:repeat(2,minmax(0,1fr))}.fbar input[type=search]{width:100%}select{max-width:48%}
   .grid td.fz.f-sty,.grid th.fz.f-sty{width:150px;min-width:150px;max-width:150px}
   .panel{top:0;right:0;bottom:0;width:100vw;border-radius:0}}
+.grid td.pt{font-weight:400;font-style:italic;color:var(--muted)}

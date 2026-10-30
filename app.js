@@ -1,6 +1,7 @@
 // Shalam Tool: sign-in, reading every source from SharePoint, the source chips, the failure rules, the error email,
-// the stage numbers (Inventory and Pull from China tabs, the side panel) and the Problems tab. Parsing and the stage
-// rules live in core/*.js; this file fetches, calls them and draws.
+// what can be sold (Available to sell: stock after customer orders, and goods from China with one date each), where
+// the goods are (Where it is and Pull from China tabs, the side panel) and the Problems tab. Parsing, the stage rules
+// and the selling rules live in core/*.js; this file fetches, calls them and draws.
 // The page is read-only: the one request it makes that isn't a GET is the error email (POST /me/sendMail).
 (function () {
   'use strict';
@@ -66,7 +67,10 @@
     noId: 'No shipment ID', noContainer: 'No container number', duplicates: 'Repeated containers',
     labelRows: 'Title rows (like "Complete Shipments")', noRoundRows: 'Rows with no Round # (listed on Problems)' };
   // Words that differ by source.
-  const SRC_LABELS = { forwarder: { records: 'Shipments' }, drayage: { records: 'Containers' } };
+  const SRC_LABELS = { forwarder: { records: 'Shipments' }, drayage: { records: 'Containers' },
+    ats: { styleRows: 'Style rows', grandTotalRows: 'Grand Total rows', noStyleRows: 'Rows with no style', multiWarehouseStyles: 'Styles on more than one row (summed)',
+      notANumber: "Rows with a figure that isn't a number", blankNumbers: 'Rows with a blank In WH or customer orders', unknownStyles: "Styles whose stock can't be read",
+      inWh: 'In WH, all rows (units)', orders: 'Customer orders, all rows (units)', negativeInWh: 'Styles with In WH below zero', erpAtsDiffers: "Styles where the ERP's ATS differs" } };
 
   // Plain words for the parsers' issue codes, shown on the Problems tab (the code stays in the tooltip and the filter).
   const CODE_LABELS = {
@@ -108,8 +112,23 @@
     // Container Tracking sections with no round (config.js's sections), and POs below the tracker's lowest PO
     'below-tracker': 'Older than the PO Status Tracker', 'ignored-section': 'Ignored section', 'section-not-listed': 'Section not in the list',
     'pull-section': 'Straight to the customer from China', 'planning-section': 'Planned, not booked yet',
+    // The ATS report (core/ats.js) and Available to sell (core/sell.js)
+    'negative-in-wh': 'In warehouse below zero', 'erp-ats-differs': "The ERP's ATS isn't In WH minus customer orders",
+    'not-a-number': 'Not a number', 'grand-total': "Grand Total row missing or repeated (the report can't be checked)",
+    'negative-orders': 'Customer orders below zero',
+    'dates-disagree': 'Ready dates disagree (more than 7 days apart)', 'no-date': 'No date to sell from',
+    oversold: 'Oversold: more customer orders than stock and goods coming', 'orders-unknown': 'Customer orders not known (no ATS report, or not on it)',
+    'erp-only': 'On the ATS report only', estimate: 'Date estimated from the order date',
+    'erp-received': 'Sailed, but probably received already (not In Trans on the ATS report)',
+    'erp-in-transit': 'Orders may be covered by goods In Trans on the ATS report (landed, not received?)',
+    'orders-may-include-sold': 'Orders may be the goods sold to ship from China',
+    // flags on a style or lot of Available to sell
+    now: 'Pull-from date passed: available now', 'part-taken': 'Partly taken by customer orders', taken: 'All taken by customer orders',
+    'mixed-case-pack': 'Lots in different case packs', 'stock-unknown': "Stock on the ATS report can't be read", 'not-on-report': 'Not on the ATS report',
   };
-  const codeLabel = c => CODE_LABELS[c] || (c ? String(c).replace(/-/g, ' ') : '(no code)');
+  // The same code from another file, where its words differ (the ATS report's rows aren't product lines).
+  const SOURCE_LABELS = { 'ATS report': { 'no-style': 'Row with no style' } };
+  const codeLabel = (c, src) => (SOURCE_LABELS[src] || {})[c] || CODE_LABELS[c] || (c ? String(c).replace(/-/g, ' ') : '(no code)');
 
   // ---------- small helpers ----------
   const $ = id => document.getElementById(id);
@@ -501,15 +520,15 @@
   // ---------- state ----------
   let st = {};
   const cache = {};
-  let loading = null, timer = null, due = false, again = false, lastLoaded = null, fatal = '', tab = 'inv';
+  let loading = null, timer = null, due = false, again = false, lastLoaded = null, fatal = '', tab = 'sell';
   let fatalAuth = false;   // the fatal message asks to sign in again
   let cycleDone = false;   // a load cycle has ended (finished, cancelled or failed)
   let scopeFatal = '';     // the sign-in isn't read-only, or can't read SharePoint: nothing loads until it's fixed
   let copyCheck = null;   // null: not known · true: same rules as the PO Book · false: the PO Book's rules changed
   let mailScopeMissing = false;
   const mailMemo = new Map();   // source|day -> what happened to its email, in this page session
-  // Parsed results, kept for step 2.
-  const data = { po: null, ct: null, forwarder: null, drayage: null, upc: null };
+  // Parsed results, kept for the stage and selling numbers.
+  const data = { po: null, ct: null, forwarder: null, drayage: null, upc: null, ats: null };
 
   // Once the page has stopped over its sign-in permissions, a reader finishing late shows nothing.
   function showLoading(k) { if (scopeFatal) return; st[k] = { ...(st[k] || fresh(k)), state: 'load' }; renderSources(); }
@@ -808,16 +827,19 @@
     commit(k, s);
   }
 
-  // ---------- ATS: step 1 only looks for the newest report (it is read in step 3; nothing is ever uploaded) ----------
+  // ---------- ATS: the newest weekly ERP report in the ATS folder, read with core/ats.js (nothing is ever uploaded) ----------
   // Where to save the report, in plain words: "Inventory/ATS on the Production site" for /sites/Production/<library>/Inventory/ATS.
   function atsPlace() {
     const parts = locText('ats').split('/').filter(Boolean);
     return /^\/sites\//i.test(locText('ats')) && parts.length > 3 ? `${parts.slice(3).join('/')} on the ${parts[1]} site` : 'the ATS folder set in config.js';
   }
-  async function loadAts(today, signal) {
+  const isBook = n => /\.(xlsx|xlsm|xls)$/i.test(String(n || ''));
+  // The report's date: from its file name ("… 10-29-2026 12-58 PM.xlsx"), else the day it was saved. Its age decides
+  // amber (after 8 days) and the error email (after 10).
+  async function loadAts(today, force, signal) {
     const s = fresh('ats');
     showLoading('ats');
-    const noReport = () => off(s, 'no report yet', `No ATS report yet. Save the weekly ATS report into ${atsPlace()}.`, `save it into ${atsPlace()}`);
+    const noReport = why => off(s, 'no report yet', `${why || 'No ATS report yet.'} Save the weekly ATS report into ${atsPlace()}.`, `save it into ${atsPlace()}`);
     await attempt(s, async () => {
       let at;
       try { at = await locate('ats', s, signal); }
@@ -825,22 +847,60 @@
       if (!at) return notSet(s);
       const folder = at.item;
       s.file = folder.name || s.file; s.webUrl = folder.webUrl || s.webUrl;
-      const kids = (await gAll(`/drives/${at.driveId}/items/${folder.id}/children?$select=id,name,lastModifiedDateTime,lastModifiedBy,file,webUrl&$top=999`, signal))
+      setBusy('Looking in the ATS folder…');
+      const files = (await gAll(`/drives/${at.driveId}/items/${folder.id}/children?$select=id,name,lastModifiedDateTime,lastModifiedBy,file,webUrl&$top=999`, signal))
         .filter(x => x.file && !/^~\$/.test(x.name || ''));
-      s.rows = [['Files in the folder', kids.length]];
-      if (!kids.length) return noReport();
-      const f = kids.slice().sort((a, b) => String(b.lastModifiedDateTime).localeCompare(String(a.lastModifiedDateTime)))[0];
+      const kids = files.filter(x => isBook(x.name));
+      s.rows = [['Files in the folder', files.length]];
+      if (!kids.length) return noReport(files.length ? `No Excel file in the ATS folder (${plural(files.length, 'other file')}).` : '');
+      // The newest report: by the date in its file name (a report opened and saved again keeps its own date), else the
+      // day it was saved; then the latest saved.
+      const dayOfKid = x => { const d = window.InvAts.dayFromName(x.name); if (d != null) return d; const ms = Date.parse(x.lastModifiedDateTime); return Number.isFinite(ms) ? window.InvCommon.todayNY(ms) : -Infinity; };
+      const f = kids.slice().sort((a, b) => (dayOfKid(b) - dayOfKid(a)) || String(b.lastModifiedDateTime).localeCompare(String(a.lastModifiedDateTime)))[0];
       s.file = f.name; s.webUrl = f.webUrl || s.webUrl; s.savedAt = f.lastModifiedDateTime || ''; s.savedBy = who(f.lastModifiedBy);
-      const ms = Date.parse(f.lastModifiedDateTime);
-      const day = Number.isFinite(ms) ? window.InvCommon.todayNY(ms) : null;
+      const meta = await gj(`/drives/${at.driveId}/items/${f.id}`, { signal });   // with its download link
+      s.file = meta.name || f.name; s.webUrl = meta.webUrl || s.webUrl;
+      s.savedAt = meta.lastModifiedDateTime || s.savedAt; s.savedBy = who(meta.lastModifiedBy) || s.savedBy;
+      let c = cache['file:ats'];
+      if (force || !unchanged(c, meta)) {
+        const buf = await fetchBytes(meta, 'the ATS report', signal);
+        c = { id: meta.id, lm: meta.lastModifiedDateTime, wb: readBook(buf, meta.name) };
+        cache['file:ats'] = c;
+      }
+      setBusy('Reading the ATS report…'); await yieldUi();
+      let r;
+      try { r = window.InvAts.parseAts(XLSX, c.wb, meta.name, today); }
+      catch (e) { console.error(e); throw problem("can't read the file", 'Reading the ATS report failed: ' + ((e && e.message) || e)); }
+      if (!r || typeof r !== 'object') throw problem("can't read the file", "Reading the ATS report gave nothing back.");
+      const ms = Date.parse(s.savedAt);
+      const savedDay = Number.isFinite(ms) ? window.InvCommon.todayNY(ms) : null;
+      const fromName = typeof r.reportDay === 'number';
+      const day = fromName ? r.reportDay : savedDay;
       const age = day == null ? null : today - day;
-      s.rows.push(['Newest file', f.name], ['Saved', age == null ? '' : `${plural(age, 'day')} ago`]);
+      s.reportDay = day; s.reportFrom = fromName ? 'file name' : day == null ? '' : 'saved';
+      const n = r.styles instanceof Map ? r.styles.size : null;
+      // Rows read (style rows, blank rows and the Grand Total) against style rows counted.
+      s.read = firstNum(r.counts, ['rowsRead', 'rows']); s.counted = firstNum(r.counts, ['styleRows']) ?? n;
+      s.rows.push(['Newest file', meta.name],
+        ['Report date', day == null ? 'not known' : `${window.InvCommon.fmtDay(day)} (${fromName ? 'from the file name' : 'the day it was saved: no date in the file name'})`],
+        ['Age', age == null ? '' : plural(age, 'day')], ...countRows(r.counts, SRC_LABELS.ats), ...(r.counts && typeof r.counts.styles === 'number' ? [] : [['Styles', n]]));
+      s.issues = (r.issues || []).map(i => normIssue('ATS report', { ...i, source: 'ATS report' }));
+      if (!r.ok) {
+        const msg = unprefix('ATS report', String(r.error || '')) || "The ATS report couldn't be read.";
+        const seen = r.seen || r.headers;
+        throw problem(/add up/i.test(msg) ? "doesn't add up" : labelFor(msg), msg, { headers: Array.isArray(seen) ? seen.map(x => window.InvCommon.S(x)).filter(Boolean).join(' | ') : '' });
+      }
+      if (!n) throw problem('empty', `${meta.name} has no style rows.`);
+      const asOf = day == null ? '' : ` (report date ${window.InvCommon.fmtDay(day)})`;
       if (age != null && age > ATS_MAIL_DAYS) {
-        warn(s, `${plural(age, 'day')} old`, `Found ${f.name}, saved ${plural(age, 'day')} ago: the weekly ATS report is late. It's read in step 3.`);
+        warn(s, `${plural(age, 'day')} old`, `${meta.name} is ${plural(age, 'day')} old${asOf}: the weekly ATS report is late, so stock and customer orders may be out of date.`);
         s.mailProblem = `the newest report is ${plural(age, 'day')} old`;
       } else if (age != null && age > ATS_AMBER_DAYS) {
-        warn(s, `${plural(age, 'day')} old`, `Found ${f.name}, saved ${plural(age, 'day')} ago. It's read in step 3.`);
-      } else off(s, 'read in step 3', `Found ${f.name}. It's read in step 3.`);
+        warn(s, `${plural(age, 'day')} old`, `${meta.name} is ${plural(age, 'day')} old${asOf}, so stock and customer orders may be out of date.`);
+      } else if (age != null && age < 0) {
+        warn(s, 'date in the future', `The date in the file name of ${meta.name} (${window.InvCommon.fmtDay(day)}) is after today: check the file name's date, the report may not be the newest.`);
+      } else ok(s);
+      data.ats = r; s.data = r;
     });
     commit('ats', s);
   }
@@ -906,6 +966,7 @@
     "can't read the location": 'Fix its location in config.js.',
     empty: 'Open the file and check its rows are still there (it may have been cleared or saved over).',
     "can't read the file": 'Open the file and check it opens in Excel; save it again if it is damaged.',
+    "doesn't add up": "Open the report and check its rows against its Grand Total row (it may have been cut short or edited); save a fresh copy from the ERP into the folder.",
   };
   function nextStep(src, s, user) {
     if (s.label === 'link refused') return `Check ${user} can open the file. If they can, the read-only sign-in can't use sharing links: replace the link in config.js with the file's /sites/<site>/<library>/<path> location.`;
@@ -917,10 +978,13 @@
     if (src.k === 'ats' && s.state === 'warn') return 'Check the weekly ATS report is still being saved to the folder.';
     return NEXT[s.label] || 'Open it and check it; the page tries again every 5 minutes while it is open.';
   }
-  function effectOf(src) {
-    if (CORE_KEYS.includes(src.k)) return "The stage numbers stay off until it's fixed.";
+  function effectOf(src, s) {
+    if (CORE_KEYS.includes(src.k)) return "The stage numbers stay off until it's fixed, and Available to sell with them.";
     if (REPORT_KEYS.includes(src.k)) return `Until it's fixed, ${REPORT_EFFECT[src.k]}.`;
-    if (src.k === 'ats') return 'On hand comes from this report, so it would be out of date.';
+    if (src.k === 'ats') {
+      return s && s.state === 'warn' ? 'Stock and customer orders on Available to sell come from this report, so they may be out of date.'
+        : 'Stock and customer orders on Available to sell come from this report: until it\'s fixed, Available now says "not loaded" and customer orders aren\'t taken off the goods from China.';
+    }
     if (src.k === 'upc') return "Styles can't be matched to their UPCs until it's fixed.";
     return '';
   }
@@ -941,7 +1005,7 @@
     ];
     if (s.headers) lines.push(`Headers seen: ${s.headers}`);
     lines.push(`What fixes it: ${nextStep(src, s, user)}`);
-    const eff = effectOf(src);
+    const eff = effectOf(src, s);
     if (eff) lines.push(`Until then: ${eff}`);
     lines.push(
       `Page open by: ${(account && account.name) || ''} (${(account && account.username) || ''})`,
@@ -1035,6 +1099,7 @@
     for (const x of SOURCES) { const s = fresh(x.k); off(s, 'not read', 'Not read: Shalam Tool stopped because of its sign-in permissions (see the red banner).', 'see the red banner'); st[x.k] = s; }
     for (const k of Object.keys(data)) data[k] = null;
     stages = null; stageErr = ''; idx = null;
+    sell = null; sellErr = ''; sx = null;
     lastLoaded = null;
   }
 
@@ -1051,7 +1116,7 @@
     try {
       // Master Sheet Live, the tracker and Container Tracking first; UPC_MASTER last.
       await Promise.all([loadPoGroup(force, signal), loadCT(today, force, signal)]);
-      await Promise.all([loadReport('forwarder', today, force, signal), loadReport('drayage', today, force, signal), loadAts(today, signal)]);
+      await Promise.all([loadReport('forwarder', today, force, signal), loadReport('drayage', today, force, signal), loadAts(today, force, signal)]);
       // The stage numbers as soon as their sources are in; UPC_MASTER (descriptions, categories) fills in after.
       if (!signal.aborted) { buildStages(today); renderStageViews(); }
       await loadUpc(force, signal);
@@ -1086,7 +1151,7 @@
       setBusy(null);
       schedule();   // first, so the 5-minute refresh re-arms whatever the drawing below does
       // After every cycle, finished or not: built from what each chip shows as read (a stopped page has nothing).
-      if (scopeFatal) { stages = null; stageErr = ''; idx = null; } else buildStages(today);
+      if (scopeFatal) { stages = null; stageErr = ''; idx = null; sell = null; sellErr = ''; sx = null; } else buildStages(today);
       try { markNew(); } catch (e) { console.error(e); }
       renderAll();
       if (again) { again = false; loadAll(true); }
@@ -1220,6 +1285,9 @@
           o.ct ? `Container Tracking has ${fmtN(b.ct.units)} units on its lines, ${fmtN(b.ct.outcomeUnits)} were placed` : ''].filter(Boolean).join('; ');
         out.push(`<div class="banner err" id="balanceBanner"><div class="bt"><b>Units don't add up:</b> ${what}. This is a bug in Shalam Tool, not a problem in the files: tell Saul. The stage numbers may be wrong until it's fixed; Problems has the details.</div></div>`);
       }
+      if (sellErr && !stageErr) {
+        out.push(`<div class="banner err" id="sellErrBanner"><div class="bt"><b>Available to sell couldn't be worked out:</b> ${esc(sellErr)}. This is a bug in Shalam Tool, not a problem in the files: tell Saul. Available to sell says "not loaded" until it's fixed; the other tabs still work.</div></div>`);
+      }
       // A report missing or not used: the stages it would have given come from Container Tracking's own dates.
       const amb = REPORT_KEYS.filter(k => st[k] && (st[k].state === 'warn' || st[k].state === 'err'));
       const unused = stages && stages.ok ? REPORT_KEYS.filter(k => !got(k)) : [];
@@ -1269,9 +1337,11 @@
 
   let pq = '', showChecked = false;
   const expanded = new Set();
-  // The stage engine's issues come first, under "Incoming"; then every parser's, by source.
+  // The stage engine's issues come first, under "Incoming"; then the selling engine's, under "Available to sell"; then
+  // every parser's, by source (the ATS report's under "ATS report").
   const stageIssues = () => (stages && stages.ok ? [...(stages.issues || []).map(i => normIssue('Incoming', i)), ...pageIssues] : []);
-  const allIssues = () => [...stageIssues(), ...SOURCES.flatMap(x => (st[x.k] && st[x.k].state !== 'load' ? st[x.k].issues : []))];
+  const sellIssues = () => (sell && sell.ok ? [...(sell.issues || []).map(i => normIssue(SELL_SRC, { ...i, source: SELL_SRC })), ...sellPageIssues] : []);
+  const allIssues = () => [...stageIssues(), ...sellIssues(), ...SOURCES.flatMap(x => (st[x.k] && st[x.k].state !== 'load' ? st[x.k].issues : []))];
 
   // A problem marked checked is kept in this browser only, under inv:checked:<source>:<code>:<po>:<style>:<row>, with
   // its message: it comes back when the message changes. With storage blocked the mark lasts for this page session.
@@ -1312,6 +1382,8 @@
     }
     const read = SOURCES.filter(x => st[x.k] && !st[x.k].stale && (st[x.k].state === 'ok' || st[x.k].state === 'warn')).map(x => x.name);
     if (stages && stages.ok) read.push('Incoming');
+    if (sell && sell.ok) read.push(SELL_SRC);
+    if (st.ats && !st.ats.stale && st.ats.data) read.push('ATS report');
     newSet = new Set(); curBy = new Map();
     let first = false;
     for (const name of new Set([...cur.keys(), ...read])) {
@@ -1340,11 +1412,11 @@
       const ck = isChecked(i);
       if (ck) nChecked++; else open++;
       if (ck && !showChecked) continue;
-      if (q && ![i.source, i.code, codeLabel(i.code), i.sheet, i.row, i.po, i.style, i.message].join(' ').toLowerCase().includes(q)) continue;
+      if (q && ![i.source, i.code, codeLabel(i.code, i.source), i.sheet, i.row, i.po, i.style, i.message].join(' ').toLowerCase().includes(q)) continue;
       if (!groups.has(i.source)) groups.set(i.source, []);
       groups.get(i.source).push({ i, ck, nw: newSet.has(issHash(i)) });
     }
-    const order = ['Incoming', ...SOURCES.map(x => x.name)];
+    const order = ['Incoming', SELL_SRC, 'ATS report', ...SOURCES.map(x => x.name)];
     const names = [...groups.keys()].sort((a, b) => ((order.indexOf(a) + 1) || 99) - ((order.indexOf(b) + 1) || 99) || a.localeCompare(b));
     let h = '<thead><tr><th class="fz">What</th><th>Sheet</th><th class="num">Row / item</th><th>PO</th><th>Style</th><th>Message</th></tr></thead><tbody>';
     let matched = 0;
@@ -1355,13 +1427,13 @@
       matched += list.length;
       const byCode = new Map();
       for (const { i } of list) byCode.set(i.code, (byCode.get(i.code) || 0) + 1);
-      const codes = [...byCode].sort((a, b) => b[1] - a[1]).map(([c, n]) => `<span title="${esc(c || '')}">${esc(codeLabel(c))} ${fmtN(n)}</span>`).join(' · ');
+      const codes = [...byCode].sort((a, b) => b[1] - a[1]).map(([c, n]) => `<span title="${esc(c || '')}">${esc(codeLabel(c, name))} ${fmtN(n)}</span>`).join(' · ');
       const nNew = list.filter(x => x.nw).length;
       h += `<tr class="gh"><td colspan="6"><b>${esc(name)}</b> · ${plural(list.length, 'issue')}${nNew ? ` · <b>${fmtN(nNew)} new</b>` : ''}<span class="codes">${codes}</span></td></tr>`;
       const show = expanded.has(name) ? list : list.slice(0, ISSUE_PAGE);
       for (const { i, ck, nw } of show) {
         const ix = shownIss.push(i) - 1;
-        h += `<tr class="${nw ? 'isnew' : ''}${ck ? ' isck' : ''}"><td class="nw fz" title="${esc(i.code)}"><input type="checkbox" class="ck" data-ix="${ix}"${ck ? ' checked' : ''} title="Checked: hidden from this list until its message changes" aria-label="Checked">${nw ? '<span class="pill new">new</span>' : ''}${esc(codeLabel(i.code))}</td><td class="nw">${esc(i.sheet)}</td><td class="num">${esc(i.row)}</td><td class="nw">${esc(i.po)}</td><td class="nw">${esc(i.style)}</td><td class="msg">${esc(i.message)}</td></tr>`;
+        h += `<tr class="${nw ? 'isnew' : ''}${ck ? ' isck' : ''}"><td class="nw fz" title="${esc(i.code)}"><input type="checkbox" class="ck" data-ix="${ix}"${ck ? ' checked' : ''} title="Checked: hidden from this list until its message changes" aria-label="Checked">${nw ? '<span class="pill new">new</span>' : ''}${esc(codeLabel(i.code, i.source))}</td><td class="nw">${esc(i.sheet)}</td><td class="num">${esc(i.row)}</td><td class="nw">${esc(i.po)}</td><td class="nw">${esc(i.style)}</td><td class="msg">${esc(i.message)}</td></tr>`;
       }
       if (show.length < list.length) {
         h += `<tr><td colspan="6" class="more">Showing ${fmtN(show.length)} of ${fmtN(list.length)}. <button type="button" class="ghost" data-more="${esc(name)}">Show all ${fmtN(list.length)}</button></td></tr>`;
@@ -1377,7 +1449,7 @@
     $('pqCheckedWrap').hidden = !nChecked && !showChecked;
     $('nChecked').textContent = fmtN(nChecked);
     $('cProb').textContent = fmtN(open);
-    document.querySelector('#tabs .tab.iss').classList.toggle('bad', SOURCES.some(x => st[x.k] && st[x.k].state === 'err') || !!stageErr || balanceBad());
+    document.querySelector('#tabs .tab.iss').classList.toggle('bad', SOURCES.some(x => st[x.k] && st[x.k].state === 'err') || !!stageErr || !!sellErr || balanceBad());
   }
   function renderProblems() { renderSrcTable(); renderBalance(); renderIssues(); }
 
@@ -1387,7 +1459,7 @@
   // Each tab's pane fills the window below where it starts (banners and tiles above it vary), so its own scroll bars
   // stay on screen and the page itself needs no second scroll to reach them.
   function fitPanes() {
-    for (const id of ['invPane', 'pullPane', 'issPane']) {
+    for (const id of ['sellPane', 'invPane', 'pullPane', 'issPane']) {
       const p = $(id);
       if (!p || !p.getClientRects().length) continue;   // on a hidden tab: sized when it's shown
       const top = p.getBoundingClientRect().top + scrollY;
@@ -1395,32 +1467,48 @@
     }
   }
 
+  const TABS = ['sell', 'inv', 'pull', 'problems'];
   function showTab(t) {
-    if (!['inv', 'pull', 'problems'].includes(t)) t = 'inv';
+    if (!TABS.includes(t)) t = 'sell';
     if (tab === 'problems' && t !== 'problems') commitSeen();
     tab = t;
     for (const b of document.querySelectorAll('#tabs .tab')) {
       b.classList.toggle('on', b.dataset.tab === t);
       b.setAttribute('aria-selected', String(b.dataset.tab === t));
     }
-    for (const x of ['inv', 'pull', 'problems']) $('tab-' + x).hidden = x !== t;
-    // One set of filters for the Inventory and Pull from China tabs: the bar moves to the tab shown.
+    for (const x of TABS) $('tab-' + x).hidden = x !== t;
+    // One set of filters for Available to sell, Where it is and Pull from China: the bar moves to the tab shown. Stage and
+    // PO type are about where goods are (not on Available to sell); "only styles with something available" is its own.
     const fbar = $('fbar');
-    if (t === 'inv') $('tab-inv').insertBefore(fbar, $('invPane'));
+    if (t === 'sell') $('tab-sell').insertBefore(fbar, $('sellPane'));
+    else if (t === 'inv') $('tab-inv').insertBefore(fbar, $('invPane'));
     else if (t === 'pull') $('tab-pull').insertBefore(fbar, $('pullPane'));
     fbar.hidden = t === 'problems';
+    $('fStage').hidden = $('fType').hidden = t === 'sell';
+    $('fAvailWrap').hidden = t !== 'sell';
+    $('fq').placeholder = t === 'sell' ? 'Search style, UPC, description…' : 'Search style, UPC, description, PO…';
+    $('fq').setAttribute('aria-label', t === 'sell' ? 'Search style, UPC or description' : 'Search style, UPC, description or PO');
+    $('btnClearF').hidden = !filtersOn();
+    // The loading picture and the sources box go with Where it is when it's shown, else with Available to sell.
+    const lead = t === 'inv' ? $('invState') : $('sellState');
+    if ($('invLoad').parentNode !== lead) lead.appendChild($('invLoad'));
+    const home = t === 'inv' ? $('tab-inv') : $('tab-sell');
+    if ($('srcBox').parentNode !== home) home.appendChild($('srcBox'));
     fitPanes();
+    if (t === 'sell' && vtSell) vtSell.show();
     if (t === 'inv' && vtInv) vtInv.show();
     if (t === 'pull' && vtPull) vtPull.show();
     if (vtInv) setInfo();
-    store.set('tab', t);
+    store.set('tab2', t);
   }
 
   // ---------- step 2: the stage numbers (core/stages.js) ----------
   // Every unit on Master Sheet Live ends in one allocation with one bucket. The page only sums allocations: the rows,
   // the tiles and the side panel are all sums of the same allocations, after the same filters.
+  // pullFromChina: China Pickup POs and the direct-to-customer sections. Those goods are sold (Saul, Oct 30), so they're
+  // "Sold, ships from China", never available.
   const BUCKET_LABEL = { noCrd: 'No CRD', inProd: 'In production', ready: 'Ready', booked: 'Booked', loaded: 'Loaded', inChina: 'In China',
-    water: 'On the water', port: 'At port', incoming: 'Incoming', landed: 'Landed', pullFromChina: 'Pull from China', short: 'Short-shipped',
+    water: 'On the water', port: 'At port', incoming: 'Incoming', landed: 'Landed', pullFromChina: 'Sold, ships from China', short: 'Short-shipped',
     shippedNotOnCt: 'Shipped, not on Container Tracking', duplicate: 'Repeat of a shipped line', ctMore: 'Container Tracking holds more',
     unmatched: 'Unmatched', planning: 'Planned, not booked yet', ignored: 'Ignored section', belowTracker: 'Older than the PO Status Tracker',
     casesIncoming: 'Incoming' };
@@ -1434,7 +1522,7 @@
   const CT_ONLY = ['ctMore', 'unmatched', 'planning', 'ignored', 'belowTracker'];
   // config.js's direct-to-customer sections, named where Pull from China is explained.
   const PULL_SECTIONS = (CFG.sections && Array.isArray(CFG.sections.pullFromChina) ? CFG.sections.pullFromChina : []).filter(x => typeof x === 'string' && x.trim());
-  const PULL_TIP = `China Pickup POs${PULL_SECTIONS.length ? `, and Container Tracking's ${PULL_SECTIONS.join(', ')} sections (straight to the customer)` : ''}: picked up in China, never in In China or Incoming`;
+  const PULL_TIP = `Already sold: China Pickup POs${PULL_SECTIONS.length ? `, and Container Tracking's ${PULL_SECTIONS.join(', ')} sections (straight to the customer)` : ''}, shipped to the customer from China. Never available to sell, never in In China or Incoming`;
   const TOT = ['noCrd', 'inProd', 'ready', 'booked', 'loaded', 'inChina', 'water', 'port', 'incoming', 'pullFromChina', 'unmatched'];
   const NUM_COLS = ['noCrd', 'inProd', 'ready', 'booked', 'loaded', 'inChina', 'water', 'port', 'incoming', 'pullFromChina'];
   const bucketsOf = k => (k === 'inChina' ? IN_CHINA : k === 'incoming' || k === 'casesIncoming' ? INCOMING : [k]);
@@ -1459,10 +1547,11 @@
     if (/unknown/i.test(t) || (x && x.tracked === false) || (Array.isArray(x && x.flags) && x.flags.includes('unknown-type'))) return 'Unknown';
     return t;
   }
-  function casesText(c, np, u) {
+  function casesText(c, np, u, loose) {
     if (!u) return '';
     const p = [];
     if (c) p.push(plural(c, 'case'));
+    if (loose) p.push(`${fmtN(loose)} loose unit${loose === 1 ? '' : 's'}`);
     if (np) p.push(`${fmtN(np)} units with no case pack`);
     return p.join(' + ');
   }
@@ -1471,6 +1560,12 @@
   let stageErr = '';     // the engine stopped or gave an answer the page can't read: a bug, said so
   let idx = null;        // per build: allocations by style, the filter lists
   let pageIssues = [];   // the page's own check that its sums equal the engine's
+  // Available to sell (core/sell.js), built on the stages and the ATS report.
+  const SELL_SRC = 'Available to sell';
+  let sell = null;       // the last InvSell.buildSell result; null while the stages aren't loaded
+  let sellErr = '';      // the selling engine stopped or gave an answer the page can't read: a bug, said so
+  let sx = null;         // per build: the selling rows by style, lots by allocation
+  let sellPageIssues = [];
   const got = k => (st[k] && st[k].data) || null;
 
   // The PO Book group and Container Tracking, each read and used, or why not (one line each).
@@ -1485,9 +1580,23 @@
     return out;
   }
   // An error in the page's own stage code shows as the red "couldn't be worked out" banner, never as a load failure.
-  const stageCodeErr = e => { console.error(e); stageErr = `the page couldn't draw them (${(e && e.message) || e})`; stages = { ok: false, notLoaded: [], block: [] }; idx = null; };
+  const stageCodeErr = e => { console.error(e); stageErr = `the page couldn't draw them (${(e && e.message) || e})`; stages = { ok: false, notLoaded: [], block: [] }; idx = null; sell = null; sx = null; };
   function buildStages(today) {
     try { buildStagesNow(today); } catch (e) { stageCodeErr(e); }
+    buildSell(today);
+  }
+  // Available to sell: only on loaded stages (the not-loaded rule: no partial numbers). The ATS report is optional to
+  // the engine: without it (missing or red) customer orders aren't taken off and the page says why.
+  function buildSell(today) {
+    sell = null; sellErr = ''; sx = null; sellPageIssues = [];
+    if (!stages || !stages.ok || stageErr) return;
+    let r;
+    try { r = window.InvSell.buildSell({ stages, ats: got('ats'), today, upc: got('upc'), reportDay: numOr(st.ats && st.ats.reportDay) }); }
+    catch (e) { console.error(e); sellErr = `the selling engine stopped (${(e && e.message) || e})`; return; }
+    if (!r || r.ok === false) { sellErr = `the selling engine gave no numbers${r && r.error ? ` (${r.error})` : ''}`; return; }
+    if (!Array.isArray(r.styles) || !Array.isArray(r.lots) || !r.totals) { sellErr = "the selling engine gave an answer the page can't read"; return; }
+    sell = r;
+    try { indexSell(); } catch (e) { console.error(e); sell = null; sx = null; sellErr = `the page couldn't draw it (${(e && e.message) || e})`; }
   }
   function buildStagesNow(today) {
     stageErr = ''; pageIssues = [];
@@ -1552,18 +1661,22 @@
     }
   }
 
-  // ---------- filters: one set for the Inventory and Pull from China tabs ----------
-  const F = { q: '', fac: '', cat: '', stage: '', type: '' };
+  // ---------- filters: one set for the Available to sell, Where it is and Pull from China tabs ----------
+  // avail: Available to sell only ("only styles with something available"); stage and type: the other two only.
+  const F = { q: '', fac: '', cat: '', stage: '', type: '', avail: false };
   const NONE = '__none__';   // the choice for a blank factory or category
   const fOn = () => !!(F.q || F.fac || F.cat || F.stage || F.type);
+  const fOnSell = () => !!(F.q || F.fac || F.cat || F.avail);
+  const filtersOn = () => fOn() || F.avail;   // any filter at all, a hidden one too: Clear shows and clears it
   const facOk = v => !F.fac || (F.fac === NONE ? !v : v === F.fac);
   const catOk = v => !F.cat || (F.cat === NONE ? !v : v === F.cat);
   const styleHit = s => lc(s.style).includes(F.q) || lc(s.styleRaw).includes(F.q) || lc(s.desc).includes(F.q);
   const allocHit = a => lc(a.upc).includes(F.q) || lc(a.po).includes(F.q) || lc(a.poShown).includes(F.q);
-  const passes = (a, sHit) => facOk(a.factory || '') && (!F.type || ptypeOf(a) === F.type) &&
-    (!F.stage || bucketsOf(F.stage).includes(a.bucket)) && (sHit || !F.q || allocHit(a));
+  // sellView: opened from Available to sell, where the stage and PO type filters are hidden (and not applied).
+  const passes = (a, sHit, sellView) => facOk(a.factory || '') && (sellView || !F.type || ptypeOf(a) === F.type) &&
+    (sellView || !F.stage || bucketsOf(F.stage).includes(a.bucket)) && (sHit || !F.q || allocHit(a));
   const STAGE_OPTS = [['inChina', 'In China (any)'], ...IN_CHINA.map(k => [k, '· ' + BUCKET_LABEL[k]]), ['water', 'On the water'], ['port', 'At port'],
-    ['incoming', 'Incoming (any)'], ['pullFromChina', 'Pull from China'], ['unmatched', 'Unmatched']];
+    ['incoming', 'Incoming (any)'], ['pullFromChina', BUCKET_LABEL.pullFromChina], ['unmatched', 'Unmatched']];
   const STAGE_OUT = OUTSIDE.map(k => [k, BUCKET_LABEL[k]]);
   const TYPE_OPTS = [['LA', 'LA'], ['China Pickup', 'China Pickup'], ['Unknown', 'Unknown']];
   function fillSelect(el, all, opts, cur, extra) {
@@ -1574,13 +1687,15 @@
   }
   function renderFilterLists() {
     const named = set => [...set].filter(Boolean).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-    const facs = idx ? idx.facs : new Set(), cats = idx ? idx.cats : new Set();
+    // The styles only on the ATS report add their categories (from UPC_MASTER); a style with no factory is "(no factory)".
+    const facs = new Set([...(idx ? idx.facs : []), ...(sx ? sx.facs : [])]), cats = new Set([...(idx ? idx.cats : []), ...(sx ? sx.cats : [])]);
     fillSelect($('fFac'), 'All factories', [...named(facs).map(v => [v, v]), ...(facs.has('') ? [[NONE, '(no factory)']] : [])], F.fac);
     fillSelect($('fCat'), 'All categories', [...named(cats).map(v => [v, v]), ...(cats.has('') ? [[NONE, '(no category)']] : [])], F.cat);
     fillSelect($('fStage'), 'All stages', STAGE_OPTS, F.stage,
       `<optgroup label="Not counted (side panel and Problems)">${STAGE_OUT.map(([v, t]) => `<option value="${v}"${v === F.stage ? ' selected' : ''}>${esc(t)}</option>`).join('')}</optgroup>`);
     fillSelect($('fType'), 'All PO types', TYPE_OPTS, F.type);
-    $('btnClearF').hidden = !fOn();
+    $('fAvail').checked = F.avail;
+    $('btnClearF').hidden = !filtersOn();
   }
 
   // ---------- tables that draw only the rows in view ----------
@@ -1626,7 +1741,7 @@
       redraw() { draw(true); },
     };
   }
-  let vtInv = null, vtPull = null, vtPanel = null;
+  let vtSell = null, vtInv = null, vtPull = null, vtPanel = null;
   const sortHead = (cols, srt) => `<tr>${cols.map(c => {
     const on = srt && srt.k === c.k, cls = [c.cls, c.n || c.b || c.off ? 'num' : '', c.sum ? 'sum' : '', c.off ? 'off' : ''].filter(Boolean).join(' ');
     const sortable = !c.off && !c.nosort;
@@ -1647,10 +1762,10 @@
     return { k, dir: c.n || c.b || c.date ? (c.date ? 1 : -1) : 1 };
   }
 
-  // ---------- Inventory tab ----------
+  // ---------- Where it is tab (step 2's Inventory tab) ----------
   const INV_COLS = [
     { k: 'style', t: 'Style', cls: 'fz f-sty' }, { k: 'desc', t: 'Description' }, { k: 'category', t: 'Category' }, { k: 'factory', t: 'Factory' },
-    { k: 'onHand', t: 'On hand', off: 1, tip: 'Comes with the ATS report (step 3)' },
+    { k: 'onHand', t: 'On hand', n: 1, tip: 'In warehouse on the ATS report: physical stock, before customer orders (Available to sell takes them off)' },
     ...NUM_COLS.map(k => ({ k, t: BUCKET_LABEL[k], b: 1, sum: k === 'inChina' || k === 'incoming',
       tip: k === 'inChina' ? 'No CRD + In production + Ready + Booked + Loaded' : k === 'incoming' ? 'In China + On the water + At port'
         : k === 'pullFromChina' ? PULL_TIP : '' })),
@@ -1690,7 +1805,7 @@
     }
     const k = sortInv.k;
     const val = k === 'style' ? r => r.styleRaw : ['desc', 'category', 'factory', 'nextEta'].includes(k) ? r => r[k]
-      : k === 'casesIncoming' ? r => r.cases.incoming : r => r.units[k];
+      : k === 'casesIncoming' ? r => r.cases.incoming : k === 'onHand' ? r => inWhOf(r.key) : r => r.units[k];
     rows.sort(cmpBy(val, sortInv.dir));
     invShown = { styles: rows.length, empty };
     // UPC lines under a style with more than one UPC (with the filters on, only the UPCs they leave).
@@ -1722,7 +1837,7 @@
         `<td class="desc" title="${esc(r.desc)}">${esc(r.desc)}</td><td class="cut" title="${esc([r.category, r.sub].filter(Boolean).join(' · '))}">${esc(r.category)}</td>` +
         `<td class="cut" title="${esc(r.factories.join(', '))}">${esc(r.factory)}</td>`;
     }
-    h += `<td class="num off">${up ? '' : 'step 3'}</td>`;
+    h += up ? '<td class="num"></td>' : onHandCell(r.key);
     for (const k of NUM_COLS) h += `<td class="num${k === 'inChina' || k === 'incoming' ? ' sum' : ''}">${nb(k)}</td>`;
     const c = r.cases.incoming, np = r.noPack.incoming;
     const ci = !r.units.incoming ? '' : `<button type="button" class="nb" data-b="casesIncoming" title="${esc(casesText(c, np, r.units.incoming))}">${c ? fmtN(c) : ''}${np ? `<span class="np">${c ? '+ no case pack' : 'no case pack'}</span>` : ''}</button>`;
@@ -1732,7 +1847,7 @@
   // ---------- the tiles ----------
   const TILES = [['inChina', 'In China', 'No CRD + In production + Ready + Booked + Loaded'], ['water', 'On the water', 'Sailed, not arrived'],
     ['port', 'At port', 'Arrived or picked up, not delivered'], ['incoming', 'Incoming', 'In China + On the water + At port'],
-    ['pullFromChina', 'Pull from China', PULL_TIP],
+    ['pullFromChina', BUCKET_LABEL.pullFromChina, PULL_TIP],
     ['unmatched', 'Unmatched', 'On Container Tracking with no Master Sheet Live line (not landed): never in the stage numbers']];
   function renderTiles(g) {
     const lead = stageLead();
@@ -1742,8 +1857,9 @@
         `<div class="lbl">${esc(t)}${fOn() ? '<i>filtered</i>' : ''}</div><div class="n">${fmtN(g.units[k])}<small>units</small></div>` +
         `<div class="cs">${esc(casesText(g.cases[k], g.noPack[k], g.units[k]))}</div></button>`;
     });
-    const later = ['On hand', 'Held', 'Available'].map(t => `<div class="glass tile off"><div class="lbl">${t}</div><div class="n">—</div><div class="cs">comes with the ATS report (step 3)</div></div>`);
-    $('tiles').innerHTML = live.concat(later).join('');
+    // Stock after customer orders, and what can be sold from China, are on their own tab.
+    const later = '<button type="button" class="glass tile off go" data-go="sell" title="Open Available to sell"><div class="lbl">On hand and available</div><div class="n">Available to sell →</div><div class="cs">stock after customer orders, and goods from China</div></button>';
+    $('tiles').innerHTML = live.join('') + later;
   }
 
   // What the Inventory and Pull from China tabs say while there are no numbers: loading, not loaded, or a bug.
@@ -1787,7 +1903,7 @@
   }
   // The line at the end of the filter bar, for the tab it sits on.
   function setInfo() {
-    $('fInfo').textContent = !idx ? '' : tab === 'pull' ? pullInfo
+    $('fInfo').textContent = tab === 'sell' ? (sx ? sellInfo() : '') : !idx ? '' : tab === 'pull' ? pullInfo
       : `${plural(invShown.styles, 'style')}${invShown.empty ? ` · ${fmtN(invShown.empty)} more ${fOn() ? (invShown.empty === 1 ? 'matches but has' : 'match but have') : (invShown.empty === 1 ? 'has' : 'have')} nothing in these columns (shipped, landed or not counted)` : ''}`;
   }
 
@@ -1796,7 +1912,10 @@
     { k: 'po', t: 'PO', cls: 'fz f-po' }, { k: 'style', t: 'Style', cls: 'fz f-sty2' }, { k: 'desc', t: 'Description' }, { k: 'customer', t: 'Customer' },
     { k: 'ptype', t: 'PO type' }, { k: 'factory', t: 'Factory' }, { k: 'crd', t: 'CRD', date: 1 }, { k: 'units', t: 'Units', n: 1 }, { k: 'cases', t: 'Cases', n: 1 },
     { k: 'ctStatus', t: 'Container Tracking status' }, { k: 'round', t: 'Round' }, { k: 'containers', t: 'Container' },
-    { k: 'etd', t: 'ETD', date: 1 }, { k: 'eta', t: 'ETA', date: 1 }, { k: 'flags', t: 'Flags' },
+    { k: 'etd', t: 'ETD', date: 1 }, { k: 'eta', t: 'ETA', date: 1 },
+    { k: 'pullFrom', t: 'Pull-from date', date: 1, tip: "When a buyer can have it: in China, 10 days before the ETD, else 5 days before the CRD, else about 75 days after the order date; sailed, its ETA. \"Sold\": China Pickup or straight to the customer" },
+    { k: 'availAfter', t: 'Available after orders', n: 1, tip: 'Units left to sell after customer orders beyond the stock are taken off, earliest goods first' },
+    { k: 'flags', t: 'Flags' },
   ];
   let sortPull = null, pullInfo = '';
   // The stage filter on a Pull from China line: by its Container Tracking status, and its CRD while it's not on it.
@@ -1817,7 +1936,7 @@
     if (sortPull) {
       const k = sortPull.k;
       rows.sort(cmpBy(r => (k === 'flags' ? flagText(r.flags) : k === 'containers' || k === 'round' ? fmtList(r[k]) : k === 'ptype' ? ptypeOf(r)
-        : k === 'style' ? r.styleRaw || r.style : r[k]), sortPull.dir));
+        : k === 'style' ? r.styleRaw || r.style : k === 'pullFrom' ? pullSellVal(r, 'day') : k === 'availAfter' ? pullSellVal(r, 'avail') : r[k]), sortPull.dir));
     }
     const u = rows.reduce((p, r) => p + units(r.units), 0), cp = rows.filter(r => ptypeOf(r) === 'China Pickup').reduce((p, r) => p + units(r.units), 0);
     pullInfo = `${plural(rows.length, 'open line')} · ${fmtN(u)} units${cp ? ` (China Pickup ${fmtN(cp)})` : ''}`;
@@ -1835,6 +1954,7 @@
       // A mix of stages takes two lines: the first part, then the rest.
       `<td class="cut st${/^(not on tracker$|planned · )/i.test(st2) ? ' nt' : ''}" title="${esc(st2)}">${esc(st2.split(' · ')[0])}<span class="u">${st2.includes(' · ') ? esc(st2.split(' · ').slice(1).join(' · ')) : '&nbsp;'}</span></td><td class="nw">${esc(fmtList(r.round))}</td>` +
       `<td class="cut" title="${esc(fmtList(r.containers))}">${esc(fmtList(r.containers))}</td><td class="nw">${esc(fmtD(r.etd))}</td><td class="nw">${esc(fmtD(r.eta))}</td>` +
+      pullSellCells(r) +
       `<td class="cut flag" title="${esc(flagText(r.flags))}">${esc(flagText(r.flags))}</td></tr>`;
   }
   function renderPull(toTop) {
@@ -1843,6 +1963,477 @@
     const c = $('cPull');
     c.hidden = !idx; c.textContent = idx ? fmtN(rows.length) : '';
     setInfo();
+  }
+
+  // ---------- Available to sell (core/sell.js) ----------
+  // Per style: the stock left after customer orders (the weekly ATS report), and the lots in China or on the water, each
+  // with one date a buyer can have it. Customer orders beyond the stock come off the earliest lots. Sold goods (China
+  // Pickup POs, the direct-to-customer sections) are shown, never available. The page only draws the engine's numbers;
+  // the tiles are sums of the rows shown, and with no filter they must equal the engine's totals.
+  const numOr = v => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const hasFlag = (x, f) => !!x && Array.isArray(x.flags) && x.flags.includes(f);
+  const upcText = u => (typeof u === 'string' ? u : (u && (u.upc || u.upcRaw)) || '');
+  const sellToday = () => numOr(sell && sell.today) ?? numOr(stages && stages.today) ?? window.InvCommon.todayNY(Date.now());
+  // m/d in running text ("10 days before ETD 11/14"); with the year when it isn't this year's.
+  const md = d => { const t = fmtD(d); return d != null && window.InvCommon.dayYear(d) === window.InvCommon.dayYear(sellToday()) ? t.replace(/\/\d{4}$/, '') : t; };
+
+  // What the stock columns can show: the ATS report's numbers, or why not.
+  function atsMode() {
+    const s = st.ats;
+    if (got('ats')) return 'ok';
+    if (!s || s.state === 'load') return 'wait';
+    if (s.state === 'err') return 'bad';
+    if (s.label === 'no report yet') return 'none';
+    if (s.label === 'not set') return 'unset';
+    return 'unread';
+  }
+  const ATS_WORD = { bad: 'not loaded', none: 'no report yet', unset: 'not set', unread: 'not read', wait: 'loading…' };
+  // The engine took customer orders off (it had the report, and the page has it too).
+  const stockOk = () => !!sell && !sell.atsMissing && atsMode() === 'ok';
+  const stockWord = () => { const m = atsMode(); return m === 'ok' ? 'not loaded' : ATS_WORD[m] || 'not loaded'; };
+  const atsDay = () => numOr(st.ats && st.ats.reportDay) ?? numOr(sell && sell.reportDay);
+  const asOfText = () => { const d = atsDay(); return d == null ? '' : ` of ${fmtD(d)}`; };
+  function atsWhy() {
+    const m = atsMode(), s = st.ats || fresh('ats');
+    if (m === 'bad') return `The ATS report couldn't be used: ${onFromColon(s.message)}`;
+    if (m === 'none') return `No ATS report yet: save the weekly ATS report into ${atsPlace()}.`;
+    if (m === 'unset') return "The ATS folder's location is blank in config.js.";
+    if (m === 'unread') return "The ATS report wasn't read this time: click Refresh.";
+    if (m === 'wait') return 'The ATS report is still loading.';
+    return "The ATS report loaded, but customer orders weren't taken off (a bug in Shalam Tool: tell Saul).";
+  }
+  // The style's row on the ATS report (Where it is shows its In warehouse as On hand).
+  function atsRowOf(style) { const a = got('ats'); return a && a.styles instanceof Map ? a.styles.get(style) || null : null; }
+  const inWhOf = style => { const r = atsRowOf(style); return r ? numOr(r.inWh) : null; };
+  function onHandCell(style) {
+    const m = atsMode();
+    if (m !== 'ok') return `<td class="num nr" title="${esc(atsWhy())}">${esc(ATS_WORD[m])}</td>`;
+    const r = atsRowOf(style);
+    if (!r) return `<td class="num nr" title="${esc(`This style has no row on the ATS report${asOfText()}`)}">not on report</td>`;
+    const v = numOr(r.inWh);
+    // A blank or a figure that isn't a number is never 0 (core/ats.js lists it).
+    if (v == null) return `<td class="num nr" title="${esc(`In WH on the ATS report${asOfText()} is blank or not a number (listed on Problems)`)}">can't be read</td>`;
+    return `<td class="num${v < 0 ? ' neg' : ''}" title="${esc(`In warehouse on the ATS report${asOfText()}, before customer orders`)}">${v ? fmtN(v) : ''}</td>`;
+  }
+
+  // A lot's date: its pull-from date in China, its arrival (ETA) once sailed.
+  const lotDay = l => numOr(l.availableDate) ?? numOr(l.inChina ? l.pullFrom : l.arrival);
+  const lotOrder = (a, b) => { const x = lotDay(a), y = lotDay(b); return (x == null) - (y == null) || (x ?? 0) - (y ?? 0) || String(a.po || '').localeCompare(String(b.po || ''), undefined, { numeric: true }); };
+  const allocOf = l => (idx && l && l.allocId != null ? idx.byId.get(l.allocId) || null : null);
+  const packNum = s => (typeof s.casePack === 'number' && s.casePack > 0 ? s.casePack : null);
+  const lotPack = (l, s) => { const a = allocOf(l), m = numOr(l.master) ?? (a ? numOr(a.master) : null); return m && m > 0 ? m : packNum(s); };
+  // When a buyer can have a lot, in words (Saul's rule): in China, 10 days before the ETD, else 5 days before the CRD
+  // (ready date), else about 75 days after the order date (an estimate); a date already past is "now". Sailed: its ETA
+  // (one already past says so: due, or at port).
+  function lotWhen(l) {
+    const today = sellToday(), d = lotDay(l), dates = l.dates && typeof l.dates === 'object' ? l.dates : {};
+    if (!l.inChina) {
+      const eta = md(numOr(l.eta) ?? d);
+      return d == null ? { day: null, main: 'no ETA yet', why: 'sailed, with no ETA', none: true }
+        : d < today ? { day: d, main: fmtD(d), why: `ETA ${eta} passed: due now`, passed: true } : { day: d, main: fmtD(d), why: `arrives: ETA ${eta}` };
+    }
+    const rule = String(l.pullRule || (d == null ? 'none' : '')), od = numOr(dates.orderDate);
+    const why = rule === 'etd' ? `10 days before ETD ${md(numOr(l.etd))}` : rule === 'crd' ? `5 days before CRD ${md(numOr(l.readyDate))}`
+      : rule === 'order' ? `estimated, 75 days after the order date${od != null ? ' ' + md(od) : ''}` : d == null ? 'no ETD, CRD or order date' : '';
+    if (d == null) return { day: null, main: 'no date', why, none: true };
+    const est = rule === 'order' || !!l.estimate, dateText = (est ? 'about ' : '') + fmtD(d);
+    return d < today ? { day: d, main: 'now', why: `from ${dateText}${why ? ': ' + why : ''}`, est } : { day: d, main: dateText, why, est };
+  }
+  // The ready date (CRD) and every source's date: Container Tracking's Ready Date, the PO Book's own date, Factory CRD,
+  // CRD Expected, Ship by (core/sell.js's order; the first with a date is used). Short names for the line under the date.
+  const READY_SHORT = { ctReady: 'CT ready', poBook: 'PO Book', factoryCrd: 'Factory CRD', crdExpected: 'CRD Expected', shipBy: 'Ship by', crd: 'CRD' };
+  const READY_KEYS = ['ctReady', 'poBook', 'factoryCrd', 'crdExpected', 'shipBy'];
+  function readyInfo(l) {
+    const IS = window.InvSell || {}, LBL = IS.READY_LABEL || {}, FILE = IS.READY_FILE || {};
+    const d = l.dates && typeof l.dates === 'object' ? l.dates : {}, won = String(l.readyFrom || '');
+    const have = (Array.isArray(l.readySources) ? l.readySources.map(x => ({ k: String(x && x.key), day: numOr(x && x.day), far: !!(x && x.far) }))
+      : READY_KEYS.map(k => ({ k, day: numOr(d[k]) }))).filter(x => x.day != null);
+    const disagree = hasFlag(l, 'dates-disagree');
+    const long = k => `${cap(LBL[k] || READY_SHORT[k] || k)}${FILE[k] ? ` (${FILE[k]})` : ''}`;
+    return {
+      disagree,
+      line: have.map(x => `${READY_SHORT[x.k] || x.k} ${md(x.day)}${x.k === won && have.length > 1 ? ' (used)' : x.far ? ' (wrong year?)' : ''}`).join(' · '),
+      tip: ["Ready date (CRD): the first of Container Tracking's Ready Date, the PO Book's own date, Factory CRD, CRD Expected and Ship by; a date more than a year ahead or before 2015 is skipped.",
+        ...have.map(x => `${long(x.k)}: ${fmtD(x.day)}${x.k === won ? ' (used)' : x.far ? ' (not used: more than a year ahead or before 2015, a wrong year?)' : ''}`), !have.length ? 'No source has a date.' : '',
+        disagree ? 'These dates are more than 7 days apart: check which one is right.' : ''].filter(Boolean).join('\n'),
+    };
+  }
+  // The first date a style's goods in China can be pulled: the engine's (a day, or { date, rule }), or, if it gives none
+  // at all, the earliest of its lots still in China with units left.
+  function firstPullOf(s, lots) {
+    const f = s.firstPull, open = lots.filter(l => l.inChina && units(l.available) > 0);
+    let day = null, rule = '', lot = null;
+    if (f && typeof f === 'object') { day = numOr(f.date ?? f.day); rule = String(f.rule || ''); }
+    else if (typeof f === 'number') { day = f; rule = String(s.firstPullRule || ''); }
+    if (f === undefined) { lot = open.find(l => numOr(l.pullFrom) != null) || null; day = lot ? numOr(lot.pullFrom) : null; }
+    else if (day != null) lot = open.find(l => numOr(l.pullFrom) === day) || null;
+    if (!rule && lot) rule = String(lot.pullRule || '');
+    return { day, rule, lot, est: rule === 'order' || !!s.firstPullEstimate || !!(lot && lot.estimate), open: open.length };
+  }
+  function firstArrivalOf(s, lots) {
+    const f = s.firstArrival;
+    if (typeof f === 'number') return f;
+    if (f && typeof f === 'object') return numOr(f.date ?? f.day);
+    if (f !== undefined) return null;
+    const ds = lots.filter(l => !l.inChina && units(l.available) > 0).map(l => numOr(l.arrival) ?? numOr(l.eta)).filter(d => d != null);
+    return ds.length ? Math.min(...ds) : null;
+  }
+
+  function indexSell() {
+    const byAlloc = new Map(), lotsByStyle = new Map();
+    for (const l of sell.lots) {
+      if (!l) continue;
+      if (l.allocId != null) byAlloc.set(l.allocId, l);
+      (lotsByStyle.get(l.style) || lotsByStyle.set(l.style, []).get(l.style)).push(l);
+    }
+    const upc = got('upc'), upcMap = upc && upc.byStyle instanceof Map ? upc.byStyle : null;
+    const list = [], byStyle = new Map(), cats = new Set(), facs = new Set();
+    for (const s of sell.styles) {
+      if (!s || byStyle.has(s.style)) continue;
+      const lots = (Array.isArray(s.lots) ? s.lots.filter(Boolean) : lotsByStyle.get(s.style) || []).slice().sort(lotOrder);
+      const e = idx && idx.byStyle.get(s.style), um = (upcMap && upcMap.get(s.style)) || [];
+      const pick = k => { const x = um.find(y => y && y[k]); return x ? x[k] : ''; };
+      const category = s.category || (e && e.s.category) || pick('category');
+      const factories = [...new Set([...(Array.isArray(s.factories) ? s.factories : []), ...(e && Array.isArray(e.s.factories) ? e.s.factories : []),
+        ...lots.map(l => { const a = allocOf(l); return l.factory || (a ? a.factory : ''); })].filter(Boolean))].sort();
+      const upcs = [...new Set([...(Array.isArray(s.upcs) ? s.upcs : []).map(upcText), ...lots.map(l => l.upc || '')].filter(Boolean))];
+      const desc = s.desc || (e && e.s.desc) || pick('desc');
+      const r = { s, key: s.style, styleRaw: s.styleRaw || s.style, desc, category, factories, upcs, lots,
+        fp: firstPullOf(s, lots), fa: firstArrivalOf(s, lots) };
+      r.hay = [r.key, r.styleRaw, desc, ...upcs].map(lc).join('\n');
+      list.push(r); byStyle.set(s.style, r);
+      cats.add(category || '');
+      if (factories.length) for (const f of factories) facs.add(f); else facs.add('');
+    }
+    sx = { list, byStyle, byAlloc, cats, facs, memo: new WeakMap() };
+    // The rows must add up to the engine's totals, unit for unit.
+    const KEYS = ['now', 'fromChina', 'arriving', 'total', 'soldChina', 'oversold'];
+    const off = KEYS.filter(k => typeof sell.totals[k] === 'number' && Math.abs(sell.totals[k] - list.reduce((p, r) => p + units(r.s[k]), 0)) > 1e-6);
+    if (off.length) {
+      const msg = `The page adds the styles up to different totals than the selling engine: ${off.map(k => `${SELL_TILE_LABEL[k] || k} ${fmtN(list.reduce((p, r) => p + units(r.s[k]), 0))} here, ${fmtN(sell.totals[k])} in the engine`).join('; ')}. This is a bug in Shalam Tool: tell Saul.`;
+      console.error(msg);
+      sellPageIssues = [{ source: SELL_SRC, code: 'page-sum', sheet: '', row: '', po: '', style: '', message: msg }];
+    }
+  }
+
+  // ---------- the Available to sell table ----------
+  const SELL_COLS = [
+    { k: 'style', t: 'Style', cls: 'fz f-sty' }, { k: 'desc', t: 'Description' },
+    { k: 'casePack', t: 'Case pack', n: 1, tip: 'Units in a master carton (Master on Master Sheet Live); "mixed" when its goods come in different ones' },
+    { k: 'inWh', t: 'In warehouse', n: 1, tip: 'In WH on the weekly ATS report: physical stock' },
+    { k: 'orders', t: 'Customer orders', n: 1, tip: 'Total Customer Orders on the ATS report: sold, not shipped yet' },
+    { k: 'now', t: 'Available now', b: 1, tip: 'In warehouse minus customer orders, when above zero. Orders beyond the stock come off the earliest goods from China' },
+    { k: 'fromChina', t: 'Available from China', b: 1, tip: 'Still in China (in production, ready, booked, loaded), after customer orders' },
+    { k: 'firstPull', t: 'First pull date', date: 1, tip: 'The first date goods in China can be pulled: 10 days before the ETD, else 5 days before the CRD, else about 75 days after the order date. "now": that date has passed' },
+    { k: 'arriving', t: 'Arriving', b: 1, tip: 'On the water or at port, after customer orders' },
+    { k: 'firstArrival', t: 'First arrival', date: 1, tip: 'The earliest ETA of the goods on the water or at port' },
+    { k: 'total', t: 'Total available', b: 1, sum: 1, tip: 'Available now + from China + arriving' },
+    { k: 'soldChina', t: 'Sold (ships from China)', b: 1, tip: PULL_TIP },
+  ];
+  const SELL_STOCK = ['inWh', 'orders', 'now', 'total'];
+  let sortSell = { k: 'style', dir: 1 }, sellShown = { styles: 0, all: 0 };
+  // Something a buyer can have: stock after orders (when known), goods from China or arriving.
+  const sellsAny = r => (stockOk() && units(r.s.now) > 0) || units(r.s.fromChina) > 0 || units(r.s.arriving) > 0;
+  function sellFiltered() {
+    return sx.list.filter(r => (!F.q || r.hay.includes(F.q)) && catOk(r.category) &&
+      (!F.fac || (F.fac === NONE ? !r.factories.length : r.factories.includes(F.fac))) && (!F.avail || sellsAny(r)));
+  }
+  function sellRows() {
+    const ok = stockOk(), rows = sellFiltered(), k = sortSell.k;
+    const val = k === 'style' ? r => r.styleRaw : k === 'desc' ? r => r.desc : k === 'casePack' ? r => r.s.casePack
+      : k === 'firstPull' ? r => r.fp.day : k === 'firstArrival' ? r => r.fa
+        : SELL_STOCK.includes(k) ? r => (ok ? numOr(r.s[k]) : null) : r => numOr(r.s[k]);
+    rows.sort(cmpBy(val, sortSell.dir));
+    sellShown = { styles: rows.length, all: sx.list.length };
+    return rows;
+  }
+  const sellInfo = () => `${plural(sellShown.styles, 'style')}${fOnSell() ? ` of ${fmtN(sellShown.all)}` : ''}`;
+  function stockTip(s) {
+    const net = numOr(s.stockNet) ?? (units(s.inWh) - units(s.orders));
+    return `In warehouse ${fmtN(units(s.inWh))} − customer orders ${fmtN(units(s.orders))} = ${fmtN(net)}${net < 0 ? `: the ${fmtN(-net)} ordered beyond the stock come off the earliest goods from China` : ''}. Click for its lots.`;
+  }
+  function firstPullHtml(r) {
+    const fp = r.fp;
+    if (fp.day == null) return fp.open ? '<span class="nt" title="Goods in China with no ETD, CRD or order date (listed on Problems)">no date</span>' : '';
+    // The rule in words, without the "from <date>:" a past date carries (the tooltip starts with the date).
+    const w = fp.lot ? lotWhen(fp.lot) : null, why = w ? w.why.replace(/^from [^:]*:\s*/, '').replace(/^from .*$/, '') : '';
+    const today = sellToday(), now = fp.day < today;
+    const word = now ? 'now' : (fp.est ? 'about ' : '') + fmtD(fp.day);
+    const tip = `Pull-from date ${fp.est ? 'about ' : ''}${fmtD(fp.day)}${why ? ': ' + why : ''}${now ? ` (${plural(today - fp.day, 'day')} ago)` : ''}`;
+    // "now" says since when, so a date passed months ago (a CRD nobody updated) shows.
+    return `<span class="${fp.est ? 'est' : ''}" title="${esc(tip)}">${esc(word)}</span>${now ? `<span class="u">since ${esc(md(fp.day))}</span>` : ''}`;
+  }
+  function firstArrivalHtml(r) {
+    if (r.fa == null) return '';
+    const passed = r.fa < sellToday();
+    return `<span${passed ? ' title="This ETA has passed: due now, or at port"' : ''}>${esc(fmtD(r.fa))}</span>${passed ? '<span class="u">ETA passed</span>' : ''}`;
+  }
+  // A style the ATS report has no row for, or whose In WH or customer orders on it can't be read: its stock isn't known
+  // (never 0), so its lots show in full.
+  const notOnReport = s => hasFlag(s, 'not-on-report') || s.onReport === false;
+  const stockUnknown = s => hasFlag(s, 'stock-unknown');
+  const cantRead = '<span class="nt" title="Blank or not a number on the ATS report (listed on Problems)">can\'t be read</span>';
+  function sellRowHtml(r, i) {
+    const s = r.s, ok = stockOk(), partial = ok && (notOnReport(s) || stockUnknown(s));
+    const nb = (k, v) => (v ? `<button type="button" class="nb" data-b="${k}">${fmtN(v)}</button>` : '');
+    const tags = [];
+    const maybe = [hasFlag(s, 'erp-in-transit') ? `the ATS report shows ${fmtN(s.erpInTrans)} In Trans, more than we have on the water, at port or booked (landed, not received yet?)` : '',
+      hasFlag(s, 'orders-may-include-sold') ? `${fmtN(s.soldChina)} units are sold to ship from China: the orders may be those` : ''].filter(Boolean);
+    if (units(s.oversold) > 0) tags.push(`<button type="button" class="tag ov" data-b="all" title="${esc(`Oversold by ${fmtN(s.oversold)} units: customer orders are more than the stock and every lot coming${maybe.length ? '. Check first: ' + maybe.join('; ') : ''}`)}">oversold ${fmtN(s.oversold)}</button>`);
+    if (hasFlag(s, 'erp-received')) tags.push(`<button type="button" class="tag um" data-b="all" title="${esc(`${fmtN(s.erpReceived)} units on the water or at port have an ETA on or before the ATS report's date but aren't In Trans on it: the ERP has probably received them, so they may be in Available now and in Arriving (listed on Problems)`)}">received?</button>`);
+    if (ok && notOnReport(s)) tags.push(`<span class="tag um" title="${esc(`No row on the ATS report${asOfText()}, so its customer orders aren't known: its goods from China show in full`)}">not on ATS report</span>`);
+    else if (ok && stockUnknown(s)) tags.push(`<span class="tag um" title="${esc(`Its In WH or customer orders on the ATS report${asOfText()} can't be read, so its customer orders aren't taken off: its goods from China show in full`)}">stock can't be read</span>`);
+    const upcLine = r.upcs.length ? r.upcs[0] + (r.upcs.length > 1 ? ` +${r.upcs.length - 1} more` : '') : '';
+    const tip = [r.styleRaw, r.upcs.length ? 'UPC ' + r.upcs.join(', ') : '', r.category, r.factories.length ? 'Factory ' + r.factories.join(', ') : '',
+      'Click for its stock and every lot, with their dates'].filter(Boolean).join('\n');
+    let h = `<tr class="r" data-i="${i}"><td class="fz f-sty" title="${esc(tip)}"><div class="sc"><button type="button" class="sb" data-b="all">${esc(r.styleRaw)}</button>${tags.join('')}</div><span class="u">${esc(upcLine) || '&nbsp;'}</span></td>` +
+      `<td class="desc" title="${esc(r.desc)}">${esc(r.desc)}</td>` +
+      `<td class="num"${s.casePack === 'mixed' ? ' title="Its goods come in different case packs"' : ''}>${typeof s.casePack === 'number' ? fmtN(s.casePack) : s.casePack === 'mixed' ? 'mixed' : ''}</td>`;
+    const inWh = numOr(s.inWh), orders = numOr(s.orders);
+    if (!ok) h += `<td class="nr" colspan="3" title="${esc(atsWhy())}">${esc(stockWord())}</td>`;
+    else if (notOnReport(s)) h += `<td class="nr" colspan="3" title="${esc(`This style has no row on the ATS report${asOfText()}`)}">not on report</td>`;
+    else if (stockUnknown(s)) {
+      h += `<td class="num${inWh < 0 ? ' neg' : ''}">${inWh == null ? cantRead : inWh ? fmtN(inWh) : ''}</td><td class="num">${orders == null ? cantRead : nz(orders)}</td>` +
+        '<td class="num nr" title="In WH or customer orders can\'t be read on the ATS report, so stock after orders isn\'t known (never 0)">not known</td>';
+    } else {
+      h += `<td class="num${inWh < 0 ? ' neg' : ''}">${inWh ? fmtN(inWh) : ''}</td><td class="num">${nz(orders)}</td>` +
+        `<td class="num" title="${esc(stockTip(s))}">${nb('now', numOr(s.now))}</td>`;
+    }
+    h += `<td class="num">${nb('fromChina', numOr(s.fromChina))}</td><td class="nw">${firstPullHtml(r)}</td>` +
+      `<td class="num">${nb('arriving', numOr(s.arriving))}</td><td class="nw">${firstArrivalHtml(r)}</td>`;
+    // Without the stock (no report, or not on it) Total available would be a part only: the column says so.
+    h += !ok ? `<td class="num sum nr" title="${esc(atsWhy())}">${esc(stockWord())}</td>`
+      : partial ? `<td class="num sum pt" title="Stock not known: this is from China and arriving only">${nb('total', numOr(s.total))}</td>`
+        : `<td class="num sum">${nb('total', numOr(s.total))}</td>`;
+    return h + `<td class="num">${nb('soldChina', numOr(s.soldChina))}</td></tr>`;
+  }
+
+  // ---------- its tiles: sums of the rows shown, in units and cases ----------
+  const SELL_TILE_LABEL = { now: 'Available now', fromChina: 'Available from China', arriving: 'Arriving', total: 'Total available', oversold: 'Oversold styles',
+    soldChina: 'Sold (ships from China)' };
+  const SELL_TILES = [
+    ['now', 'In warehouse minus customer orders (the ATS report), where above zero', false],
+    ['fromChina', 'Still in China (in production, ready, booked, loaded), after customer orders. Click for the lots and their pull-from dates', true],
+    ['arriving', 'On the water or at port, after customer orders. Click for the lots and their ETAs', true],
+    ['total', 'Available now + from China + arriving. Click for the lots', true],
+    ['oversold', 'Styles with more customer orders than their stock and every lot coming (each one is on Problems)', false],
+  ];
+  function sellAgg(rows) {
+    const z = () => ({ u: 0, c: 0, np: 0, lo: 0 });
+    const g = { now: z(), fromChina: z(), arriving: z(), total: z(), oversold: z(), oversoldStyles: 0 };
+    // Whole cases only (a part case is never offered as a case); the rest are loose units.
+    const add = (o, u, p) => { if (!u) return; o.u += u; if (p) { const c = Math.floor(u / p + 1e-9); o.c += c; o.lo += u - c * p; } else o.np += u; };
+    for (const r of rows) {
+      const s = r.s, p = packNum(s);
+      if (s.cases && typeof s.cases === 'object') {
+        // The engine's cases (each lot by its own Master; stock by the style's), and the units with no case pack.
+        const np = s.noCasePackUnits && typeof s.noCasePackUnits === 'object' ? s.noCasePackUnits : {};
+        const lo = s.looseUnits && typeof s.looseUnits === 'object' ? s.looseUnits : {};
+        for (const k of ['now', 'fromChina', 'arriving']) { g[k].u += units(s[k]); g[k].c += units(s.cases[k]); g[k].np += units(np[k]); g[k].lo += units(lo[k]); }
+      } else {
+        add(g.now, units(s.now), p);
+        // Cases lot by lot (each with its own Master) when the lots add up to the style's number, else by the style's.
+        for (const [k, inChina] of [['fromChina', true], ['arriving', false]]) {
+          const ls = r.lots.filter(l => !!l.inChina === inChina), want = units(s[k]);
+          if (ls.reduce((q, l) => q + units(l.available), 0) === want) for (const l of ls) add(g[k], units(l.available), lotPack(l, s));
+          else add(g[k], want, p);
+        }
+      }
+      g.total.u += units(s.total);
+      if (units(s.oversold) > 0) { g.oversoldStyles++; add(g.oversold, units(s.oversold), p); }
+    }
+    g.total.c = g.now.c + g.fromChina.c + g.arriving.c; g.total.np = g.now.np + g.fromChina.np + g.arriving.np; g.total.lo = g.now.lo + g.fromChina.lo + g.arriving.lo;
+    return g;
+  }
+  function renderSellTiles(g, L) {
+    const ok = stockOk(), why = atsWhy(), filt = fOnSell() ? '<i>filtered</i>' : '';
+    $('sellTiles').innerHTML = SELL_TILES.map(([k, tip, click]) => {
+      const t = SELL_TILE_LABEL[k];
+      if (!g) return `<div class="glass tile nl" data-t="${k}"><div class="lbl">${esc(t)}</div><div class="n">${esc(L ? L.word : 'not loaded')}</div><div class="cs"></div></div>`;
+      const needsStock = k === 'now' || k === 'total' || k === 'oversold';
+      if (needsStock && !ok) return `<div class="glass tile nl" data-t="${k}" title="${esc(why)}"><div class="lbl">${esc(t)}</div><div class="n">${esc(stockWord())}</div><div class="cs">needs the ATS report</div></div>`;
+      const o = g[k];
+      const n = k === 'oversold' ? `${fmtN(g.oversoldStyles)}<small>style${g.oversoldStyles === 1 ? '' : 's'}</small>` : `${fmtN(o.u)}<small>units</small>`;
+      const cs = k === 'oversold' ? (o.u ? `${fmtN(o.u)} units oversold` : 'none') : casesText(o.c, o.np, o.u, o.lo);
+      const warnLine = !ok && (k === 'fromChina' || k === 'arriving') ? `<div class="cs wn">customer orders not taken off</div>` : '';
+      const inner = `<div class="lbl">${esc(t)}${filt}</div><div class="n">${n}</div><div class="cs">${esc(cs)}</div>${warnLine}`;
+      const on = panel && panel.kind === 'sellTile' && panel.b === k ? ' on' : '';
+      return click ? `<button type="button" class="glass tile${on}" data-t="${k}" title="${esc(tip)}">${inner}</button>`
+        : `<div class="glass tile flat${k === 'oversold' && g.oversoldStyles ? ' bad' : ''}" data-t="${k}" title="${esc(tip)}">${inner}</div>`;
+    }).join('');
+  }
+
+  // ---------- what the tab says when it has no numbers, and the ATS report's banner ----------
+  function sellLead() {
+    const L = stageLead();
+    if (L) return { word: L.word, h: L.h === 'Loading the sources…' ? L.h : 'Available to sell is not loaded', p: L.p, short: L.short };
+    if (sellErr) {
+      return { word: 'not loaded', h: "Available to sell couldn't be worked out", p: `${cap(sellErr)}. This is a bug in Shalam Tool, not a problem in the files: tell Saul. Where it is and Pull from China still work.`,
+        short: "Not loaded: Available to sell couldn't be worked out (see the red banner)." };
+    }
+    if (!sx) return { word: 'not loaded', h: 'Available to sell is not loaded', p: '', short: 'Not loaded.' };
+    return null;
+  }
+  function renderSellBanner() {
+    const el = $('sellNote');
+    if (!sx) { el.innerHTML = ''; return; }
+    const m = atsMode(), s = st.ats || fresh('ats'), d = atsDay();
+    const mail = s.mail ? ` <i>${esc(s.mail.text)}</i>` : '';
+    let h = '';
+    if (m === 'ok' && sell.atsMissing) h = banner('err', `<b>Customer orders aren't taken off:</b> ${esc(atsWhy())}`);
+    else if (m === 'ok' && s.state === 'warn') h = banner('warn', `<b>The ATS report is ${esc(s.label)}</b>${d != null ? ` (report date ${esc(fmtD(d))})` : ''}: stock and customer orders may be out of date.${mail}`);
+    else if (m === 'bad') h = banner('err', `<b>The ATS report couldn't be used:</b> ${esc(onFromColon(s.message))} Available now says "not loaded", and customer orders aren't taken off the goods from China.${mail}`);
+    else if (m === 'none' || m === 'unset') h = banner('warn', `<b>Customer orders aren't taken off</b> until the weekly ATS report is in ${esc(atsPlace())}${m === 'unset' ? " (the ATS folder's location is blank in config.js)" : ''}: the goods from China show in full, and Available now waits for the report.`);
+    else if (m === 'unread') h = banner('warn', "<b>The ATS report wasn't read this time</b>, so customer orders aren't taken off: click Refresh.");
+    el.innerHTML = h;
+  }
+  function renderSell(toTop) {
+    if (!vtSell) return;
+    const L = sellLead();
+    $('sellState').hidden = !L;
+    if (L) { $('sellStateH').textContent = L.h; $('sellStateP').textContent = L.p; }
+    renderSellBanner();
+    const rows = sx ? sellRows() : [];
+    renderSellTiles(sx ? sellAgg(rows) : null, L);
+    vtSell.set(rows, toTop);
+    setInfo();
+  }
+
+  // ---------- its side panel: a style's lots in date order, then its stock ----------
+  const SELL_PANEL_COLS = [
+    { k: 'style', t: 'Style', many: 1 }, { k: 'status', t: 'Status' }, { k: 'po', t: 'PO' }, { k: 'units', t: 'Units', n: 1 },
+    { k: 'taken', t: 'Taken by orders', n: 1 }, { k: 'available', t: 'Available', n: 1 },
+    { k: 'when', t: 'Available from', date: 1, tip: 'In China: the pull-from date and its rule. Sailed: the ETA' },
+    { k: 'readyDate', t: 'Ready date (CRD)', date: 1, tip: "The first of Container Tracking's Ready Date, the PO Book's own date, Factory CRD, CRD Expected and Ship by, with every source's date under it" },
+    { k: 'etd', t: 'ETD', date: 1 }, { k: 'eta', t: 'ETA', date: 1 }, { k: 'flags', t: 'Flags' },
+  ];
+  const LOT_STATUS = ['No CRD', 'In production', 'Ready', 'Booked', 'Loaded', 'On the water', 'At port'];
+  let sellPanelCols = SELL_PANEL_COLS;
+  // A lot's flags, without the ones its other columns already say (now, about, taken, dates disagree, no date).
+  const LOT_SAID = ['now', 'estimate', 'part-taken', 'taken', 'dates-disagree', 'no-date'];
+  // Without the ATS report every lot's orders are unknown: the stock line says it once instead.
+  const lotFlags = l => flagText((Array.isArray(l.flags) ? l.flags : []).filter(f => !LOT_SAID.includes(f) && (f !== 'orders-unknown' || stockOk())));
+  function sellPanelRowHtml(l, i) {
+    const w = lotWhen(l), rd = readyInfo(l), a = allocOf(l), fr = (a && a.from && typeof a.from === 'object') ? a.from : {};
+    const shown = l.poShown && l.poShown !== l.po ? l.poShown : '';
+    const sr = sx && sx.byStyle.get(l.style), p = lotPack(l, sr ? sr.s : {});
+    const u = units(l.units), cases = p && u ? plural(Math.ceil(u / p - 1e-9), 'case') : '';
+    const cust = l.customer || (a && a.customer) || '';
+    const cells = {
+      style: `<td class="nw">${esc((sr && sr.styleRaw) || l.style)}<span class="u">${esc(l.upc || '') || '&nbsp;'}</span></td>`,
+      status: `<td class="nw">${esc(l.status)}<span class="u">${esc(l.inChina ? 'in China' : 'sailed')}</span></td>`,
+      po: `<td class="nw"><b>${esc(l.po)}</b><span class="u">${shown ? esc('as ' + shown) : cust ? esc(cust) : '&nbsp;'}</span></td>`,
+      units: `<td class="num">${fmtN(u)}<span class="u">${esc(cases) || '&nbsp;'}</span></td>`,
+      taken: `<td class="num">${nz(units(l.taken))}<span class="u">&nbsp;</span></td>`,
+      available: `<td class="num"><b>${nz(units(l.available))}</b><span class="u">${units(l.available) || !units(l.taken) ? '&nbsp;' : 'all taken'}</span></td>`,
+      when: `<td class="nw${w.none ? ' nt' : ''}${w.est ? ' est' : ''}" title="${esc([w.main, w.why].filter(Boolean).join(': '))}">${esc(w.main)}<span class="u">${esc(w.why) || '&nbsp;'}</span></td>`,
+      readyDate: `<td class="nw rd${rd.disagree ? ' flag' : ''}" title="${esc(rd.tip)}">${esc(fmtD(numOr(l.readyDate))) || '<span class="nt">none</span>'}${rd.disagree ? ' <b>dates disagree</b>' : ''}<span class="u">${esc(rd.line) || '&nbsp;'}</span></td>`,
+      etd: `<td class="nw">${esc(fmtD(numOr(l.etd)))}<span class="u">${numOr(l.etd) != null && fr.etd ? esc(fr.etd) : '&nbsp;'}</span></td>`,
+      eta: `<td class="nw">${esc(fmtD(numOr(l.eta)))}<span class="u">${numOr(l.eta) != null && fr.eta ? esc(fr.eta) : '&nbsp;'}</span></td>`,
+      flags: `<td class="cut flag" title="${esc(lotFlags(l))}">${esc(lotFlags(l))}<span class="u">&nbsp;</span></td>`,
+    };
+    return `<tr class="r" data-i="${i}">${sellPanelCols.map(c => cells[c.k]).join('')}</tr>`;
+  }
+  function sellFilterWords() {
+    const w = [];
+    if (F.q) w.push(`search "${F.q}"`);
+    if (F.fac) w.push(`factory ${F.fac === NONE ? '(none)' : F.fac}`);
+    if (F.cat) w.push(`category ${F.cat === NONE ? '(none)' : F.cat}`);
+    if (F.avail) w.push('only styles with something available');
+    return w.join(', ');
+  }
+  // The stock line under a style's lots.
+  function stockLine(r) {
+    const s = r.s, of = asOfText(), has = r.lots.length > 0;
+    const full = has ? 'the lots above show in full' : 'and it has no open lot from China';
+    if (!stockOk()) return `Stock: ${stockWord()}. ${atsWhy()} Customer orders aren't taken off${has ? ': the lots above show in full' : ''}.`;
+    if (notOnReport(s)) return `Stock: not on the ATS report${of}, so its customer orders aren't known${has ? ': the lots above show in full' : ''}.`;
+    if (stockUnknown(s) || numOr(s.inWh) == null || numOr(s.orders) == null) {
+      return `Stock (ATS report${of}): in warehouse ${numOr(s.inWh) == null ? "can't be read" : fmtN(s.inWh)}, customer orders ${numOr(s.orders) == null ? "can't be read" : fmtN(s.orders)}: stock after orders isn't known (never 0), so customer orders aren't taken off${has ? ' and ' + full : ''}.`;
+    }
+    const net = numOr(s.stockNet) ?? (s.inWh - units(s.orders));
+    let t = `Stock (ATS report${of}): ${fmtN(s.inWh)} in warehouse − ${fmtN(units(s.orders))} customer orders = ${fmtN(net)} net`;
+    // Cross-checks with the ATS report (listed on Problems; never counted).
+    const notes = [hasFlag(s, 'erp-received') ? ` Check: ${fmtN(s.erpReceived)} units on the water or at port have an ETA on or before the report's date but aren't In Trans on it, so the ERP has probably received them already: they may be counted twice (in stock and arriving).` : '',
+      hasFlag(s, 'erp-in-transit') ? ` Check: the ATS report shows ${fmtN(s.erpInTrans)} In Trans, ${fmtN(s.erpInTransBeyond)} more than we have on the water, at port or booked with an ETD: probably goods that have landed but aren't received yet, which may cover these orders (not counted here).` : '',
+      hasFlag(s, 'orders-may-include-sold') ? ` Check: ${fmtN(s.soldChina)} units of this style are sold to ship from China; if those orders are in the ERP's customer orders, they're taken off twice.` : ''].join('');
+    if (net >= 0) return t + (net ? `: ${fmtN(net)} available now.` : ': nothing available now.') + notes;
+    if (!has) return t + `: ${fmtN(-net)} more ordered than in stock, ${full}: oversold.` + notes;
+    const taken = r.lots.reduce((p, l) => p + units(l.taken), 0);
+    t += `: the ${fmtN(-net)} ordered beyond the stock come off the earliest lots above (${fmtN(taken)} taken)`;
+    return t + (units(s.oversold) ? `, and ${fmtN(s.oversold)} more than every lot holds: oversold.` : '.') + notes;
+  }
+  function renderSellPanel(toTop) {
+    const p = panel;
+    sellPanelCols = SELL_PANEL_COLS.filter(c => !c.many || p.kind === 'sellTile');
+    const stockEl = $('panelStock');
+    if (!sx) {
+      $('panelSub').textContent = 'Available to sell is not loaded, so there is nothing to show now.';
+      $('panelNote').textContent = ''; stockEl.hidden = true;
+      vtPanel.set([], toTop);
+      return;
+    }
+    let lots = [], r = null, rowsShown = null;
+    if (p.kind === 'sell') { r = sx.byStyle.get(p.key) || null; lots = r ? r.lots.slice() : []; }
+    else {
+      rowsShown = sellFiltered();
+      lots = rowsShown.flatMap(x => x.lots).filter(l => (p.b === 'fromChina' ? l.inChina : p.b === 'arriving' ? !l.inChina : true));
+    }
+    let rows = lots.slice().sort((a, b) => lotOrder(a, b) || String(a.style).localeCompare(String(b.style)));
+    if (sortPanel) {
+      const k = sortPanel.k;
+      rows = rows.sort(cmpBy(l => (k === 'when' ? lotDay(l) : k === 'status' ? LOT_STATUS.indexOf(l.status) + 1 || null : k === 'flags' ? lotFlags(l)
+        : k === 'style' ? (sx.byStyle.get(l.style) || {}).styleRaw || l.style : ['units', 'taken', 'available', 'readyDate', 'etd', 'eta'].includes(k) ? numOr(l[k]) : l[k]), sortPanel.dir));
+    }
+    const sum = (list, f) => list.reduce((q, l) => q + units(f(l)), 0);
+    const china = lots.filter(l => l.inChina), sailed = lots.filter(l => !l.inChina);
+    const left = sum(lots, l => l.available), aChina = sum(china, l => l.available), aSailed = sum(sailed, l => l.available);
+    const parts = [plural(lots.length, 'lot'), aChina ? `${fmtN(aChina)} available from China` : '', aSailed ? `${fmtN(aSailed)} arriving` : '',
+      sum(lots, l => l.taken) ? `${fmtN(sum(lots, l => l.taken))} taken by customer orders` : '', lots.length && !left ? 'nothing left to sell in them' : ''];
+    if (r) {
+      if (units(r.s.soldChina)) parts.push(`${fmtN(r.s.soldChina)} sold (ships from China), not available`);
+      if (units(r.s.unmatched)) parts.push(`${fmtN(r.s.unmatched)} on Container Tracking with no Master Sheet Live line, not available`);
+    }
+    $('panelSub').textContent = parts.filter(Boolean).join(' · ');
+    $('panelNote').textContent = p.kind === 'sell' ? (r ? '' : "This style isn't on Available to sell now (it may have shipped, or its style changed).")
+      : fOnSell() ? `Filters on: ${sellFilterWords()}.` : '';
+    let stock = '';
+    if (r) stock = stockLine(r);
+    else if (p.kind === 'sellTile' && p.b === 'total' && rowsShown) stock = stockOk() ? `Plus ${fmtN(rowsShown.reduce((q, x) => q + units(x.s.now), 0))} available now from stock (not lots, so not listed).` : `Stock: ${stockWord()}. ${atsWhy()}`;
+    stockEl.textContent = stock; stockEl.hidden = !stock;
+    vtPanel.set(rows, toTop);
+  }
+
+  // ---------- on the Pull from China tab: each open line's pull-from date and what's left after orders ----------
+  function pullSell(r) {
+    if (!sx || !r) return null;
+    let v = sx.memo.get(r);
+    if (v) return v;
+    const ids = Array.isArray(r.allocs) ? r.allocs : [];
+    const lots = ids.map(id => sx.byAlloc.get(id)).filter(Boolean).sort(lotOrder);
+    let sold = 0;
+    for (const id of ids) { const a = idx && idx.byId.get(id); if (a && a.bucket === 'pullFromChina') sold += units(a.units); }
+    const soldLine = ptypeOf(r) === 'China Pickup' || hasFlag(r, 'pull-section');
+    const first = lots.find(l => lotDay(l) != null) || lots[0] || null;
+    v = { lots, sold, soldOnly: !lots.length && (sold > 0 || soldLine), avail: lots.length ? lots.reduce((q, l) => q + units(l.available), 0) : null,
+      taken: lots.reduce((q, l) => q + units(l.taken), 0), when: first ? lotWhen(first) : null, dates: new Set(lots.map(lotDay).filter(d => d != null)).size };
+    sx.memo.set(r, v);
+    return v;
+  }
+  const pullSellVal = (r, k) => { const v = pullSell(r); if (!v || v.soldOnly) return null; return k === 'day' ? (v.when ? v.when.day : null) : v.avail; };
+  function pullSellCells(r) {
+    if (!sx) { const w = sellErr ? 'not loaded' : ''; return `<td class="nw nt">${w}<span class="u">&nbsp;</span></td><td class="num nt">${w}<span class="u">&nbsp;</span></td>`; }
+    const v = pullSell(r);
+    if (v.soldOnly) {
+      return `<td class="nw nt" title="${esc(PULL_TIP)}">Sold<span class="u">ships from China</span></td><td class="num nt" title="Sold: never available to sell">Sold<span class="u">&nbsp;</span></td>`;
+    }
+    if (!v.lots.length) return '<td class="nw"><span class="u">&nbsp;</span></td><td class="num"><span class="u">&nbsp;</span></td>';
+    const w = v.when, more = v.dates > 1 ? ` (+${v.dates - 1} later date${v.dates > 2 ? 's' : ''}: the side panel has them)` : '';
+    const ok = stockOk();
+    const under = [v.taken ? `${fmtN(v.taken)} taken` : '', v.sold ? `${fmtN(v.sold)} sold` : '', !ok ? 'orders not taken off' : ''].filter(Boolean).join(' · ');
+    return `<td class="nw${w.none ? ' nt' : ''}${w.est ? ' est' : ''}" title="${esc([w.main, w.why].filter(Boolean).join(': ') + more)}">${esc(w.main)}<span class="u">${esc(w.why) || '&nbsp;'}</span></td>` +
+      `<td class="num" title="${esc(`${fmtN(units(r.units))} units on the line${v.taken ? `; ${fmtN(v.taken)} taken by customer orders beyond the stock` : ''}${v.sold ? `; ${fmtN(v.sold)} sold, ships from China` : ''}${!ok ? `. ${atsWhy()} Customer orders aren't taken off.` : ''}`)}">` +
+      `${v.avail ? fmtN(v.avail) : v.taken ? '<span class="nt">all taken</span>' : ''}<span class="u">${esc(under) || '&nbsp;'}</span></td>`;
   }
 
   // ---------- the side panel: the allocations behind a number ----------
@@ -1893,7 +2484,7 @@
       if (!catOk(e.s.category || '')) continue;
       const sHit = !F.q || styleHit(e.s);
       for (const a of e.allocs) {
-        if (!passes(a, sHit) || (pick && !pick.has(a.bucket)) || (p.upc != null && (a.upc || '') !== p.upc)) continue;
+        if (!passes(a, sHit, !!p.sellView) || (pick && !pick.has(a.bucket)) || (p.upc != null && (a.upc || '') !== p.upc)) continue;
         out.push(a);
       }
     }
@@ -1921,7 +2512,12 @@
     };
     return `<tr class="r" data-i="${i}">${panelCols.map(c => cells[c.k]).join('')}</tr>`;
   }
-  const markTile = () => { for (const t of $('tiles').querySelectorAll('.tile[data-t]')) t.classList.toggle('on', !!panel && panel.kind === 'tile' && panel.b === t.dataset.t); };
+  const markTile = () => {
+    for (const t of $('tiles').querySelectorAll('.tile[data-t]')) t.classList.toggle('on', !!panel && panel.kind === 'tile' && panel.b === t.dataset.t);
+    for (const t of $('sellTiles').querySelectorAll('.tile[data-t]')) t.classList.toggle('on', !!panel && panel.kind === 'sellTile' && panel.b === t.dataset.t);
+  };
+  const isSellPanel = () => !!panel && (panel.kind === 'sell' || panel.kind === 'sellTile');
+  const curPanelCols = () => (isSellPanel() ? sellPanelCols : panelCols);
   function openPanel(p, from) {
     panel = p; panelFrom = from || null; sortPanel = null;
     $('panel').hidden = false;
@@ -1939,6 +2535,8 @@
   }
   function panelTitle(p) {
     const e = idx && idx.byStyle.get(p.key), name = (e && (e.s.styleRaw || e.s.style)) || p.key || '';
+    if (p.kind === 'sell') { const r = sx && sx.byStyle.get(p.key); return `${(r && r.styleRaw) || name}: available to sell`; }
+    if (p.kind === 'sellTile') return `${SELL_TILE_LABEL[p.b] || p.b}: every style`;
     if (p.kind === 'tile') return `${BUCKET_LABEL[p.b]}: every style`;
     if (p.kind === 'pull') return `PO ${p.po}${p.poShown ? ` (${p.poShown})` : ''} · ${p.name || p.key}${p.upc ? ' · UPC ' + p.upc : ''}`;
     const upc = p.upc != null ? ` · UPC ${p.upc || 'none'}` : '';
@@ -1957,6 +2555,9 @@
   function renderPanel(toTop) {
     if (!panel) return;
     $('panelTitle').textContent = panelTitle(panel);
+    $('panelLbl').textContent = isSellPanel() ? 'What can be sold' : 'Behind this number';
+    if (isSellPanel()) { renderSellPanel(toTop); return; }
+    $('panelStock').hidden = true;
     panelCols = PANEL_COLS.filter(c => !c.many || panel.kind === 'tile');
     if (!idx) {
       $('panelSub').textContent = 'The stage numbers are not loaded, so there is nothing behind them now.';
@@ -1985,7 +2586,7 @@
       um ? `${fmtN(um)} units unmatched (never in the stage numbers)` : '', cs,
       outside ? `${fmtN(outside)} units not counted (${Object.entries(outBy).map(([b, n]) => `${fmtN(n)} ${OUT_WORD[b] || stageText(b).toLowerCase()}`).join(', ')})` : ''].filter(Boolean).join(' · ');
     $('panelNote').textContent = panel.kind === 'pull' ? (panel.gone ? "This line isn't on Master Sheet Live as it was (its PO or style changed, or it shipped): showing this style's lines on the PO instead." : '')
-      : fOn() ? `Filters on: ${filterWords()}.` : '';
+      : panel.sellView ? (fOnSell() ? `Filters on: ${sellFilterWords()}.` : '') : fOn() ? `Filters on: ${filterWords()}.` : '';
     vtPanel.set(rows, toTop);
   }
 
@@ -2000,7 +2601,7 @@
     const b = stages.balance, by = {};
     for (const a of stages.allocs) if (a && !CT_ONLY.includes(a.bucket)) by[a.bucket] = (by[a.bucket] || 0) + units(a.units);
     const inChina = IN_CHINA.reduce((p, k) => p + (by[k] || 0), 0);
-    const parts = [[inChina, 'in China'], [by.water, 'on the water'], [by.port, 'at port'], [by.landed, 'landed'], [by.pullFromChina, 'to pull from China'],
+    const parts = [[inChina, 'in China'], [by.water, 'on the water'], [by.port, 'at port'], [by.landed, 'landed'], [by.pullFromChina, 'sold, shipping from China'],
       [by.short, 'short-shipped'], [by.shippedNotOnCt, 'shipped, not on Container Tracking (treated as landed)'],
       [by.duplicate, 'repeats of a line already inside a Round (shipped once)']].filter(([n]) => n);
     const sum = parts.reduce((p, [n]) => p + n, 0);
@@ -2040,6 +2641,7 @@
     try {
       renderLead();
       renderFilterLists();
+      renderSell(toTop);
       renderInv(toTop);
       renderPull(toTop);
       renderPanel(false);
@@ -2053,11 +2655,28 @@
   function bindStageUi() {
     const cellOf = (vt, e) => { const tr = e.target.closest('tr.r'); return tr ? vt.rows[+tr.dataset.i] : null; };
     vtInv = vtable('invPane', 'invTable', { cols: () => INV_COLS.length, head: () => sortHead(INV_COLS, sortInv), row: invRowHtml,
-      empty: () => emptyText(fOn() ? 'Nothing matches these filters.' : 'No styles with goods in China, on the way or to pull.') });
+      empty: () => emptyText(fOn() ? 'Nothing matches these filters.' : 'No styles with goods in China, on the way or sold from China.') });
     vtPull = vtable('pullPane', 'pullTable', { rowH: 40, cols: () => PULL_COLS.length, head: () => sortHead(PULL_COLS, sortPull), row: pullRowHtml,
       empty: () => emptyText(fOn() ? 'No open line matches these filters.' : 'No open lines on Master Sheet Live.') });
-    vtPanel = vtable('panelPane', 'panelTable', { cols: () => panelCols.length, head: () => sortHead(panelCols, sortPanel), row: panelRowHtml,
-      empty: () => (idx ? 'No lines behind this number now.' : 'Not loaded.') });
+    vtSell = vtable('sellPane', 'sellTable', { rowH: 40, cols: () => SELL_COLS.length, head: () => sortHead(SELL_COLS, sortSell), row: sellRowHtml,
+      empty: () => esc(sellLead() ? sellLead().short : F.avail || fOnSell() ? 'No style matches these filters.' : 'No styles on the ATS report or with goods coming.') });
+    // The side panel draws either the lines behind a stage number or a style's lots (Available to sell).
+    vtPanel = vtable('panelPane', 'panelTable', { cols: () => curPanelCols().length, head: () => sortHead(curPanelCols(), sortPanel),
+      row: (r, i) => (isSellPanel() ? sellPanelRowHtml(r, i) : panelRowHtml(r, i)),
+      empty: () => (isSellPanel() ? (sx ? 'Nothing coming from China or on the water for this.' : 'Not loaded.') : idx ? 'No lines behind this number now.' : 'Not loaded.') });
+    $('sellTable').addEventListener('click', e => {
+      const th = e.target.closest('th[data-s]');
+      if (th) { sortSell = nextSort(sortSell, SELL_COLS, th.dataset.s); renderSell(true); return; }
+      const btn = e.target.closest('button[data-b]'), r = btn && cellOf(vtSell, e);
+      if (!r) return;
+      // Sold (ships from China) isn't a lot: its lines are the stage panel's.
+      if (btn.dataset.b === 'soldChina') openPanel({ kind: 'cell', key: r.key, b: 'pullFromChina', sellView: true }, btn);
+      else openPanel({ kind: 'sell', key: r.key, b: btn.dataset.b }, btn);
+    });
+    $('sellTiles').addEventListener('click', e => {
+      const t = e.target.closest('button.tile[data-t]');
+      if (t) openPanel({ kind: 'sellTile', b: t.dataset.t }, t);
+    });
     $('invTable').addEventListener('click', e => {
       const th = e.target.closest('th[data-s]');
       if (th) { sortInv = nextSort(sortInv, INV_COLS, th.dataset.s); renderInv(true); return; }
@@ -2074,9 +2693,11 @@
     });
     $('panelTable').addEventListener('click', e => {
       const th = e.target.closest('th[data-s]');
-      if (th) { sortPanel = nextSort(sortPanel, panelCols, th.dataset.s); renderPanel(true); }
+      if (th) { sortPanel = nextSort(sortPanel, curPanelCols(), th.dataset.s); renderPanel(true); }
     });
     $('tiles').addEventListener('click', e => {
+      const go = e.target.closest('[data-go]');
+      if (go) { showTab(go.dataset.go); return; }
       const t = e.target.closest('button.tile[data-t]');
       if (t) openPanel({ kind: 'tile', b: t.dataset.t }, t);
     });
@@ -2084,11 +2705,16 @@
     document.addEventListener('keydown', e => { if (e.key === 'Escape' && panel) { e.preventDefault(); closePanel(); } });
     // Filters: the rows, the tiles and an open panel follow them.
     let ft = null;
-    const apply = () => { $('btnClearF').hidden = !fOn(); renderInv(true); renderPull(true); renderPanel(true); };
+    const apply = () => { $('btnClearF').hidden = !filtersOn(); renderSell(true); renderInv(true); renderPull(true); renderPanel(true); };
     $('fq').addEventListener('input', e => { clearTimeout(ft); ft = setTimeout(() => { F.q = e.target.value.trim().toLowerCase(); apply(); }, 150); });
     for (const [id, k] of [['fFac', 'fac'], ['fCat', 'cat'], ['fStage', 'stage'], ['fType', 'type']]) $(id).addEventListener('change', e => { F[k] = e.target.value; apply(); });
-    $('btnClearF').onclick = () => { Object.assign(F, { q: '', fac: '', cat: '', stage: '', type: '' }); $('fq').value = ''; renderFilterLists(); apply(); };
-    addEventListener('resize', () => { fitPanes(); if (tab === 'inv') vtInv.redraw(); else if (tab === 'pull') vtPull.redraw(); if (panel) vtPanel.redraw(); });
+    $('fAvail').addEventListener('change', e => { F.avail = e.target.checked; apply(); });
+    // Clear clears every filter, the ones hidden on this tab too, so none stays on unseen.
+    $('btnClearF').onclick = () => {
+      Object.assign(F, { q: '', fac: '', cat: '', stage: '', type: '', avail: false });
+      $('fq').value = ''; renderFilterLists(); apply();
+    };
+    addEventListener('resize', () => { fitPanes(); if (tab === 'sell') vtSell.redraw(); else if (tab === 'inv') vtInv.redraw(); else if (tab === 'pull') vtPull.redraw(); if (panel) vtPanel.redraw(); });
     // Problems: checked marks and the switch that shows them.
     $('issTable').addEventListener('change', e => {
       const ck = e.target.closest('input.ck');
@@ -2117,7 +2743,7 @@
     $('btnRefresh').hidden = false; $('who').hidden = false;
     $('who').innerHTML = `<b>${esc(account.name || account.username || '')}</b><button type="button" class="ghost" id="btnSignout" title="Sign out of Shalam Tool">Sign out</button>`;
     $('btnSignout').onclick = signOut;
-    showTab(store.get('tab') || 'inv');
+    showTab(store.get('tab2') || 'sell');
     store.prune('loc:', text => SOURCES.some(x => locText(x.k) === text));   // locations no longer in config.js
     scopeFatal = '';
     renderAll();
@@ -2176,7 +2802,8 @@
     bindUi();
     startBg();
     const parts = [['InvCommon', 'core/common.js'], ['PoBookCore', 'core/pobook.js'], ['InvUpc', 'core/upc.js'], ['InvCT', 'core/ct.js'],
-      ['InvShipping', 'core/shipping.js'], ['InvStages', 'core/stages.js'], ['XLSX', 'vendor/xlsx-js-style/xlsx.bundle.js']];
+      ['InvShipping', 'core/shipping.js'], ['InvStages', 'core/stages.js'], ['InvAts', 'core/ats.js'], ['InvSell', 'core/sell.js'],
+      ['XLSX', 'vendor/xlsx-js-style/xlsx.bundle.js']];
     const missing = parts.filter(([name]) => !window[name]).map(p => p[1]);
     if (missing.length) { showSignin(`Part of the page didn't load (${missing.join(', ')}). Reload the page; if it keeps happening, tell Saul.`, true); return; }
     initAuth();

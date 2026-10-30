@@ -1,11 +1,15 @@
 // The page in headless Edge against a stand-in for SharePoint: a fake sign-in (never a real one), a fake Graph that
 // answers from invented workbooks, a test config.js with invented locations, and checks on the chips, banners, the
 // error email, the read-only rules and the tabs. The step 2 scenarios (s2-…) compare every stage number the page shows
-// with core/stages.js run here on the same files.
-//   node tests/headless/run.mjs [scenario,scenario…]      (default: all but s2-real)
+// with core/stages.js run here on the same files; the Available to sell scenarios (sell-…, ats…) compare the selling
+// view with core/ats.js and core/sell.js run here on the same files, and check Saul's pull-from date rule lot by lot
+// on their own (10 days before the ETD; else 5 days before the CRD; else about 75 days after the order date).
+//   node tests/headless/run.mjs [scenario,scenario…]      (default: all but s2-real and sell-real)
 //   REAL_DIR=<folder> [REAL_LISTS=<lists.json>] node tests/headless/run.mjs s2-real
-// s2-real runs only when named: the page on local copies of the real files (served on 127.0.0.1 only; numbers printed,
-// nothing else). <folder> as for tools/check-real.mjs; the lists default to <folder>/lists.json.
+//   REAL_DIR=<folder> REAL_ATS=<ATS report.xlsx> node tests/headless/run.mjs sell-real
+// s2-real and sell-real run only when named: the page on local copies of the real files (served on 127.0.0.1 only;
+// numbers printed, nothing else). <folder> as for tools/check-real.mjs; the lists default to <folder>/lists.json;
+// sell-real serves the ATS report as saved yesterday, with yesterday's date in its name.
 // Edge runs InPrivate, with sync off and a new throwaway profile; each scenario gets its own fresh browser context;
 // every request that isn't to 127.0.0.1 is blocked. Screenshots go to .tmp/. Exits 1 when any check fails.
 import { createServer } from 'node:http';
@@ -49,6 +53,8 @@ const NAMES = { msl: 'Master Sheet Live', tracker: 'PO Status Tracker', pobook: 
 
 const X = loadXLSX();
 const C = core('common'), PB = core('pobook'), CT = core('ct'), SH = core('shipping'), UPC = core('upc'), ST = core('stages');
+const ATS = core('ats'), SELL = core('sell');
+const TODAY = C.todayNY(Date.now());   // the page works its dates out from the same clock
 const iso = days => new Date(Date.now() - days * 864e5).toISOString();
 const fmtN = v => (typeof v === 'number' ? v.toLocaleString('en-US') : String(v));
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -56,7 +62,7 @@ const sha = t => createHash('sha256').update(t, 'utf8').digest('hex');
 
 // ------------------------------------------------------------------ invented source files
 
-function buildFixtures() {
+function buildFixtures(today) {
   const bytes = new Map();
   const TH = ['PO#', 'Supplier', 'Order date', 'Item Description', 'Style #', 'Item Type', 'Order Type', 'Customer',
     'Customer 1st Ship Date', 'CRD Expected', 'Factory CRD', 'Delayed CRD'];
@@ -176,6 +182,72 @@ function buildFixtures() {
     }));
   }
 
+  // ---- Available to sell. The ERP's weekly ATS report as the real one is laid out: sheet "Report", a title row, the
+  // header, one row per style and warehouse (numbers sometimes stored as text), and a "Grand Total" row the rows' In WH
+  // must add up to (o.grand: another total, so it doesn't).
+  const AH = ['Color Code', 'Style', 'Style Description', 'Category', 'Sub Category', 'Warehouse', 'In WH', 'Total Customer Orders', 'ATS from in WH',
+    'ATS from In Trans', 'In Trans Qty', 'Import PO Backlog Qty', 'ETA Date', 'ETD Date'];
+  const ar = (sty, inWh, ord, ats, wh = 'LA') => ['C1', sty, 'Desc ' + sty, 'Lip', 'Gloss', wh, inWh, ord,
+    ats !== undefined ? ats : typeof inWh === 'number' && typeof ord === 'number' ? inWh - ord : null, null, null, null, null, null];
+  const atsBook = (rows, o = {}) => {
+    const sum = j => rows.reduce((s, r) => s + (Number(String(r[j] ?? '').replace(/,/g, '')) || 0), 0);
+    return xlsxBytes({ Report: [['Inventory Report - On Hand_In Transit_In Production (invented)'], o.header || AH, ...rows,
+      ['Grand Total', null, null, null, null, null, o.grand ?? sum(6), sum(7), null, null, null, null, null, null]] });
+  };
+  // The standard small files: AB-100's orders take its lot on the water and more; ZZ-900 on two warehouses; QQ-77 on
+  // the report only.
+  const smallAts = [ar('AB-100', 100, 700), ar('AB-200', '50', 0, '50'), ar('ZZ-900', 1000, 200), ar('QQ-77', 300, 0), ar('ZZ-900', 5, 0, 5, 'NJ')];
+  bytes.set('ats.xlsx', atsBook(smallAts));
+  bytes.set('ats-nocol.xlsx', atsBook(smallAts, { header: AH.map(h => (h === 'Total Customer Orders' ? 'Orders Total' : h)) }));
+
+  // A small set for the selling view, dated around today so each pull-from rule gives a date of its own:
+  //   SL-101 Booked, ETD in 30 days (10 days before the ETD) · SL-102 two lots in production, CRDs in 40 and 90 days
+  //   (5 days before the CRD), customer orders beyond its stock take the first lot and part of the second · SL-103 no
+  //   CRD and no Ship by (about 75 days after the order date), not on the ATS report · SL-104 Ready, CRD passed ("now"),
+  //   oversold · SL-105 shipped, on the water (its ETA) · SL-106 Factory CRD and CRD Expected 20 days apart (dates
+  //   disagree) · SL-107 China Pickup (sold) · SL-108 on the ATS report only · SL-109 Ready, CRD passed ("now"), part
+  //   taken by orders.
+  const sd = d => C.fmtDay(today + d), sser = d => today + d + 25569;
+  const sellLines = [   // [style, PO, quantity, Master, order date, CRD Expected, Factory CRD, Ship by, order type, UPC] (days from today)
+    ['SL-105', 900506, 2400, 24, -90, -40, -40, -40, 'Stock', '000000005055'],
+    ['SL-101', 900501, 1200, 24, -60, 42, 40, 41, 'Stock', '000000005017'],
+    ['SL-102', 900502, 1200, 12, -60, 40, 40, 40, 'Stock', '000000005024'],
+    ['SL-102', 900503, 480, 12, -60, 90, 90, 90, 'Stock', '000000005024'],
+    ['SL-103', 900504, 600, 12, -10, null, null, null, 'Stock', '000000005031'],
+    ['SL-104', 900505, 1200, 24, -60, -20, -20, -20, 'Stock', '000000005048'],
+    ['SL-106', 900507, 960, 24, -60, 60, 40, 40, 'Stock', '000000005062'],
+    ['SL-107', 900508, 720, 24, -60, 30, 30, 30, 'China Pickup', '000000005079'],
+    ['SL-109', 900509, 600, 12, -60, -12, -12, -12, 'Stock', '000000005093']];
+  const sOpt = d => (d == null ? null : sd(d));
+  bytes.set('trk-sell.xlsx', xlsxBytes({ 'PO Status Tracker': [TH, ...sellLines.map(([sty, po, , , od, exp, fcrd, , type]) =>
+    [po, 'Factory S', sd(od), 'Item ' + sty, sty, 'Cosmetics', type, type === 'China Pickup' ? 'Customer 2' : 'Customer 1', sd(120), sOpt(exp), sOpt(fcrd), null])] }));
+  const sm = ([sty, po, qty, master, od, , , sb, , upc]) => ['Lip', 'Gloss', 'Brand S', 'Item ' + sty, sty, upc, 6, master, 2, qty, null, String(po), 'Factory S', sd(od), null, sOpt(sb), null];
+  bytes.set('msl-sell.xlsx', xlsxBytes({ 'Master Sheet Live': [MH, sm(sellLines[0]), m('Round 1', null, null, null), ...sellLines.slice(1).map(sm)] }));
+  bytes.set('ct-sell.xlsx', xlsxBytes({
+    'Booking vs Master PO Comp': [['PO', 'Style']],
+    Booking: [BOOK, row(BOOK, { Category: 'Round 380' }),
+      row(BOOK, { Style: 'SL-101', Barcode: '000000005017', Master: 24, Quantity: 1200, 'PO Number': 900501, Company: 'Factory S' })],
+    Loaded: [LOAD, row(LOAD, { Category: 'Loaded' }), row(LOAD, { Category: 'Round 381' }),
+      row(LOAD, { Style: 'SL-105', Barcode: '000000005055', Master: 24, Quantity: 2400, 'Po Number': 900506, Company: 'Factory S', 'Ready Date': sser(-38) })],
+    Open: [CONT, row(CONT, { 'ID#': 1, 'Container #': 'GGGU1111111', 'Round #': 380, ETD: sser(30), ETA: sser(60), Factory: 'Factory S', 'PO#': '900501' }),
+      row(CONT, { 'ID#': 2, 'Container #': 'FFFU5555555', 'Round #': 381, ETD: sser(-5), ETA: sser(20), Factory: 'Factory S', 'PO#': '900506' })],
+    Complete: [CONT, row(CONT, { 'ID#': 'Complete Shipments' }), row(CONT, { 'ID#': 3, 'Container #': 'EEEU3333333', 'Round #': 300, ETD: ser(2026, 6, 5), ETA: ser(2026, 7, 5) })],
+  }));
+  // SL-101's "ATS from in WH" isn't In WH − Total Customer Orders (listed); SL-105's numbers are stored as text.
+  const sellAts = [ar('SL-101', 1000, 200, 700), ar('SL-102', 100, 1600), ar('SL-104', 0, 5000), ar('SL-105', '300', '0', '300'),
+    ar('SL-106', 0, 0), ar('SL-107', 0, 0), ar('SL-108', 50, 0), ar('SL-109', 0, 100)];
+  bytes.set('ats-sell.xlsx', atsBook(sellAts));
+  bytes.set('ats-sell-bad.xlsx', atsBook(sellAts, { grand: 9999 }));
+
+  // The big set's report: every third style, some with more customer orders than stock (taken off their lots, or
+  // oversold), and three styles on the report only.
+  {
+    const rows = [];
+    for (let i = 0; i < 2400; i += 3) rows.push(ar('ST' + String(i).padStart(4, '0'), (i % 5) * 100, (i % 4) * 400));
+    rows.push(ar('ERP-1', 500, 0), ar('ERP-2', 0, 240), ar('ERP-3', 1200, 1200));
+    bytes.set('ats-big.xlsx', atsBook(rows));
+  }
+
   // The PO Book page, served at /po-book/index.html: its CORE block as copied into core/pobook.js, or changed.
   const block = PB.coreText(readFileSync(join(REPO, 'core', 'pobook.js'), 'utf8'));
   const poBook = body => `<!doctype html><html><head><title>PO Book</title></head><body><script>\n/*CORE-START*/${body}/*CORE-END*/\n</script></body></html>`;
@@ -209,6 +281,75 @@ function stagesFor(fx, today, f = {}) {
   const upc = f.upc ? UPC.fromListItems(f.upc) : null;
   return ST.build({ po, mrows, ct: ok(ct), forwarder: ok(fwd), drayage: ok(dray), upc: ok(upc), today, sections: f.sections });
 }
+// Available to sell on the same files, as app.js builds it: the stage engine, the ATS report read with core/ats.js under
+// the name the stand-in gives it (f.ats: the world's ats option; its date is in the name), and UPC_MASTER. A report
+// that fails is passed as null, as on the page. { R, A (parseAts's result, or null), S (buildSell's, or null) }.
+function sellFor(fx, today, f = {}) {
+  const R = stagesFor(fx, today, f);
+  const A = f.ats && !f.ats.empty ? ATS.parseAts(X, X.read(fx.bytes.get(f.ats.file || 'ats.xlsx'), XOPT), atsName(f.ats), today) : null;
+  const upc = UPC.fromListItems(f.upc || fx.upcPages.flat());
+  const S = R.ok ? SELL.buildSell({ stages: R, ats: A && A.ok ? A : null, today, upc: upc.ok ? upc : null }) : null;
+  return { R, A, S };
+}
+// Saul's rule, worked out here on its own from each lot's dates (not with core/sell.js's code): still in China, 10 days
+// before the ETD; no ETD, 5 days before the ready date (the first of Container Tracking's Ready Date, the PO Book's own
+// date, Factory CRD, CRD Expected, Ship by); no ready date, 75 days after the order date (an estimate, its range from the
+// order date). Sailed: the ETA. A date before today is "now"; ready dates more than 7 days apart disagree (in China).
+// Also each lot's units = taken + available. Answers one line per lot that breaks a rule.
+const READY_KEYS = ['ctReady', 'poBook', 'factoryCrd', 'crdExpected', 'shipBy'];
+const isDay = v => typeof v === 'number' && Number.isFinite(v);
+// A source more than a year ahead or before 2015 (a wrong year) isn't used, unless every source is.
+const readyPick = (src, today) => src.find(x => !(x > today + 366 || x < C.ymd(2015, 1, 1))) ?? (src.length ? src[0] : null);
+function ruleMismatches(S, today) {
+  const bad = [];
+  for (const l of S.lots) {
+    const d = l.dates || {}, src = l.dates ? READY_KEYS.map(k => d[k]).filter(isDay) : isDay(l.crd) ? [l.crd] : [];
+    const ready = readyPick(src, today), why = [];
+    if ((l.readyDate ?? null) !== ready) why.push(`ready date ${l.readyDate}, not ${ready}`);
+    if (l.inChina) {
+      const w = isDay(l.etd) ? [l.etd - 10, 'etd'] : ready != null ? [ready - 5, 'crd'] : isDay(d.orderDate) ? [d.orderDate + 75, 'order'] : [null, 'none'];
+      if ((l.pullFrom ?? null) !== w[0] || l.pullRule !== w[1]) why.push(`pull-from ${l.pullFrom} (${l.pullRule}), not ${w[0]} (${w[1]})`);
+      if (!!l.estimate !== (w[1] === 'order')) why.push('estimate');
+      if (w[1] === 'order' && !(l.pullRange && l.pullRange.from === d.orderDate && l.pullRange.to === d.orderDate + 75)) why.push('the range is not the order date to 75 days after it');
+      if ((l.availableDate ?? null) !== w[0]) why.push('available date is not the pull-from date');
+      if (l.flags.includes('now') !== (w[0] != null && w[0] < today)) why.push('"now"');
+      const spread = src.length > 1 ? Math.max(...src) - Math.min(...src) : 0;
+      if (l.flags.includes('dates-disagree') !== spread > 7) why.push(`dates-disagree with a spread of ${spread} days`);
+    } else if ((l.availableDate ?? null) !== (isDay(l.eta) ? l.eta : null) || l.flags.includes('dates-disagree')) why.push('sailed: not its ETA');
+    if (l.units !== l.taken + l.available || l.taken < 0 || l.available < 0) why.push(`units ${l.units} ≠ taken ${l.taken} + available ${l.available}`);
+    if (why.length) bad.push(`${l.style} PO ${l.po}: ${why.join('; ')}`);
+  }
+  return bad;
+}
+// The selling engine's sums: the styles add up to the totals, each style's lots to its numbers, stock after orders,
+// customer orders taken off the earliest lots first, the lots to the stage engine's Incoming and sold to its Pull from
+// China. Answers what doesn't hold.
+function sellSums(S, R) {
+  const bad = [], T = S.totals, sum = (a, f) => a.reduce((p, x) => p + (f(x) || 0), 0);
+  for (const k of ['now', 'fromChina', 'arriving', 'total', 'soldChina', 'oversold', 'ordersTaken']) if (sum(S.styles, x => x[k]) !== T[k]) bad.push(`styles' ${k} ${sum(S.styles, x => x[k])} ≠ total ${T[k]}`);
+  if (T.total !== T.now + T.fromChina + T.arriving) bad.push('total ≠ now + from China + arriving');
+  const lotDay = l => (l.availableDate == null ? Infinity : l.availableDate);
+  for (const s of S.styles) {
+    const ls = s.lots, lu = sum(ls, l => l.units);
+    if (lu !== s.fromChina + s.arriving + s.ordersTaken) bad.push(`${s.style}: lots ${lu} ≠ from China + arriving + taken`);
+    if (s.fromChina !== sum(ls.filter(l => l.inChina), l => l.available) || s.arriving !== sum(ls.filter(l => !l.inChina), l => l.available)) bad.push(`${s.style}: lot availability`);
+    if (sum(ls, l => l.taken) !== s.ordersTaken) bad.push(`${s.style}: taken ≠ orders taken`);
+    const known = isDay(s.inWh) && isDay(s.orders) && !s.flags.includes('stock-unknown');
+    if (known && (s.now !== Math.max(0, s.inWh - s.orders) || s.ordersTaken + s.oversold !== Math.max(0, s.orders - s.inWh))) bad.push(`${s.style}: stock after orders`);
+    if (!known && (s.ordersTaken || s.oversold || s.now)) bad.push(`${s.style}: orders taken off with stock not known`);
+    // Taken from the earliest first (no date last): once a lot keeps something, no later lot gives any.
+    let kept = false;
+    for (const l of ls.slice().sort((a, b) => (lotDay(a) > lotDay(b)) - (lotDay(a) < lotDay(b)))) {
+      if (kept && l.taken) { bad.push(`${s.style}: a later lot taken before an earlier one`); break; }
+      if (l.available > 0) kept = true;
+    }
+  }
+  if (R && R.ok) {
+    if (sum(S.lots, l => l.units) !== R.totals.units.incoming) bad.push(`lots ${sum(S.lots, l => l.units)} ≠ Incoming ${R.totals.units.incoming}`);
+    if (T.soldChina !== R.totals.units.pullFromChina) bad.push(`sold ${T.soldChina} ≠ Pull from China ${R.totals.units.pullFromChina}`);
+  }
+  return bad;
+}
 // The section lists in the real config.js (public), run with a stand-in window: s2-real serves them, so the page and
 // the engine here read the real files as the live page does.
 function realSections() {
@@ -217,15 +358,21 @@ function realSections() {
   return win.INV_CONFIG ? win.INV_CONFIG.sections : undefined;
 }
 
-// Every issue code and allocation flag core/stages.js can give, without plain words in app.js's CODE_LABELS (the page
-// would show the bare code). Read from the two files' text.
+// Every issue code and flag core/stages.js, core/ats.js and core/sell.js can give, without plain words in app.js's
+// CODE_LABELS (the page would show the bare code). Read from the files' text.
 function unlabelledCodes() {
-  const app = readFileSync(join(REPO, 'app.js'), 'utf8'), eng = readFileSync(join(REPO, 'core', 'stages.js'), 'utf8');
+  const app = readFileSync(join(REPO, 'app.js'), 'utf8');
   const m = /const CODE_LABELS = (\{[^]*?\n {2}\});/.exec(app);
   if (!m) return ['(no CODE_LABELS object in app.js)'];
   const labels = new Function(`return ${m[1]};`)();
-  const codes = new Set([...eng.matchAll(/\bissue\('([\w-]+)'/g)].map(x => x[1]));
-  for (const x of eng.matchAll(/'([a-z]+(?:-[a-z]+)+)'/g)) codes.add(x[1]);   // the hyphenated codes and flags
+  const codes = new Set();
+  for (const f of ['stages', 'ats', 'sell']) {
+    const eng = readFileSync(join(REPO, 'core', f + '.js'), 'utf8');
+    for (const x of eng.matchAll(/\bissue\('([\w-]+)'/g)) codes.add(x[1]);
+    for (const x of eng.matchAll(/'([a-z]+(?:-[a-z]+)+)'/g)) codes.add(x[1]);   // the hyphenated codes and flags
+    // flags pushed onto a lot or style, one-word ones too ("now", "taken", "oversold")
+    for (const x of eng.matchAll(/flags\.push\(([^)]*)\)/g)) for (const y of x[1].matchAll(/'([\w-]+)'/g)) codes.add(y[1]);
+  }
   return [...codes].filter(k => !labels[k]).sort();
 }
 
@@ -258,10 +405,16 @@ function expected(fx, today) {
   // The stage engine's own issues join the list on Problems, under "Incoming".
   const R = stagesFor(fx, today);
   e.incoming = { issues: R.ok ? R.issues.length : 0 };
+  // The ATS folder is empty in the standard world: Available to sell without the report (its issues under "Available
+  // to sell"; none from the report).
+  const S = R.ok ? SELL.buildSell({ stages: R, ats: null, today, upc }) : null;
+  e.ats = { issues: 0 };
+  e.sell = { issues: S && S.ok ? S.issues.length : 0 };
   e.totalIssues = sum(Object.values(e).map(x => x.issues));
   e.sane = tc.ok && cm.ok && ct.ok && fwd.ok && dray.ok && upc.ok && e.msl.open !== e.msl.openPlain && e.totalIssues > 0 &&
-    R.ok && R.balance.diff === 0 && e.incoming.issues > 0;
+    R.ok && R.balance.diff === 0 && e.incoming.issues > 0 && !!S && S.ok && S.atsMissing && e.sell.issues > 0;
   Object.defineProperty(e, 'R', { value: R, enumerable: false });   // kept out of the printed summary
+  Object.defineProperty(e, 'S', { value: S, enumerable: false });
   return e;
 }
 
@@ -274,6 +427,14 @@ function newWorld(fx, o = {}) {
   return { fx, o: { mslFile: 'msl.xlsx', trkFile: 'tracker.xlsx', ctFile: 'ct.xlsx', fwdFile: 'fwd.xlsx', drayFile: 'dray.csv', drayOldFile: 'dray.csv',
     fwdAge: 0, tracker: 200, poBook: 'same', mail: 202, ats: { empty: true }, slowCt: false, sources: {}, real: false, ...o },
     calls: [], downloads: [], pageGets: [], unanswered: [], pending: new Set(), aborted: [], poBookGets: 0 };
+}
+// The ATS folder's reports, named as the ERP names them, with the day the report was made: "Inventory Report - On
+// Hand_In Transit_In Production 10-28-2026 12-58 PM.xlsx" (o.age days ago; `older` days before that for the older one),
+// or with no date in the name (o.noDate), when the page takes the day the file was saved.
+function atsName(o, older = 0) {
+  if (o && o.noDate) return older ? 'ats-report-older.xlsx' : 'ats-report-new.xlsx';
+  const dt = new Date((TODAY - ((o && o.age) || 0) - older) * 864e5);
+  return `Inventory Report - On Hand_In Transit_In Production ${dt.getUTCMonth() + 1}-${dt.getUTCDate()}-${dt.getUTCFullYear()} 12-58 PM.xlsx`;
 }
 // The config.js the page gets: the invented locations, with the scenario's changes.
 const configFor = w => ({ ...TEST_CONFIG, sources: { ...LOC, ...((w && w.o.sources) || {}) }, ...(w && w.o.real ? { sections: realSections() } : {}) });
@@ -326,8 +487,14 @@ function graph(w, method, path, q) {
     if (path === `/drives/${SRC}/items/itm-ats-dir/children` && o.ats) {
       const lock = kid('itm-ats-lock', '~$ats-report-new.xlsx', 0), sub = { id: 'itm-ats-sub', name: 'Old', folder: { childCount: 2 }, lastModifiedDateTime: iso(0) };
       if (o.ats.empty) return J(200, { value: [lock, sub] });
-      return J(200, { value: [kid('itm-ats-1', 'ats-report-new.xlsx', o.ats.age), kid('itm-ats-0', 'ats-report-older.xlsx', o.ats.age + 7), lock, sub] });
+      // A newer file that isn't Excel is skipped: the newest Excel file is the report.
+      // o.ats.resaved: the older report was opened and saved again after the newest one (it must not win).
+      return J(200, { value: [kid('itm-ats-txt', 'read-me.txt', 0), kid('itm-ats-1', atsName(o.ats), Math.max(0, o.ats.age)),
+        kid('itm-ats-0', atsName(o.ats, 7), o.ats.resaved ? 0 : Math.max(0, o.ats.age) + 7), lock, sub] });
     }
+    // The newest report, with its download link (the invented workbook o.ats.file); the older one only if asked for.
+    if (path === `/drives/${SRC}/items/itm-ats-1` && o.ats && !o.ats.empty) return J(200, fileMeta('itm-ats-1', atsName(o.ats), o.ats.file || 'ats.xlsx', Math.max(0, o.ats.age)));
+    if (path === `/drives/${SRC}/items/itm-ats-0` && o.ats && !o.ats.empty) return J(200, fileMeta('itm-ats-0', atsName(o.ats, 7), 'ats.xlsx', o.ats.resaved ? 0 : Math.max(0, o.ats.age) + 7));
     if (path === `/drives/${SRC}/items/itm-msl`) return J(200, fileMeta('itm-msl', 'Master Sheet Live.xlsx', o.mslFile, 1));
     if (path === `/drives/${SRC}/items/itm-trk`) return o.tracker === 403 ? denied() : J(200, fileMeta('itm-trk', 'PO Status Tracker.xlsx', o.trkFile, 1));
     if (path === `/drives/${SRC}/items/itm-ct`) return J(200, fileMeta('itm-ct', o.ctReplaced ? 'Test Container Sheet OLD.xlsx' : 'Test Container Sheet.xlsx', o.ctFile, o.ctReplaced ? 5 : 0));
@@ -521,7 +688,8 @@ function snapshot() {
     issueGroups: issRows.filter(r => r.classList.contains('gh')).map(txt),
     issueRows: issRows.filter(r => !r.classList.contains('gh') && !r.querySelector('.more,.empty')).length,
     srcRows: document.querySelectorAll('#srcTable tr[id^="srow-"]').length,
-    tabs: Object.fromEntries(['inv', 'pull', 'problems'].map(t => [t, shown(q('#tab-' + t))])),
+    tabs: Object.fromEntries(['sell', 'inv', 'pull', 'problems'].map(t => [t, shown(q('#tab-' + t))])),
+    tabOrder: [...document.querySelectorAll('#tabs .tab')].map(b => b.dataset.tab), srcBoxIn: (q('#srcBox') && q('#srcBox').closest('.tabpane') || {}).id || '',
     who: txt(q('#who')), sourcesButton: !!q('#btnSources'), dialog: !!q('dialog'),
     toast: txt(q('#toast')), toastShown: shown(q('#toast')),
     msalFake: !!(window.msal && window.msal.headlessFake), msalSetTried: H.msalSetTried || 0, msalInteractive: H.msal || [],
@@ -758,6 +926,82 @@ function tileSums(R, pred) {
 const BIG = { mslFile: 'msl-big.xlsx', trkFile: 'trk-big.xlsx', ctFile: 'ct-big.xlsx' };
 const BIG_FILES = { msl: 'msl-big.xlsx', trk: 'trk-big.xlsx', ct: 'ct-big.xlsx' };
 const REAL = { mslFile: 'real-msl.xlsx', trkFile: 'real-trk.xlsx', ctFile: 'real-ct.xlsx', fwdFile: 'real-fwd.xlsx', drayFile: 'real-dray.csv', real: true };
+const SELLW = { mslFile: 'msl-sell.xlsx', trkFile: 'trk-sell.xlsx', ctFile: 'ct-sell.xlsx' };
+const SELL_FILES = { msl: 'msl-sell.xlsx', trk: 'trk-sell.xlsx', ct: 'ct-sell.xlsx' };
+const SELL_ATS = { age: 2, file: 'ats-sell.xlsx' };
+
+// ---- Available to sell: what the checks read from its tab and the side panel, in one call. A cell's value leaves out
+// its second line (.u) and tags; `u` is the second line.
+const SL = `(() => {
+  const q = s => document.querySelector(s), txt = el => (el ? el.textContent.replace(/\\s+/g, ' ').trim() : '');
+  const shown = el => !!el && !el.hidden && !el.closest('[hidden]') && getComputedStyle(el).display !== 'none';
+  const plain = el => { if (!el) return ''; const x = el.cloneNode(true); x.querySelectorAll('.u,.tag,.ar').forEach(y => y.remove()); return x.textContent.replace(/\\s+/g, ' ').trim(); };
+  const sub = el => { const u = el && el.querySelector('.u'); return u ? u.textContent.replace(/\\s+/g, ' ').trim() : ''; };
+  const ph = [...document.querySelectorAll('#panelTable thead th')].map(plain);
+  const on = q('#tabs .tab.on');
+  return {
+    tab: on ? on.dataset.tab : '', shown: shown(q('#tab-sell')), lead: shown(q('#sellState')) ? txt(q('#sellState')) : '',
+    note: txt(q('#sellNote')), noteCls: (q('#sellNote .banner') || {}).className || '',
+    tiles: [...document.querySelectorAll('#sellTiles .tile')].map(t => ({ k: t.dataset.t || '', btn: t.tagName === 'BUTTON', cls: t.className, n: txt(t.querySelector('.n')),
+      cs: [...t.querySelectorAll('.cs')].map(txt), lbl: txt(t.querySelector('.lbl')), title: t.title || '' })),
+    heads: [...document.querySelectorAll('#sellTable thead th')].map(th => ({ t: plain(th), sort: th.getAttribute('aria-sort') || '' })),
+    tr: document.querySelectorAll('#sellTable tbody tr.r').length, first: q('#sellTable tbody tr.r') ? +q('#sellTable tbody tr.r').dataset.i : -1,
+    empty: txt(q('#sellTable tbody td.empty')),
+    rows: [...document.querySelectorAll('#sellTable tbody tr.r')].slice(0, 80).map(tr => {
+      const tds = [...tr.children], sp = tds.find(td => td.colSpan > 1), b = k => txt(tr.querySelector('button.nb[data-b="' + k + '"]')), tot = tds[tds.length - 2];
+      return { i: +tr.dataset.i, style: txt(tr.querySelector('button.sb')), upc: sub(tds[0]), tags: [...tr.querySelectorAll('.tag')].map(txt), cells: tds.length,
+        span: sp ? plain(sp) : null, inWh: sp ? null : plain(tds[3]), orders: sp ? null : plain(tds[4]), nowCell: sp ? null : plain(tds[5]), casePack: plain(tds[2]),
+        now: b('now'), fromChina: b('fromChina'), arriving: b('arriving'), total: b('total'), sold: b('soldChina'),
+        totalCell: plain(tot), totalCls: tot.className, totalTitle: tot.title || '', firstPull: plain(tds[sp ? 5 : 7]), firstArrival: plain(tds[sp ? 7 : 9]) };
+    }),
+    info: txt(q('#fInfo')), fbarIn: (q('#fbar').parentElement || {}).id || '', availShown: shown(q('#fAvailWrap')), stageShown: shown(q('#fStage')), typeShown: shown(q('#fType')),
+    panel: shown(q('#panel')), panelLbl: txt(q('#panelLbl')), panelTitle: txt(q('#panelTitle')), panelSub: txt(q('#panelSub')), panelNote: txt(q('#panelNote')),
+    panelStock: shown(q('#panelStock')) ? txt(q('#panelStock')) : '', panelHead: ph, panelTr: document.querySelectorAll('#panelTable tbody tr.r').length,
+    lots: [...document.querySelectorAll('#panelTable tbody tr.r')].slice(0, 80).map(tr => Object.fromEntries(ph.map((h, j) => {
+      const td = tr.children[j]; return [h, { v: plain(td), u: sub(td), title: (td && td.title) || '', cls: (td && td.className) || '' }]; }))),
+    scroll: q('#sellPane').scrollTop,
+  };
+})()`;
+const sl = t => t.eval(SL);
+const SELL_TILE_KEYS = ['now', 'fromChina', 'arriving', 'total'];
+const sellTile = (p, k) => p.tiles.find(x => x.k === k) || { n: null, cs: [], cls: '', lbl: '' };
+const sellTilesSay = (p, S) => [...SELL_TILE_KEYS, 'oversold'].map(k => `${k} "${sellTile(p, k).n}" vs ${S ? S.totals[k] : '?'}`).join('; ');
+// "1,234 cases + 7 loose units + 56 units with no case pack", as the tiles write it (whole cases only).
+const casesSay = (c, np, lo) => [c ? `${fmtN(c)} case${c === 1 ? '' : 's'}` : '', lo ? `${fmtN(lo)} loose unit${lo === 1 ? '' : 's'}` : '',
+  np ? `${fmtN(np)} units with no case pack` : ''].filter(Boolean).join(' + ');
+const nz = v => (v ? fmtN(v) : '');
+// A date in running text: m/d this year, m/d/yyyy otherwise (as "10 days before ETD 11/14").
+const md = (d, today) => (new Date(d * 864e5).getUTCFullYear() === new Date(today * 864e5).getUTCFullYear() ? C.fmtDay(d).replace(/\/\d{4}$/, '') : C.fmtDay(d));
+// What the side panel's "Available from" cell must say for a lot (Saul's rule in words), worked out here: the date
+// shown (or "now"), and the words that must be in its tooltip.
+function whenSays(l, today) {
+  if (!l.inChina) return l.eta == null ? { main: 'no ETA yet', words: [] } : { main: C.fmtDay(l.eta), words: [`ETA ${md(l.eta, today)}`] };
+  if (l.pullFrom == null) return { main: 'no date', words: [] };
+  const date = (l.pullRule === 'order' ? 'about ' : '') + C.fmtDay(l.pullFrom);
+  const words = l.pullRule === 'etd' ? [`10 days before ETD ${md(l.etd, today)}`] : l.pullRule === 'crd' ? [`5 days before CRD ${md(l.readyDate, today)}`]
+    : ['75 days after the order date', md(l.dates.orderDate, today), md(l.pullFrom, today)];
+  return { main: l.pullFrom < today ? 'now' : date, words: [date, ...words] };
+}
+// A style's First pull date cell, worked out here.
+const firstPullSays = (s, today) => (s.firstPull == null ? (s.lots.some(l => l.inChina && l.available > 0) ? 'no date' : '')
+  : s.firstPull < today ? 'now' : (s.firstPullEstimate ? 'about ' : '') + C.fmtDay(s.firstPull));
+// The table's columns, in order.
+const SELL_HEADS = ['Style', 'Description', 'Case pack', 'In warehouse', 'Customer orders', 'Available now', 'Available from China', 'First pull date', 'Arriving', 'First arrival',
+  'Total available', 'Sold (ships from China)'];
+// Every style row drawn against the engine: stock, after orders, from China, arriving, total, sold, dates. Answers what differs.
+function sellRowsDiffer(p, S, today, stock) {
+  const by = new Map(S.styles.map(s => [s.styleRaw || s.style, s])), bad = [];
+  for (const r of p.rows) {
+    const s = by.get(r.style);
+    if (!s) { bad.push(`${r.style}: not in the engine`); continue; }
+    const want = { fromChina: nz(s.fromChina), arriving: nz(s.arriving), sold: nz(s.soldChina), firstPull: firstPullSays(s, today), firstArrival: s.firstArrival == null ? '' : C.fmtDay(s.firstArrival) };
+    if (stock === 'ok' && !s.flags.includes('not-on-report') && !s.flags.includes('stock-unknown')) Object.assign(want, { inWh: nz(s.inWh), orders: nz(s.orders), now: nz(s.now), total: nz(s.total) });
+    else if (stock === 'ok') Object.assign(want, { span: s.flags.includes('not-on-report') ? 'not on report' : undefined, total: nz(s.total) });
+    else Object.assign(want, { span: stock, totalCell: stock });
+    for (const [k, v] of Object.entries(want)) if (v !== undefined && r[k] !== v) bad.push(`${r.style} ${k}: "${r[k]}", not "${v}"`);
+  }
+  return bad;
+}
 
 const SCENARIOS = [
   {
@@ -801,26 +1045,33 @@ const SCENARIOS = [
       c('health line: all sources loaded', /All sources loaded/.test(s.health), s.health);
       c('no email', sendMails(w.calls).length === 0);
       c('no ⚙ Sources button and no popup in the page', !s.sourcesButton && !s.dialog);
-      c(`Problems count = every issue the parsers and the stage engine found (${e.totalIssues}, ${e.incoming.issues} of them Incoming)`, s.cProb === String(e.totalIssues), s.cProb);
+      c(`Problems count = every issue the parsers, the stage engine and the selling engine found (${e.totalIssues}, ${e.incoming.issues} of them Incoming, ${e.sell.issues} Available to sell)`, s.cProb === String(e.totalIssues), s.cProb);
       c('no console errors', t.console.length === 0, t.console.join(' | '));
-      c('Inventory tab: a card per source', s.tabs.inv && s.cardCount === 8, `${s.cardCount} cards`);
+      c('Available to sell is the first tab and is shown at start, with the sources box (a card per source) under it',
+        s.tabOrder.join(',') === 'sell,inv,pull,problems' && s.tabs.sell && !s.tabs.inv && s.srcBoxIn === 'tab-sell' && s.cardCount === 8, `${s.tabOrder} · ${JSON.stringify(s.tabs)} · box in ${s.srcBoxIn} · ${s.cardCount} cards`);
       t.shots.push(await t.shot('ok'));
 
+      await t.click('#tabs .tab[data-tab="inv"]');
+      s = await t.snap();
+      c('Where it is: the sources box moves with it', s.tabs.inv && !s.tabs.sell && s.srcBoxIn === 'tab-inv', `${JSON.stringify(s.tabs)} · box in ${s.srcBoxIn}`);
       await t.click('#tabs .tab[data-tab="pull"]');
       s = await t.snap();
-      c('Pull from China tab draws', s.tabs.pull && !s.tabs.inv && !s.tabs.problems, JSON.stringify(s.tabs));
+      c('Pull from China tab draws', s.tabs.pull && !s.tabs.sell && !s.tabs.inv && !s.tabs.problems, JSON.stringify(s.tabs));
       await t.click('#tabs .tab[data-tab="problems"]');
       s = await t.snap();
       c('Problems tab: sources table with 8 rows', s.tabs.problems && s.srcRows === 8, `${s.srcRows} rows`);
       c(`Problems tab: every issue listed (${e.totalIssues})`, s.issueRows === e.totalIssues, `${s.issueRows} rows`);
-      const groups = ['tracker', 'msl', 'pobook', 'ct', 'forwarder', 'drayage', 'upc', 'incoming'].filter(k => e[k].issues > 0).length;
-      c(`Problems tab: issues grouped by source (${groups} groups, Incoming included) with counts in plain words, not codes`,
+      const groups = ['tracker', 'msl', 'pobook', 'ct', 'forwarder', 'drayage', 'upc', 'incoming', 'sell', 'ats'].filter(k => e[k].issues > 0).length;
+      c(`Problems tab: issues grouped by source (${groups} groups, Incoming and Available to sell included) with counts in plain words, not codes`,
         s.issueGroups.length === groups && s.issueGroups.some(g => /^UPC_MASTER · \d+ issues?/.test(g) && /UPC not 12-13 digits \d/.test(g)) &&
         !s.issueGroups.some(g => /\bbadupc\b|\bmslonly\b|\bdupround\b/.test(g)), s.issueGroups.join(' | '));
       const inc = s.issueGroups.find(g => g.startsWith('Incoming')) || '';
       const incCodes = [...new Set(e.R.issues.map(i => i.code))];
       c(`Problems tab: the Incoming group has the stage engine's ${e.incoming.issues} issues (${incCodes.join(', ')}), in plain words`,
         new RegExp(`^Incoming · ${e.incoming.issues} issues?`).test(inc) && !incCodes.some(k => inc.includes(k) || inc.includes(k.replace(/-/g, ' '))), inc);
+      const sg = s.issueGroups.find(g => g.startsWith('Available to sell')) || '';
+      c(`Problems tab: right after it, "Available to sell" with the selling engine's ${e.sell.issues} (no ATS report: customer orders not known), in plain words`,
+        s.issueGroups[1] === sg && new RegExp(`^Available to sell · ${e.sell.issues} issues?`).test(sg) && /Customer orders not known/.test(sg) && !/orders-unknown/.test(sg), s.issueGroups.join(' | '));
       c('PO Book lines: the item with no LineKey is listed', s.issueGroups.some(g => /^PO Book lines · 1 issue/.test(g) && /Item with no LineKey 1/.test(g)), s.issueGroups.join(' | '));
       await t.eval(`(() => { const q = document.getElementById('pq'); q.value = 'badupc'; q.dispatchEvent(new Event('input', { bubbles: true })); })()`);
       await sleep(500);
@@ -831,11 +1082,13 @@ const SCENARIOS = [
     },
   },
   {
-    name: 'ok-reload', title: 'reload in the same browser: the saved locations are reused', after: 'ok',
+    name: 'ok-reload', title: 'reload in the same browser: the saved locations are reused, the last tab shown again', after: 'ok',
     async run({ t, w, c }) {
       const from = w.calls.length;
       await t.reload();
       const s = await t.snap(), calls = w.calls.slice(from);
+      c('the tab last used (Where it is) is shown again, kept in this browser (inv:tab2)', s.tabs.inv && !s.tabs.sell && (s.store || {})['inv:tab2'] === 'inv', `${JSON.stringify(s.tabs)} · ${JSON.stringify(s.store && s.store['inv:tab2'])}`);
+      await t.click('#tabs .tab[data-tab="sell"]');
       greenExcept(c, s, []);
       c('no location found afresh (no /shares, site or library lookups)', !calls.some(isLookup), calls.filter(isLookup).map(x => x.path).join('; '));
       c('the sharing links opened straight from their saved ids', ['itm-msl', 'itm-trk'].every(id => calls.some(x => x.path === `/drives/${SRC}/items/${id}`)), calls.map(x => x.path).join('; '));
@@ -965,24 +1218,82 @@ const SCENARIOS = [
     },
   },
   {
-    name: 'atsold', title: 'the newest ATS report is 12 days old', world: { ats: { age: 12 } },
+    name: 'atsold', title: 'the newest ATS report is 12 days old: read and used, amber, Saul emailed', world: { ats: { age: 12 } },
     async run({ t, w, c, today }) {
-      const s = await t.snap(), a = s.chips.ats;
+      const s = await t.snap(), a = s.chips.ats, name = atsName(w.o.ats);
       c('ATS chip amber "12 days old"', a.state === 'warn' && /12 days old/.test(a.text), `${a.state}: ${a.text}`);
-      c('ATS chip names the newest report, lock file and subfolder skipped', a.title.includes('ats-report-new.xlsx') && !a.title.includes('~$'), a.title);
-      c('ATS report is only looked at: not downloaded in step 1', !w.downloads.some(d => /ats/.test(d.name)) && !w.calls.some(x => /itm-ats-[01]/.test(x.path)));
+      c('ATS chip names the newest Excel file: the lock file, the subfolder and a newer .txt skipped', a.title.includes(name) && !a.title.includes('~$') && !a.title.includes('read-me'), a.title);
+      c('the newest report is downloaded once and read; the older one and the .txt are not opened',
+        w.downloads.filter(d => d.name === 'ats.xlsx').length === 1 && w.calls.some(x => x.path === `/drives/${SRC}/items/itm-ats-1`) && !w.calls.some(x => /itm-ats-(0|txt)$/.test(x.path)),
+        `${w.downloads.map(d => d.name).join(',')} · ${w.calls.filter(x => /itm-ats/.test(x.path)).map(x => x.path).join('; ')}`);
+      c('the card: report date from the file name, 12 days old', pair(s.cards.ats, 'Report date') === `${C.fmtDay(today - 12)} (from the file name)` && pair(s.cards.ats, 'Age') === '12 days',
+        JSON.stringify(s.cards.ats && s.cards.ats.pairs));
       c('health line names ATS', s.health.includes('ATS'), s.health);
       greenExcept(c, s, []);
       oneEmail(c, s, w.calls, 'ats', 'the newest report is 12 days old', today);
+      const { S } = sellFor(w.fx, today, { ats: w.o.ats }), p = await sl(t);
+      c(`Available to sell: an amber note says the report is 12 days old; customer orders are still taken off (Available now ${fmtN(S.totals.now)})`,
+        /\bwarn\b/.test(p.noteCls) && /The ATS report is 12 days old/.test(p.note) && p.note.includes(`report date ${C.fmtDay(today - 12)}`) && !S.atsMissing && unitsIs(sellTile(p, 'now').n, S.totals.now),
+        `${p.noteCls}: ${p.note} · ${sellTile(p, 'now').n}`);
     },
   },
   {
-    name: 'atsfound', title: 'a recent ATS report: found, read in step 3', world: { ats: { age: 2 } },
-    async run({ t, w, c }) {
-      const s = await t.snap(), a = s.chips.ats;
-      c('ATS chip grey "read in step 3", naming the newest file', a.state === 'off' && /read in step 3/.test(a.text) && a.title.includes('Found ats-report-new.xlsx'), `${a.state}: ${a.text} | ${a.title}`);
+    name: 'atsfound', title: 'a recent ATS report: downloaded, read with its Grand Total check, chip green', world: { ats: { age: 2 } },
+    async run({ t, w, c, today }) {
+      const s = await t.snap(), a = s.chips.ats, { A, S } = sellFor(w.fx, today, { ats: w.o.ats });
+      c('the report (read here) adds up, with its date in the name', A.ok && A.reportDay === today - 2 && A.counts.styleRows === 5 && A.styles.size === 4, JSON.stringify(A.counts));
+      c(`ATS chip green: "${A.counts.rowsRead} read / ${A.counts.styleRows} counted", naming the file`, a.state === 'ok' && a.text.includes(`${fmtN(A.counts.rowsRead)} read / ${fmtN(A.counts.styleRows)} counted`) && a.title.includes(atsName(w.o.ats)),
+        `${a.state}: ${a.text} | ${a.title}`);
+      c('the card: report date from the file name, 2 days old, styles on more than one row summed', pair(s.cards.ats, 'Report date') === `${C.fmtDay(today - 2)} (from the file name)` &&
+        pair(s.cards.ats, 'Age') === '2 days' && pair(s.cards.ats, 'Styles on more than one row (summed)') === '1', JSON.stringify(s.cards.ats && s.cards.ats.pairs));
+      c('no email, no amber or red', sendMails(w.calls).length === 0 && !banner(s, 'err') && !banner(s, 'warn'), JSON.stringify(s.banners));
+      c('downloaded once', w.downloads.filter(d => d.name === 'ats.xlsx').length === 1, w.downloads.map(d => d.name).join(','));
+      const p = await sl(t);
+      c("Available to sell: no note; the tiles are the engine's with the report", !p.note && SELL_TILE_KEYS.every(k => unitsIs(sellTile(p, k).n, S.totals[k])), `${p.note} · ${sellTilesSay(p, S)}`);
+    },
+  },
+  {
+    name: 'atsresaved', title: 'an older ATS report was opened and saved again after the newest: the newest by the date in its name is used', world: { ats: { age: 2, resaved: true } },
+    async run({ t, w, c, today }) {
+      const s = await t.snap(), a = s.chips.ats, name = atsName(w.o.ats);
+      c('ATS chip green, naming the report dated 2 days ago (not the one saved last)', a.state === 'ok' && a.title.includes(name) && !a.title.includes(atsName(w.o.ats, 7)), `${a.state}: ${a.text} | ${a.title}`);
+      c('only the newest report is opened', w.calls.some(x => x.path === `/drives/${SRC}/items/itm-ats-1`) && !w.calls.some(x => /itm-ats-0$/.test(x.path)),
+        w.calls.filter(x => /itm-ats/.test(x.path)).map(x => x.path).join('; '));
+      c('the card: report date from the file name, 2 days old', pair(s.cards.ats, 'Report date') === `${C.fmtDay(today - 2)} (from the file name)` && pair(s.cards.ats, 'Age') === '2 days',
+        JSON.stringify(s.cards.ats && s.cards.ats.pairs));
       c('no email', sendMails(w.calls).length === 0);
-      c('nothing downloaded from the ATS folder', !w.downloads.some(d => /ats/.test(d.name)));
+    },
+  },
+  {
+    name: 'atsfuture', title: "the ATS report's file name is dated 3 days ahead: amber, said plainly, no email", world: { ats: { age: -3 } },
+    async run({ t, w, c, today }) {
+      const s = await t.snap(), a = s.chips.ats;
+      c('ATS chip amber "date in the future"', a.state === 'warn' && /date in the future/.test(a.text), `${a.state}: ${a.text}`);
+      c("the chip's tooltip names the date and says to check it", a.title.includes(C.fmtDay(today + 3)) && /after today/.test(a.title), a.title);
+      c('no email', sendMails(w.calls).length === 0);
+      greenExcept(c, s, []);
+    },
+  },
+  {
+    name: 'atsamber', title: 'the newest ATS report is 9 days old, with no date in its name: amber, no email', world: { ats: { age: 9, noDate: true } },
+    async run({ t, w, c, today }) {
+      const s = await t.snap(), a = s.chips.ats;
+      c('ATS chip amber "9 days old"', a.state === 'warn' && /9 days old/.test(a.text), `${a.state}: ${a.text}`);
+      c("the card: the report date is the day it was saved (no date in the file name)", pair(s.cards.ats, 'Report date') === `${C.fmtDay(today - 9)} (the day it was saved: no date in the file name)`,
+        JSON.stringify(s.cards.ats && s.cards.ats.pairs));
+      c('no email before 10 days', sendMails(w.calls).length === 0);
+      greenExcept(c, s, []);
+    },
+  },
+  {
+    name: 'atsnocol', title: 'the ATS report has no "Total Customer Orders" column', world: { ats: { age: 1, file: 'ats-nocol.xlsx' } },
+    async run({ t, w, c, today }) {
+      const s = await t.snap(), a = s.chips.ats;
+      c('ATS chip red "missing column", naming "Total Customer Orders"', a.state === 'err' && /missing column/.test(a.text) && a.title.includes('"Total Customer Orders"'), `${a.state}: ${a.text} | ${a.title}`);
+      greenExcept(c, s, []);
+      oneEmail(c, s, w.calls, 'ats', 'missing column "Total Customer Orders"', today);
+      const p = await sl(t);
+      c('Available to sell: a red note, Available now "not loaded"', /\berr\b/.test(p.noteCls) && /The ATS report couldn't be used/.test(p.note) && sellTile(p, 'now').n === 'not loaded', `${p.noteCls}: ${p.note} · ${sellTile(p, 'now').n}`);
     },
   },
   {
@@ -1251,13 +1562,21 @@ const SCENARIOS = [
     name: 's2-small', title: 'step 2, the standard invented files: tiles equal the engine, the balance line, Incoming issues on Problems', world: {},
     async run({ t, c, e }) {
       const R = e.R;
+      await t.click('#tabs .tab[data-tab="inv"]'); await sleep(200);
       let s = await s2(t);
       c('the engine (run here) built the small files, balance 0', R.ok && R.balance.diff === 0 && R.balance.ct.diff === 0, JSON.stringify(R.ok ? R.balance : R.notLoaded));
       c("every tile equals the engine's total", tilesAre(s, R.totals.units), tilesSay(s, R.totals.units));
-      c('the three step 3 tiles are grey, "comes with the ATS report (step 3)"', s.tiles.filter(x => /\boff\b/.test(x.cls) && /comes with the ATS report \(step 3\)/.test(x.cs)).length === 3, JSON.stringify(s.tiles.map(x => x.cs)));
+      const go = s.tiles.find(x => /\bgo\b/.test(x.cls));
+      c('one grey tile instead of the step 3 ones: "On hand and available: Available to sell →"', !!go && /\boff\b/.test(go.cls) && go.lbl === 'On hand and available' && go.n === 'Available to sell →' &&
+        !s.tiles.some(x => /step 3/.test(x.cs + x.n)), JSON.stringify(s.tiles.map(x => `${x.lbl}: ${x.n} ${x.cs}`)));
       c('no banner, no lead card', !s.banners.length && !s.lead, JSON.stringify(s.banners) + ' ' + s.lead);
       c('health line: all sources loaded, with the Unmatched units', /All sources loaded/.test(s.health) && /Unmatched/.test(s.health), s.health);
       c('the Inventory table draws its rows', s.invTr > 0, s.invTr);
+      const oh = await t.eval(`[...document.querySelectorAll('#invTable tbody tr.r:not(.upc)')].map(r => r.children[4].textContent.trim())`);
+      c('On hand says "no report yet" on every row (the ATS folder is empty), never 0 or blank', oh.length > 0 && oh.every(x => x === 'no report yet'), JSON.stringify(oh));
+      await t.click('#tiles [data-go="sell"]'); await sleep(200);
+      c('the grey tile opens Available to sell', (await t.snap()).tabs.sell);
+      await t.click('#tabs .tab[data-tab="inv"]'); await sleep(200);
       await t.click('#tabs .tab[data-tab="problems"]');
       s = await s2(t);
       c('balance line green: "Every unit adds up: … units on Master Sheet Live = …"', /\bok\b/.test(s.balance.cls) &&
@@ -1273,6 +1592,7 @@ const SCENARIOS = [
       const R = stagesFor(w.fx, today, BIG_FILES);
       c('the engine (run here) built the big files, balance 0', R.ok && R.styles.length > 2000 && R.balance.diff === 0 && R.balance.ct.diff === 0,
         JSON.stringify({ ok: R.ok, styles: R.styles && R.styles.length, bal: R.balance }));
+      await t.click('#tabs .tab[data-tab="inv"]'); await sleep(300);
       let s = await s2(t);
       c('no lead card: the stage numbers are loaded', !s.lead, s.lead);
       for (const k of TILE_KEYS) c(`tile ${k} = the engine's ${R.totals.units[k].toLocaleString('en-US')}`, unitsIs(tileN(s, k), R.totals.units[k]), tileN(s, k));
@@ -1280,7 +1600,7 @@ const SCENARIOS = [
       c(`Incoming tile: "${cIn} cases + ${npIn} units with no case pack"`, npIn > 0 && inc && inc.cs === `${cIn.toLocaleString('en-US')} cases + ${npIn.toLocaleString('en-US')} units with no case pack`, inc && inc.cs);
       c(`info line: ${R.styles.length} styles`, s.info.startsWith(`${R.styles.length.toLocaleString('en-US')} styles`), s.info);
       c('windowed: far fewer rows drawn than styles', s.invTr > 10 && s.invTr < 150, s.invTr);
-      const want = ['Style', 'Description', 'Category', 'Factory', 'On hand', 'No CRD', 'In production', 'Ready', 'Booked', 'Loaded', 'In China', 'On the water', 'At port', 'Incoming', 'Pull from China', 'Cases incoming', 'Next ETA'];
+      const want = ['Style', 'Description', 'Category', 'Factory', 'On hand', 'No CRD', 'In production', 'Ready', 'Booked', 'Loaded', 'In China', 'On the water', 'At port', 'Incoming', 'Sold, ships from China', 'Cases incoming', 'Next ETA'];
       c('the columns, in order', s.heads.length === want.length && want.every((h, i) => s.heads[i].t.startsWith(h)), s.heads.map(h => h.t).join('|'));
       const two = await t.eval(`[...document.querySelectorAll('#invTable tbody tr.upc')].map(r => r.textContent.trim().slice(0, 14))`);
       c('ST0001 (two POs, two UPCs) has its two UPC lines under it', two.length === 2 && two.some(x => x.startsWith('100000000001')) && two.some(x => x.startsWith('200000000001')), JSON.stringify(two));
@@ -1321,10 +1641,12 @@ const SCENARIOS = [
       await setVal(t, 'fq', 'ST07'); await sleep(500);   // sailed on round 361: numbers and a Next ETA on every row
       const fmt = await t.eval(`(() => { const rows = [...document.querySelectorAll('#invTable tbody tr.r')];
         const txt = el => { const x = el.cloneNode(true); x.querySelectorAll('.np').forEach(y => y.remove()); return x.textContent.trim(); };
-        const nums = rows.flatMap(r => [...r.querySelectorAll('td.num:not(.off)')].map(txt)).filter(Boolean), eta = rows.map(r => r.lastElementChild.textContent.trim()).filter(Boolean);
+        const nums = rows.flatMap(r => [...r.querySelectorAll('td.num:not(.off):not(.nr)')].map(txt)).filter(Boolean), eta = rows.map(r => r.lastElementChild.textContent.trim()).filter(Boolean);
+        const oh = rows.filter(r => !r.classList.contains('upc')).map(r => r.children[4].textContent.trim());
         return { rows: rows.length, n: nums.length, bad: nums.filter(x => !/^[1-9]\\d{0,2}(,\\d{3})*$/.test(x)).slice(0, 5), comma: nums.filter(x => x.includes(',')).length,
-          eta: eta.length, badEta: eta.filter(x => !/^\\d{1,2}\\/\\d{1,2}\\/\\d{4}$/.test(x)).slice(0, 5) }; })()`);
-      c('numbers have thousands separators and a blank instead of 0; Next ETA is m/d/yyyy', fmt.rows > 0 && fmt.n > 0 && !fmt.bad.length && fmt.comma > 0 && fmt.eta === fmt.rows && !fmt.badEta.length, JSON.stringify(fmt));
+          eta: eta.length, badEta: eta.filter(x => !/^\\d{1,2}\\/\\d{1,2}\\/\\d{4}$/.test(x)).slice(0, 5), onHand: [...new Set(oh)] }; })()`);
+      c('numbers have thousands separators and a blank instead of 0; Next ETA is m/d/yyyy; On hand says "no report yet" (no ATS report)',
+        fmt.rows > 0 && fmt.n > 0 && !fmt.bad.length && fmt.comma > 0 && fmt.eta === fmt.rows && !fmt.badEta.length && fmt.onHand.join() === 'no report yet', JSON.stringify(fmt));
       await setVal(t, 'fq', ''); await sleep(400);
       await setVal(t, 'fFac', 'Factory B'); await sleep(300);
       s = await s2(t);
@@ -1452,8 +1774,8 @@ const SCENARIOS = [
       const pr = await t.eval(`(() => { const hs = [...document.querySelectorAll('#panelTable thead th')].map(th => th.textContent.trim()), tr = document.querySelector('#panelTable tbody tr.r');
         if (!tr) return null; const cell = h => { const x = tr.children[hs.findIndex(y => y.startsWith(h))].cloneNode(true); x.querySelectorAll('.u').forEach(y => y.remove()); return x.textContent.trim(); };
         return { counts: cell('Counts in'), stage: cell('Stage'), flags: cell('Flags') }; })()`);
-      c('the side panel: counts in Pull from China, Stage "Booked · Customer Direct", flag "Straight to the customer from China"',
-        !!pr && pr.counts === 'Pull from China' && pr.stage === 'Booked · Customer Direct' && /Straight to the customer from China/.test(pr.flags), JSON.stringify(pr));
+      c('the side panel: counts in "Sold, ships from China", Stage "Booked · Customer Direct", flag "Straight to the customer from China"',
+        !!pr && pr.counts === 'Sold, ships from China' && pr.stage === 'Booked · Customer Direct' && /Straight to the customer from China/.test(pr.flags), JSON.stringify(pr));
       await key(t, 'Escape');
       await setVal(t, 'fq', 'ST1020'); await sleep(400);
       s = await s2(t);
@@ -1538,6 +1860,10 @@ const SCENARIOS = [
   {
     name: 's2-ctbad', title: 'step 2: Container Tracking fails, every stage number says "not loaded"', world: { ...BIG, ctFile: 'ct-bad.xlsx' },
     async run({ t, c }) {
+      const p = await sl(t);
+      c('Available to sell says "not loaded" everywhere: a lead card saying why, every tile, no rows', p.shown && /Available to sell is not loaded/.test(p.lead) && /Container Tracking \(missing column\)/.test(p.lead) &&
+        p.tiles.length === 5 && p.tiles.every(x => x.n === 'not loaded' && !/\d/.test(x.cs.join(''))) && p.tr === 0 && /^Not loaded/.test(p.empty), `${p.lead} · ${JSON.stringify(p.tiles.map(x => x.n))} · ${p.tr} · ${p.empty}`);
+      await t.click('#tabs .tab[data-tab="inv"]'); await sleep(200);
       let s = await s2(t);
       c('every stage tile says "not loaded", with no partial number', notLoadedEverywhere(s), JSON.stringify(liveTiles(s).map(x => `${x.n} ${x.cs}`)));
       c('the lead card says why', /Stage numbers not loaded/.test(s.lead) && /Container Tracking \(missing column\)/.test(s.lead), s.lead);
@@ -1626,11 +1952,350 @@ const SCENARIOS = [
       t.shots.push(await t.shot('s2-refresh'));
     },
   },
+
+  // ---------------------------------------------------------------- Available to sell
+  {
+    name: 'sell-ok', title: 'Available to sell with a fresh ATS report: tiles, rows, each pull-from rule in the side panel, filters, Problems, the other tabs',
+    world: { ...SELLW, ats: SELL_ATS },
+    async run({ t, w, c, today }) {
+      const { R, A, S } = sellFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS });
+      c('the engines (run here) built the invented sell files with the report', R.ok && R.balance.diff === 0 && R.balance.ct.diff === 0 && A.ok && !!S && S.ok && !S.atsMissing,
+        JSON.stringify({ R: R.ok && R.balance.diff, A: A.ok || A.error, S: S && S.ok }));
+      const lot = (k, po) => S.lots.find(l => l.style === k && String(l.po) === String(po)), sty = k => S.styles.find(x => x.style === k) || {};
+      const L = { etd: lot('SL-101', 900501), crd: lot('SL-102', 900502), crd2: lot('SL-102', 900503), order: lot('SL-103', 900504), now: lot('SL-104', 900505),
+        eta: lot('SL-105', 900506), dis: lot('SL-106', 900507), now2: lot('SL-109', 900509) };
+      const shape = {
+        etd: !!L.etd && L.etd.pullRule === 'etd' && L.etd.pullFrom === today + 20 && L.etd.status === 'Booked',
+        crd: !!L.crd && L.crd.pullRule === 'crd' && L.crd.pullFrom === today + 35 && L.crd.taken === 1200 && L.crd.available === 0,
+        crd2: !!L.crd2 && L.crd2.pullFrom === today + 85 && L.crd2.taken === 300 && L.crd2.available === 180,
+        order: !!L.order && L.order.pullRule === 'order' && L.order.pullFrom === today + 65 && L.order.estimate && L.order.status === 'No CRD',
+        now: !!L.now && L.now.pullRule === 'crd' && L.now.flags.includes('now') && L.now.status === 'Ready' && L.now.available === 0,
+        nowLeft: !!L.now2 && L.now2.flags.includes('now') && L.now2.taken === 100 && L.now2.available === 500,
+        eta: !!L.eta && !L.eta.inChina && L.eta.status === 'On the water' && L.eta.availableDate === today + 20,
+        dis: !!L.dis && L.dis.flags.includes('dates-disagree') && L.dis.readyFrom === 'factoryCrd',
+        oversold: sty('SL-104').oversold === 3800, notOnReport: (sty('SL-103').flags || []).includes('not-on-report'),
+        erpOnly: (sty('SL-108').flags || []).includes('erp-only'), sold: sty('SL-107').soldChina === 720, atsIssue: A.issues.some(i => i.code === 'erp-ats-differs') };
+      c('the invented files exercise every rule: ETD, CRD, the order date, "now", ETA, ready dates that disagree, orders over two lots, oversold, not on the report, report only, sold',
+        Object.values(shape).every(Boolean), JSON.stringify(shape));
+      const rules = ruleMismatches(S, today), sums = sellSums(S, R);
+      c("Saul's pull-from rule and the ready date hold on every lot (worked out here on their own)", !rules.length, rules.join(' | '));
+      c('the selling sums hold (styles, lots, stock after orders, earliest lots first, Incoming, sold)', !sums.length, sums.join(' | '));
+
+      const s = await t.snap();
+      let p = await sl(t);
+      c('Available to sell is shown at start', p.tab === 'sell' && p.shown && s.tabs.sell, `${p.tab} ${p.shown}`);
+      c(`ATS chip green: "${A.counts.rowsRead} read / ${A.counts.styleRows} counted"`, s.chips.ats.state === 'ok' && s.chips.ats.text.includes(`${fmtN(A.counts.rowsRead)} read / ${fmtN(A.counts.styleRows)} counted`),
+        `${s.chips.ats.state}: ${s.chips.ats.text}`);
+      c('no note over the tab, no lead card', !p.note && !p.lead, `${p.note} ${p.lead}`);
+      c('the filter bar is on it, with "Only styles with something available" and without the stage and PO type filters', p.fbarIn === 'tab-sell' && p.availShown && !p.stageShown && !p.typeShown,
+        JSON.stringify([p.fbarIn, p.availShown, p.stageShown, p.typeShown]));
+      for (const k of SELL_TILE_KEYS) {
+        const x = sellTile(p, k), cs = casesSay(S.totals.cases[k], S.totals.noCasePackUnits[k], S.totals.looseUnits[k]);
+        c(`tile ${x.lbl || k}: the engine's ${fmtN(S.totals[k])} units, "${cs}"`, unitsIs(x.n, S.totals[k]) && x.cs[0] === cs, `${x.n} · ${x.cs.join(' | ')}`);
+      }
+      const ov = sellTile(p, 'oversold'), nOv = S.styles.filter(x => x.oversold > 0).length;
+      c(`tile Oversold styles: ${nOv}, "${fmtN(S.totals.oversold)} units oversold", in red`, ov.n.replace(/styles?$/, '') === String(nOv) && ov.cs[0] === `${fmtN(S.totals.oversold)} units oversold` && /\bbad\b/.test(ov.cls),
+        `${ov.n} · ${ov.cs} · ${ov.cls}`);
+      c('From China, Arriving and Total open a panel; Available now and Oversold do not', ['fromChina', 'arriving', 'total'].every(k => sellTile(p, k).btn) && !sellTile(p, 'now').btn && !sellTile(p, 'oversold').btn,
+        JSON.stringify(p.tiles.map(x => [x.k, x.btn])));
+      c('the columns, in order', p.heads.map(h => h.t).join('|') === SELL_HEADS.join('|'), p.heads.map(h => h.t).join('|'));
+      c(`one row per style (${S.styles.length}), sorted by style`, p.tr === S.styles.length && p.rows.map(r => r.style).join() === S.styles.map(x => x.styleRaw).sort().join(), p.rows.map(r => r.style).join());
+      const diff = sellRowsDiffer(p, S, today, 'ok');
+      c("every row: in warehouse, customer orders, available now, from China, first pull date, arriving, first arrival, total and sold are the engine's (blank for 0)", !diff.length, diff.join(' | '));
+      const row = k => p.rows.find(r => r.style === k) || { tags: [] };
+      c('SL-103 (not on the report): "not on report" across the stock columns, a tag, its Total in muted type said to be from China and arriving only',
+        row('SL-103').span === 'not on report' && row('SL-103').tags.includes('not on ATS report') && /\bpt\b/.test(row('SL-103').totalCls) && /from China and arriving only/.test(row('SL-103').totalTitle),
+        JSON.stringify(row('SL-103')));
+      c(`First pull date: SL-103's is the estimate "about ${C.fmtDay(today + 65)}"; SL-109's "now" (its CRD passed); SL-104's blank (customer orders took its lot)`,
+        row('SL-103').firstPull === `about ${C.fmtDay(today + 65)}` && row('SL-109').firstPull === 'now' && row('SL-104').firstPull === '',
+        `${row('SL-103').firstPull} · ${row('SL-109').firstPull} · ${row('SL-104').firstPull}`);
+      c('SL-104: tagged "oversold 3,800", Available now blank', row('SL-104').tags.includes('oversold 3,800') && row('SL-104').now === '' && row('SL-104').nowCell === '', JSON.stringify(row('SL-104')));
+      c('SL-108 (on the report only): a row with its stock, nothing coming', row('SL-108').inWh === '50' && row('SL-108').now === '50' && !row('SL-108').fromChina && !row('SL-108').arriving, JSON.stringify(row('SL-108')));
+      c('SL-102: case pack 12, its UPC under the style', row('SL-102').casePack === '12' && row('SL-102').upc === '000000005024', JSON.stringify(row('SL-102')));
+      t.shots.push(await t.shot('sell-ok'));
+
+      // The side panel of every style with lots: each lot in date order, the date a buyer can have it and its rule in words.
+      const panelBad = [];
+      for (const st of S.styles.filter(x => x.lots.length)) {
+        await t.eval(`[...document.querySelectorAll('#sellTable tbody tr.r button.sb')].find(x => x.textContent.trim() === ${JSON.stringify(st.styleRaw)}).click()`);
+        await sleep(120);
+        p = await sl(t);
+        if (!p.panel || p.panelTitle !== `${st.styleRaw}: available to sell`) { panelBad.push(`${st.style}: panel "${p.panelTitle}"`); continue; }
+        if (p.lots.length !== st.lots.length) panelBad.push(`${st.style}: ${p.lots.length} lots shown, ${st.lots.length} in the engine`);
+        st.lots.forEach((l, j) => {
+          const r = p.lots[j] || {}, cell = h => r[h] || { v: '', u: '', title: '' }, w2 = whenSays(l, today), af = cell('Available from');
+          const got = { status: cell('Status').v, po: cell('PO').v, units: cell('Units').v, taken: cell('Taken by orders').v, avail: cell('Available').v };
+          const want = { status: l.status, po: String(l.po), units: fmtN(l.units), taken: nz(l.taken), avail: nz(l.available) };
+          for (const k of Object.keys(want)) if (got[k] !== want[k]) panelBad.push(`${st.style} lot ${j + 1} ${k}: "${got[k]}", not "${want[k]}"`);
+          if (af.v !== w2.main || !w2.words.every(x => af.title.includes(x))) panelBad.push(`${st.style} PO ${l.po} Available from: "${af.v}" / "${af.title}", not "${w2.main}" with ${JSON.stringify(w2.words)}`);
+          const rd = cell('Ready date (CRD)');
+          if (!rd.v.startsWith(l.readyDate == null ? 'none' : C.fmtDay(l.readyDate)) || /dates disagree/.test(rd.v) !== l.flags.includes('dates-disagree')) panelBad.push(`${st.style} PO ${l.po} ready date: "${rd.v}"`);
+          if (l.readySources.length > 1 && !l.readySources.every(x => rd.u.includes(md(x.day, today)))) panelBad.push(`${st.style} PO ${l.po} ready date sources: "${rd.u}"`);
+          if (cell('ETD').v !== (l.etd == null ? '' : C.fmtDay(l.etd)) || cell('ETA').v !== (l.eta == null ? '' : C.fmtDay(l.eta))) panelBad.push(`${st.style} PO ${l.po} ETD "${cell('ETD').v}", ETA "${cell('ETA').v}"`);
+        });
+        // The stock line under the lots.
+        const stockWant = (st.flags || []).includes('not-on-report') ? ['not on the ATS report'] : [`${fmtN(st.inWh)} in warehouse − ${fmtN(st.orders)} customer orders = ${fmtN(st.inWh - st.orders)} net`,
+          ...(st.ordersTaken ? [`(${fmtN(st.ordersTaken)} taken)`] : []), ...(st.oversold ? [`${fmtN(st.oversold)} more than every lot holds: oversold`] : [])];
+        if (!stockWant.every(x => p.panelStock.includes(x))) panelBad.push(`${st.style} stock line: "${p.panelStock}", not ${JSON.stringify(stockWant)}`);
+        await key(t, 'Escape'); await sleep(60);
+      }
+      c('the side panel of every style with lots: each lot in date order with its status, PO, units, taken by orders, available, the pull-from date ("now" once passed) or ETA with its rule in words, the ready date (every source when they differ), ETD and ETA; then the stock line',
+        !panelBad.length, panelBad.join(' | '));
+      // Two looked at closely: SL-102 (orders take its first lot and part of the second) and SL-106 (ready dates disagree).
+      await t.eval(`[...document.querySelectorAll('#sellTable tbody tr.r button.sb')].find(x => x.textContent.trim() === 'SL-102').click()`); await sleep(150);
+      p = await sl(t);
+      c(`SL-102: "2 lots · ${fmtN(sty('SL-102').fromChina)} available from China · ${fmtN(sty('SL-102').ordersTaken)} taken by customer orders", "all taken" under the first lot`, p.panelLbl === 'What can be sold' &&
+        p.panelSub === `2 lots · ${fmtN(sty('SL-102').fromChina)} available from China · ${fmtN(sty('SL-102').ordersTaken)} taken by customer orders` && !!p.lots[0] && p.lots[0]['Available'].u === 'all taken',
+        `${p.panelLbl} · ${p.panelSub} · ${p.lots[0] && JSON.stringify(p.lots[0]['Available'])}`);
+      t.shots.push(await t.shot('sell-ok-panel'));
+      await key(t, 'Escape'); await sleep(60);
+      c('Esc closes the panel', !(await sl(t)).panel);
+      await t.eval(`[...document.querySelectorAll('#sellTable tbody tr.r button.sb')].find(x => x.textContent.trim() === 'SL-106').click()`); await sleep(150);
+      p = await sl(t);
+      const rd6 = (p.lots[0] || {})['Ready date (CRD)'] || {};
+      c(`SL-106: ready date ${C.fmtDay(today + 40)} "dates disagree", Factory CRD used, CRD Expected ${md(today + 60, today)} beside it`,
+        rd6.v === `${C.fmtDay(today + 40)} dates disagree` && rd6.u.includes(`Factory CRD ${md(today + 40, today)} (used)`) && rd6.u.includes(`CRD Expected ${md(today + 60, today)}`), JSON.stringify(rd6));
+      await t.click('#btnPanelClose'); await sleep(60);
+
+      // The tiles' panels, and Sold (ships from China), which isn't lots: its number opens the stage lines behind it.
+      await t.click('#sellTiles button.tile[data-t="fromChina"]'); await sleep(150);
+      p = await sl(t);
+      const china = S.lots.filter(l => l.inChina);
+      c(`the From China tile lists every lot still in China (${china.length}), with a Style column, adding up to the tile`, p.panel && p.panelTitle === 'Available from China: every style' &&
+        p.panelHead[0] === 'Style' && p.panelTr === china.length && p.panelSub.includes(`${fmtN(S.totals.fromChina)} available from China`), `${p.panelTitle} · ${p.panelHead} · ${p.panelTr} · ${p.panelSub}`);
+      await key(t, 'Escape'); await sleep(60);
+      await t.click('#sellTiles button.tile[data-t="total"]'); await sleep(150);
+      p = await sl(t);
+      c(`the Total tile lists every lot and adds the ${fmtN(S.totals.now)} available now from stock`, p.panel && p.panelTr === S.lots.length && p.panelStock.includes(`Plus ${fmtN(S.totals.now)} available now from stock`),
+        `${p.panelTr} · ${p.panelStock}`);
+      await key(t, 'Escape'); await sleep(60);
+      await t.eval(`[...document.querySelectorAll('#sellTable tbody tr.r')].find(x => x.querySelector('button.sb').textContent.trim() === 'SL-107').querySelector('button.nb[data-b="soldChina"]').click()`); await sleep(150);
+      p = await sl(t);
+      c("SL-107's Sold number opens its lines: 720 units counted in Sold, ships from China", p.panel && p.panelTitle === 'SL-107 · Sold, ships from China' && p.panelSub.includes('720 units counted'), `${p.panelTitle} · ${p.panelSub}`);
+      await key(t, 'Escape'); await sleep(60);
+      // The stage and PO type filters (set on Where it is, hidden here) don't empty that panel.
+      await setVal(t, 'fStage', 'inChina'); await setVal(t, 'fType', 'LA'); await sleep(200);
+      await t.eval(`[...document.querySelectorAll('#sellTable tbody tr.r')].find(x => x.querySelector('button.sb').textContent.trim() === 'SL-107').querySelector('button.nb[data-b="soldChina"]').click()`); await sleep(150);
+      p = await sl(t);
+      c("with a stage and PO type chosen on Where it is (hidden here), SL-107's Sold still opens its 720 units, and the panel names no hidden filter",
+        p.panel && p.panelSub.includes('720 units counted') && !/stage|PO type/.test(p.panelNote || ''), `${p.panelSub} · ${p.panelNote}`);
+      await key(t, 'Escape'); await sleep(60);
+      await setVal(t, 'fStage', ''); await setVal(t, 'fType', ''); await sleep(200);
+
+      // Filters: the rows and the tiles follow them.
+      await setVal(t, 'fq', 'sl-102'); await sleep(400);
+      p = await sl(t);
+      const s102 = sty('SL-102');
+      c('search: one style; the tiles are its numbers, marked filtered', p.tr === 1 && p.rows[0].style === 'SL-102' && p.info === `1 style of ${S.styles.length}` &&
+        unitsIs(sellTile(p, 'fromChina').n, s102.fromChina) && unitsIs(sellTile(p, 'total').n, s102.total) && /filtered/.test(sellTile(p, 'total').lbl), `${p.tr} · ${p.info} · ${sellTilesSay(p, null)}`);
+      await setVal(t, 'fq', '000000005031'); await sleep(400);
+      p = await sl(t);
+      c('search by UPC finds its style', p.tr === 1 && p.rows[0].style === 'SL-103', JSON.stringify(p.rows.map(r => r.style)));
+      await setVal(t, 'fq', ''); await sleep(300);
+      await t.eval(`(() => { const el = document.getElementById('fAvail'); el.checked = true; el.dispatchEvent(new Event('change', { bubbles: true })); })()`); await sleep(300);
+      p = await sl(t);
+      const avail = S.styles.filter(x => x.now > 0 || x.fromChina > 0 || x.arriving > 0);
+      c(`"Only styles with something available": ${avail.length} of ${S.styles.length} (not the all-taken or sold-only ones), the tiles unchanged`,
+        p.tr === avail.length && p.info === `${avail.length} styles of ${S.styles.length}` && !p.rows.some(r => r.style === 'SL-104' || r.style === 'SL-107') && SELL_TILE_KEYS.every(k => unitsIs(sellTile(p, k).n, S.totals[k])),
+        `${p.tr} · ${p.info} · ${p.rows.map(r => r.style)}`);
+      await t.click('#btnClearF'); await sleep(300);
+      p = await sl(t);
+      c('Clear filters clears it', p.tr === S.styles.length && !(await t.eval(`document.getElementById('fAvail').checked`)), `${p.tr}`);
+      // The 5-minute refresh reads the report again and keeps the search.
+      await setVal(t, 'fq', 'sl-102'); await sleep(400);
+      const r5 = await runRefresh(t, w);
+      p = await sl(t);
+      c('the 5-minute refresh reads the ATS report again, keeps the search and shows the same numbers', r5.fired === 1 && r5.calls.some(x => x.path === `/drives/${SRC}/items/itm-ats-1`) &&
+        (await t.eval(`document.getElementById('fq').value`)) === 'sl-102' && p.tr === 1 && unitsIs(sellTile(p, 'total').n, s102.total), `fired ${r5.fired} · ${p.tr} · ${sellTilesSay(p, null)}`);
+      await setVal(t, 'fq', ''); await sleep(300);
+
+      // Pull from China: each open line's pull-from date and what's left after orders; China Pickup "Sold".
+      await t.click('#tabs .tab[data-tab="pull"]'); await sleep(250);
+      const pull = await t.eval(`(() => { const hs = [...document.querySelectorAll('#pullTable thead th')].map(th => { const x = th.cloneNode(true); x.querySelectorAll('.ar').forEach(y => y.remove()); return x.textContent.trim(); });
+        const ix = h => hs.indexOf(h), plain = td => { const x = td.cloneNode(true); x.querySelectorAll('.u').forEach(y => y.remove()); return x.textContent.trim(); };
+        return { hs, rows: [...document.querySelectorAll('#pullTable tbody tr.r')].map(tr => ({ po: plain(tr.children[0]), style: plain(tr.children[1]),
+          when: ix('Pull-from date') < 0 ? null : plain(tr.children[ix('Pull-from date')]), avail: ix('Available after orders') < 0 ? null : plain(tr.children[ix('Available after orders')]) })) }; })()`);
+      const pr = (k, po) => pull.rows.find(r => r.style === k && r.po === String(po)) || {};
+      c('Pull from China: the Pull-from date and Available after orders columns', pull.hs.includes('Pull-from date') && pull.hs.includes('Available after orders'), pull.hs.join('|'));
+      const pullWant = [['SL-101', 900501, whenSays(L.etd, today).main, '1,200'], ['SL-102', 900502, whenSays(L.crd, today).main, 'all taken'], ['SL-102', 900503, whenSays(L.crd2, today).main, '180'],
+        ['SL-103', 900504, whenSays(L.order, today).main, '600'], ['SL-104', 900505, 'now', 'all taken'], ['SL-109', 900509, 'now', '500'], ['SL-107', 900508, 'Sold', 'Sold']];
+      const pullBad = pullWant.filter(([k, po, wh, av]) => pr(k, po).when !== wh || pr(k, po).avail !== av).map(([k, po, wh, av]) => `${k} PO ${po}: "${pr(k, po).when}" / "${pr(k, po).avail}", not "${wh}" / "${av}"`);
+      c('…each open line: its pull-from date ("now" once passed, "about" for an estimate) and what is left after orders ("all taken"); the China Pickup line "Sold"', !pullBad.length, pullBad.join(' | '));
+      t.shots.push(await t.shot('sell-ok-pull'));
+
+      // Where it is: On hand is In WH from the report.
+      await t.click('#tabs .tab[data-tab="inv"]'); await sleep(250);
+      const oh = await t.eval(`Object.fromEntries([...document.querySelectorAll('#invTable tbody tr.r:not(.upc)')].map(r => [r.querySelector('button.sb').textContent.trim(), r.children[4].textContent.trim()]))`);
+      c('Where it is: On hand is In WH from the ATS report (text numbers read; blank for 0; "not on report" for SL-103)', oh['SL-101'] === '1,000' && oh['SL-102'] === '100' && oh['SL-104'] === '' && oh['SL-105'] === '300' && oh['SL-103'] === 'not on report',
+        JSON.stringify(oh));
+      c("Where it is: its tiles are still the stage engine's", tilesAre(await s2(t), R.totals.units), tilesSay(await s2(t), R.totals.units));
+
+      // Problems: Available to sell and the ATS report, each in plain words.
+      await t.click('#tabs .tab[data-tab="problems"]'); await sleep(250);
+      const sp = await s2(t), order = sp.issGroups.map(g => g.split(' · ')[0]);
+      const gSell = sp.issGroups.find(g => g.startsWith('Available to sell')) || '', gAts = sp.issGroups.find(g => g.startsWith('ATS report')) || '';
+      const sellCodes = [...new Set(S.issues.map(i => i.code))], atsCodes = [...new Set(A.issues.map(i => i.code))];
+      c(`Problems: "Available to sell" (${S.issues.length}: ${sellCodes.join(', ')}), then "ATS report" (${A.issues.length}: ${atsCodes.join(', ')}), after Incoming and before the sources, in plain words`,
+        new RegExp(`^Available to sell · ${S.issues.length} issues?`).test(gSell) && new RegExp(`^ATS report · ${A.issues.length} issues?`).test(gAts) &&
+        order.indexOf('Available to sell') === order.indexOf('Incoming') + 1 && order.indexOf('ATS report') === order.indexOf('Available to sell') + 1 &&
+        ![...sellCodes, ...atsCodes].some(k => (gSell + gAts).includes(k)), sp.issGroups.join(' | '));
+      const pt = await t.eval(`document.getElementById('issTable').textContent`);
+      c('…naming the oversold style, the PO and style whose ready dates disagree, the style on the report only and the one whose ERP ATS differs',
+        pt.includes('Style SL-104: customer orders (5,000) are 3,800 units more') && pt.includes('PO 900507, style SL-106: the ready dates are up to 20 days apart') && /SL-108/.test(pt) && /Style SL-101 \(row \d+\): the ERP's "ATS from in WH" is 700/.test(pt),
+        pt.slice(0, 300));
+      c('no "page sums differ" issue (the rows add up to the engine\'s totals)', !/page adds the styles up/.test(pt));
+      await t.click('#tabs .tab[data-tab="sell"]'); await sleep(150);
+    },
+  },
+  {
+    name: 'sell-missing', title: "Available to sell with no ATS report yet: customer orders aren't taken off, said so, nothing partial", world: { ...SELLW },
+    async run({ t, w, c, today }) {
+      const { R, S } = sellFor(w.fx, today, SELL_FILES);
+      c('the engine (run here) without the report', R.ok && !!S && S.ok && S.atsMissing, JSON.stringify({ R: R.ok, S: S && S.atsMissing }));
+      const s = await t.snap();
+      let p = await sl(t);
+      c('ATS chip grey "no report yet"', s.chips.ats.state === 'off' && /no report yet/.test(s.chips.ats.text), s.chips.ats.text);
+      c("an amber note: customer orders aren't taken off until the weekly ATS report is in Stock/ATS on the TestSite site", /\bwarn\b/.test(p.noteCls) &&
+        /Customer orders aren't taken off until the weekly ATS report is in Stock\/ATS on the TestSite site/.test(p.note), `${p.noteCls}: ${p.note}`);
+      c('Available now, Total available and Oversold say "no report yet", with no number', ['now', 'total', 'oversold'].every(k => sellTile(p, k).n === 'no report yet' && !/\d/.test(sellTile(p, k).cs.join(''))),
+        JSON.stringify(p.tiles.map(x => [x.k, x.n, x.cs])));
+      c(`From China and Arriving: the lots in full (${fmtN(S.totals.fromChina)}, ${fmtN(S.totals.arriving)}), marked "customer orders not taken off"`,
+        ['fromChina', 'arriving'].every(k => unitsIs(sellTile(p, k).n, S.totals[k]) && sellTile(p, k).cs.includes('customer orders not taken off')), sellTilesSay(p, S));
+      const diff = sellRowsDiffer(p, S, today, 'no report yet');
+      c('every row: "no report yet" across the stock columns and in Total; from China and arriving in full', p.tr === S.styles.length && !diff.length, `${p.tr} rows · ${diff.join(' | ')}`);
+      await t.eval(`[...document.querySelectorAll('#sellTable tbody tr.r button.sb')].find(x => x.textContent.trim() === 'SL-102').click()`); await sleep(150);
+      p = await sl(t);
+      c('SL-102: both lots in full, nothing taken; the stock line says why', p.lots.length === 2 && p.lots.every(r => r['Taken by orders'].v === '') && p.lots[0]['Available'].v === '1,200' &&
+        p.panelStock.startsWith('Stock: no report yet.') && /Customer orders aren't taken off/.test(p.panelStock), `${JSON.stringify(p.lots.map(r => [r['Taken by orders'].v, r['Available'].v]))} · ${p.panelStock}`);
+      await key(t, 'Escape'); await sleep(60);
+      t.shots.push(await t.shot('sell-missing'));
+      await t.click('#tabs .tab[data-tab="problems"]'); await sleep(250);
+      const sp = await s2(t), g = sp.issGroups.find(x => x.startsWith('Available to sell')) || '';
+      c(`Problems: "Available to sell" has the one line saying customer orders aren't known (${S.issues.length})`, new RegExp(`^Available to sell · ${S.issues.length} issues?`).test(g) && /Customer orders not known/.test(g) &&
+        !sp.issGroups.some(x => x.startsWith('ATS report')), sp.issGroups.join(' | '));
+      await t.click('#tabs .tab[data-tab="sell"]'); await sleep(100);
+      c('no email', sendMails(w.calls).length === 0);
+    },
+  },
+  {
+    name: 'sell-bad', title: "Available to sell with an ATS report that doesn't add up: red, Saul emailed, Available now not loaded", world: { ...SELLW, ats: { age: 2, file: 'ats-sell-bad.xlsx' } },
+    async run({ t, w, c, today }) {
+      const { R, A, S } = sellFor(w.fx, today, { ...SELL_FILES, ats: w.o.ats });
+      c("the report (read here) doesn't add up, so the engine works without it", !!A && !A.ok && /doesn't add up: rows 1,450, Grand Total 9,999/.test(A.error) && !!S && S.atsMissing, A && A.error);
+      const s = await t.snap();
+      let p = await sl(t);
+      c('ATS chip red "doesn\'t add up", with both totals in its tooltip', s.chips.ats.state === 'err' && /doesn't add up/.test(s.chips.ats.text) && /rows 1,450, Grand Total 9,999/.test(s.chips.ats.title),
+        `${s.chips.ats.state}: ${s.chips.ats.text} | ${s.chips.ats.title}`);
+      greenExcept(c, s, []);
+      oneEmail(c, s, w.calls, 'ats', "doesn't add up", today);
+      c("a red note: the report couldn't be used, why, and that Available now says not loaded", /\berr\b/.test(p.noteCls) && /The ATS report couldn't be used:/.test(p.note) && /doesn't add up/.test(p.note) &&
+        /Available now says "not loaded"/.test(p.note), `${p.noteCls}: ${p.note}`);
+      c('Available now, Total available and Oversold "not loaded"; From China and Arriving the lots in full', ['now', 'total', 'oversold'].every(k => sellTile(p, k).n === 'not loaded') &&
+        ['fromChina', 'arriving'].every(k => unitsIs(sellTile(p, k).n, S.totals[k])), sellTilesSay(p, S));
+      const diff = sellRowsDiffer(p, S, today, 'not loaded');
+      c('every row: "not loaded" across the stock columns and in Total', p.tr === S.styles.length && !diff.length, `${p.tr} rows · ${diff.join(' | ')}`);
+      c('the stage numbers are not held up (no red stage banner)', !/stage numbers are not loaded/i.test(banner(s, 'err')), banner(s, 'err'));
+      await t.click('#tabs .tab[data-tab="inv"]'); await sleep(250);
+      const q = await s2(t), oh = await t.eval(`[...new Set([...document.querySelectorAll('#invTable tbody tr.r:not(.upc)')].map(r => r.children[4].textContent.trim()))]`);
+      c('Where it is: the stage tiles as the engine; On hand "not loaded"', tilesAre(q, R.totals.units) && oh.join() === 'not loaded', `${tilesSay(q, R.totals.units)} · ${JSON.stringify(oh)}`);
+      t.shots.push(await t.shot('sell-bad'));
+      await t.click('#tabs .tab[data-tab="sell"]'); await sleep(100);
+    },
+  },
+  {
+    name: 'sell-big', title: 'Available to sell on 2,400 styles with an ATS report: tiles, windowed rows, scroll, sort, only available', world: { ...BIG, ats: { age: 1, file: 'ats-big.xlsx' } },
+    async run({ t, w, c, today }) {
+      const { R, A, S } = sellFor(w.fx, today, { ...BIG_FILES, ats: w.o.ats });
+      c('the engines (run here): over 2,400 styles, customer orders taken off lots, some oversold, three on the report only', R.ok && A.ok && !!S && S.ok && S.styles.length > 2400 && S.totals.ordersTaken > 0 &&
+        S.totals.oversold > 0 && S.counts.erpOnlyStyles === 3, JSON.stringify({ styles: S && S.styles.length, taken: S && S.totals.ordersTaken, oversold: S && S.totals.oversold, erp: S && S.counts.erpOnlyStyles }));
+      const rules = ruleMismatches(S, today), sums = sellSums(S, R);
+      c("Saul's pull-from rule and the ready date hold on every lot (worked out here on their own)", !rules.length, rules.slice(0, 5).join(' | '));
+      c('the selling sums hold', !sums.length, sums.slice(0, 5).join(' | '));
+      let p = await sl(t);
+      for (const k of SELL_TILE_KEYS) c(`tile ${k} = the engine's ${fmtN(S.totals[k])}`, unitsIs(sellTile(p, k).n, S.totals[k]), sellTile(p, k).n);
+      const nOv = S.styles.filter(x => x.oversold > 0).length;
+      c(`tile Oversold styles: ${nOv}`, sellTile(p, 'oversold').n.replace(/styles?$/, '') === String(nOv), sellTile(p, 'oversold').n);
+      c(`info line: ${fmtN(S.styles.length)} styles; windowed: far fewer rows drawn`, p.info === `${fmtN(S.styles.length)} styles` && p.tr > 10 && p.tr < 150, `${p.info} · ${p.tr}`);
+      let diff = sellRowsDiffer(p, S, today, 'ok');
+      c('the rows drawn are the engine\'s', !diff.length, diff.slice(0, 5).join(' | '));
+      const lay = await t.eval(`(() => { const p = document.getElementById('sellPane'); p.scrollLeft = 600; p.dispatchEvent(new Event('scroll'));
+        const td = document.querySelector('#sellTable tbody tr.r td.fz'), th = document.querySelector('#sellTable thead th'), r = p.getBoundingClientRect();
+        const o = { wide: p.scrollWidth > p.clientWidth, left: Math.round(td.getBoundingClientRect().left - r.left - p.clientLeft), th: getComputedStyle(th).position,
+          page: document.documentElement.scrollWidth <= window.innerWidth + 1, bottom: Math.round(r.bottom), h: innerHeight };
+        p.scrollLeft = 0; p.dispatchEvent(new Event('scroll')); return o; })()`);
+      c('the table scrolls in its own pane, ending inside the window: Style frozen, header sticky, no page-wide sideways scroll',
+        lay.th === 'sticky' && lay.page && (!lay.wide || Math.abs(lay.left) <= 2) && lay.bottom <= lay.h && lay.bottom > lay.h - 40, JSON.stringify(lay));
+      t.shots.push(await t.shot('sell-big'));
+      await scrollTo(t, 'sellPane', 40000); await sleep(400);
+      p = await sl(t);
+      diff = sellRowsDiffer(p, S, today, 'ok');
+      c('scrolling draws later rows, still windowed, still the engine\'s', p.first > 600 && p.tr < 150 && !diff.length, `first ${p.first}, ${p.tr} rows · ${diff.slice(0, 3).join(' | ')}`);
+      await t.click('#sellTable th[data-s="total"]'); await sleep(200);
+      p = await sl(t);
+      const hi = p.heads.find(h => h.t === 'Total available'), max = Math.max(...S.styles.map(x => x.total));
+      c(`header sort: Total available, biggest first (${fmtN(max)}), back to the top`, !!hi && hi.sort === 'descending' && p.first === 0 && p.scroll === 0 && p.rows[0].total === fmtN(max), `${JSON.stringify(hi)} · ${p.first} · ${p.rows[0] && p.rows[0].total}`);
+      await t.click('#sellTable th[data-s="style"]'); await sleep(150);
+      await t.eval(`(() => { const el = document.getElementById('fAvail'); el.checked = true; el.dispatchEvent(new Event('change', { bubbles: true })); })()`); await sleep(300);
+      p = await sl(t);
+      const nAv = S.styles.filter(x => x.now > 0 || x.fromChina > 0 || x.arriving > 0).length;
+      c(`"Only styles with something available": ${fmtN(nAv)} of ${fmtN(S.styles.length)}`, p.info === `${fmtN(nAv)} styles of ${fmtN(S.styles.length)}`, p.info);
+      await t.click('#btnClearF'); await sleep(200);
+      await t.click('#tabs .tab[data-tab="problems"]'); await sleep(250);
+      const pt = await t.eval(`document.getElementById('issTable').textContent`), sp = await s2(t);
+      const gSell = sp.issGroups.find(g => g.startsWith('Available to sell')) || '';
+      c(`Problems: Available to sell has the engine's ${S.issues.length} issues; no "page sums differ" issue`, new RegExp(`^Available to sell · ${fmtN(S.issues.length)} issues?`).test(gSell) && !/page adds the styles up/.test(pt), gSell.slice(0, 160));
+      await t.click('#tabs .tab[data-tab="sell"]'); await sleep(100);
+    },
+  },
+  {
+    name: 'sell-real', title: 'Available to sell on local copies of the real files and the real ATS report (only when named, with REAL_DIR and REAL_ATS; numbers printed, nothing else)',
+    world: { ...REAL, ats: { age: 1, file: 'real-ats.xlsx' } }, optIn: true,
+    async run({ t, w, c, today }) {
+      const f = { msl: 'real-msl.xlsx', trk: 'real-trk.xlsx', ct: 'real-ct.xlsx', fwd: 'real-fwd.xlsx', dray: 'real-dray.csv', pob: w.fx.real.pob, upc: w.fx.real.upcPages.flat(), sections: realSections(), ats: w.o.ats };
+      const { R, A, S } = sellFor(w.fx, today, f);
+      c('the engines (run here) on the real files: balance 0, the ATS report adds up', R.ok && R.balance.diff === 0 && R.balance.ct.diff === 0 && !!A && A.ok && !!S && S.ok && !S.atsMissing,
+        JSON.stringify({ R: R.ok && R.balance.diff, A: A && (A.ok || A.error), S: S && S.ok }));
+      const rules = ruleMismatches(S, today), sums = sellSums(S, R);
+      c("Saul's pull-from rule and the ready date hold on every real lot (worked out here on their own)", !rules.length, `${rules.length} lots, e.g. ${rules.slice(0, 3).join(' | ')}`);
+      c('the selling sums hold on the real files', !sums.length, sums.slice(0, 5).join(' | '));
+      let p = await sl(t);
+      const s = await t.snap();
+      c('ATS chip green', s.chips.ats.state === 'ok', `${s.chips.ats.state}: ${s.chips.ats.text}`);
+      for (const k of SELL_TILE_KEYS) c(`tile ${k} = the engine's ${fmtN(S.totals[k])}`, unitsIs(sellTile(p, k).n, S.totals[k]), sellTile(p, k).n);
+      const nOv = S.styles.filter(x => x.oversold > 0).length;
+      c(`tile Oversold styles: ${nOv}`, sellTile(p, 'oversold').n.replace(/styles?$/, '') === String(nOv), sellTile(p, 'oversold').n);
+      c('rows windowed', p.tr > 10 && p.tr < 150, p.tr);
+      const diff = sellRowsDiffer(p, S, today, 'ok');
+      c("the rows drawn are the engine's", !diff.length, `${diff.length} cells differ`);
+      const ms = await t.eval(`(() => { const el = document.getElementById('fAvail'); const t0 = performance.now(); el.checked = true; el.dispatchEvent(new Event('change', { bubbles: true })); const a = performance.now() - t0;
+        const t1 = performance.now(); el.checked = false; el.dispatchEvent(new Event('change', { bubbles: true })); return [a, performance.now() - t1]; })()`);
+      const sm = await t.eval(`(() => { const p = document.getElementById('sellPane'); const t0 = performance.now(); p.scrollTop = 30000; p.dispatchEvent(new Event('scroll')); return new Promise(r => requestAnimationFrame(() => r(performance.now() - t0))); })()`);
+      const tm = await t.eval(`(() => { const t0 = performance.now(); document.querySelector('#sellTiles button.tile[data-t="fromChina"]').click(); return performance.now() - t0; })()`);
+      p = await sl(t);
+      c('the From China tile opens its lots, adding up to the tile', p.panel && p.panelTr > 0 && p.panelSub.includes(`${fmtN(S.totals.fromChina)} available from China`), p.panelSub.replace(/[^\d,· a-z]/gi, ''));
+      c('"only available" redraws in under 300 ms; the tile panel opens in under 500 ms', ms[0] < 300 && ms[1] < 300 && tm < 500, `${ms.map(x => x.toFixed(0))} · ${tm.toFixed(0)}`);
+      await key(t, 'Escape');
+      await t.click('#tabs .tab[data-tab="problems"]'); await sleep(300);
+      const pt = await t.eval(`document.getElementById('issTable').textContent`);
+      c('no "page sums differ" issue (the rows add up to the engine\'s totals)', !/page adds the styles up/.test(pt));
+      const T = S.totals, K = T.cases, N = T.noCasePackUnits, cnt = S.counts, codes = {};
+      for (const i of S.issues) codes[i.code] = (codes[i.code] || 0) + 1;
+      console.log('REAL Available to sell (units / cases / units with no case pack):');
+      for (const k of ['now', 'fromChina', 'arriving', 'total', 'soldChina']) console.log(`  ${k}: ${fmtN(T[k])} / ${fmtN(K[k])} / ${fmtN(N[k])}`);
+      console.log(`  oversold ${fmtN(T.oversold)} units on ${fmtN(nOv)} styles · customer orders taken off lots ${fmtN(T.ordersTaken)}`);
+      console.log(`REAL lots ${fmtN(cnt.lots)} (in China ${fmtN(cnt.lotsInChina)}, sailed ${fmtN(cnt.lotsSailed)}) · pull rule ${Object.entries(cnt.byRule).map(([k, v]) => `${k} ${fmtN(v)} (${fmtN(cnt.byRuleUnits[k])} units)`).join(', ')} · "now" ${fmtN(cnt.pullNow)} · sailed ${Object.entries(cnt.sailedByRule).map(([k, v]) => `${k} ${fmtN(v)}`).join(', ')}`);
+      console.log(`REAL dates disagree: ${fmtN(cnt.datesDisagreeLots)} lots on ${fmtN(cnt.datesDisagreePairs)} PO + style · styles ${fmtN(S.styles.length)}, with stock now ${fmtN(cnt.stylesWithStock)}, not on the report ${fmtN(cnt.stylesNotOnReport)}, report only ${fmtN(cnt.erpOnlyStyles)}`);
+      console.log('REAL Available to sell issue codes: ' + Object.entries(codes).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(', '));
+      console.log(`REAL page: ${p.tr} rows drawn; only available ${ms.map(x => x.toFixed(0)).join('/')} ms, scroll ${sm.toFixed(0)} ms, From China panel ${tm.toFixed(0)} ms`);
+      await t.click('#tabs .tab[data-tab="sell"]');
+    },
+  },
   {
     name: 's2-real', title: 'step 2 on local copies of the real files (only when named, with REAL_DIR; numbers printed, nothing else)', world: { ...REAL }, optIn: true,
     async run({ t, w, c, today }) {
       const R = stagesFor(w.fx, today, { msl: 'real-msl.xlsx', trk: 'real-trk.xlsx', ct: 'real-ct.xlsx', fwd: 'real-fwd.xlsx', dray: 'real-dray.csv', pob: w.fx.real.pob, upc: w.fx.real.upcPages.flat(), sections: realSections() });
       c("config.js's section lists are served to the page and used here", !!realSections() && Array.isArray(realSections().pullFromChina), JSON.stringify(Object.keys(realSections() || {})));
+      await t.click('#tabs .tab[data-tab="inv"]'); await sleep(300);
       let s = await s2(t);
       c('the engine (run here) is ok on the real files, balance 0', R.ok && R.balance.diff === 0 && R.balance.ct.diff === 0, JSON.stringify(R.ok ? R.balance.diff : R.notLoaded));
       for (const k of TILE_KEYS) c(`tile ${k} = the engine's ${R.totals.units[k].toLocaleString('en-US')}`, unitsIs(tileN(s, k), R.totals.units[k]), tileN(s, k));
@@ -1672,13 +2337,18 @@ async function main() {
   const run = SCENARIOS.filter(s => want.has(s.name));
 
   mkdirSync(OUT, { recursive: true });
-  const fx = buildFixtures();
-  if (want.has('s2-real')) {
+  const today = TODAY;
+  const fx = buildFixtures(today);
+  if (want.has('s2-real') || want.has('sell-real')) {
     const dir = process.env.REAL_DIR, lists = process.env.REAL_LISTS || (dir && join(dir, 'lists.json'));
-    if (!dir || !existsSync(dir) || !existsSync(lists)) { console.log('s2-real needs REAL_DIR (the folder of real files) and its lists.json (or REAL_LISTS).'); process.exit(2); }
+    if (!dir || !existsSync(dir) || !existsSync(lists)) { console.log('s2-real and sell-real need REAL_DIR (the folder of real files) and its lists.json (or REAL_LISTS).'); process.exit(2); }
     addRealFiles(fx, resolve(dir), resolve(lists));
+    if (want.has('sell-real')) {
+      const ats = process.env.REAL_ATS;
+      if (!ats || !existsSync(ats)) { console.log('sell-real needs REAL_ATS (the ERP\'s ATS report, .xlsx).'); process.exit(2); }
+      fx.bytes.set('real-ats.xlsx', readFileSync(ats));
+    }
   }
-  const today = C.todayNY(Date.now());
   const e = expected(fx, today);
   const results = [];
   const setup = { name: 'setup checks', title: 'fixtures, harness and the whole run', checks: [] };
@@ -1686,7 +2356,7 @@ async function main() {
   sc('core/pobook.js block hashes to CORE_SHA256 (the fake PO Book page serves it)', fx.blockMatches);
   sc('the invented files parse and exercise the PO Book marks, issues and the stage engine', e.sane, JSON.stringify(e));
   const gaps = unlabelledCodes();
-  sc('every issue code and flag core/stages.js gives has plain words in app.js CODE_LABELS', !gaps.length, gaps.join(', '));
+  sc('every issue code and flag core/stages.js, core/ats.js and core/sell.js give has plain words in app.js CODE_LABELS', !gaps.length, gaps.join(', '));
   const real = readFileSync(join(REPO, 'config.js'), 'utf8');
   sc('the test config.js is not the real one (invented locations, test client id)', !Object.values(LOC).some(v => real.includes(v)) && !real.includes(TEST_CONFIG.clientId) && !/sharepoint\.example/.test(real));
   results.push(setup);
