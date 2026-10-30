@@ -1,10 +1,22 @@
-// Runs the page's parsers on local copies of the real source files and prints only their structure: each header row,
-// the counts, issue codes with up to 3 row numbers, and whether core/pobook.js still matches the PO Book.
-// Nothing else from the files is printed (no cell values, no issue messages).
-//   node tools/check-real.mjs <folder> [po-book index.html] [--today=yyyy-mm-dd]
+// Runs the page's parsers and the stage engine on local copies of the real source files and prints only their
+// structure and numbers: each header row, the counts, issue codes with up to 3 row numbers, the Incoming totals and
+// balance, and whether core/pobook.js still matches the PO Book. Nothing else from the files is printed (no cell
+// values, no issue messages); the ERP cross-check names style codes next to numbers, nothing more.
+//   node tools/check-real.mjs <folder> [po-book index.html] [--lists <lists.json>] [--ats <ERP report.xlsx>]
+//                             [--today yyyy-mm-dd] [--no-reports | --no-forwarder | --no-drayage]
 // <folder> holds Master Sheet Live.xlsx, PO Status Tracker.xlsx, Container Tracking Sheet.xlsx, Forwarder.xlsx and
 // Drayage.csv. The PO Book file defaults to $PO_BOOK_HTML, then ../po-book/index.html next to this repo.
-// Exit code 1 when a file is missing or fails to parse, counts don't add up, or the PO Book's rules changed.
+// --lists: the SharePoint lists the page reads, saved as JSON { UPC_MASTER: [items], PO_Book_Lines: [items] } (Graph
+// list items with their fields); defaults to <folder>/lists.json when it's there. Without it the PO Book's marks and
+// UPC_MASTER are left out, so open/shipped and descriptions can differ from the page.
+// --ats: the ERP's "Inventory Report - On Hand_In Transit_In Production" (sheet "Report"), compared per style with
+// Incoming: In Trans Qty vs On the water + At port, Import PO Backlog Qty vs In China (LA POs only).
+// --no-reports: the stages without the forwarder and drayage reports, as the page shows them when both are missing;
+// --no-forwarder / --no-drayage: without that one report only (as when it is too old, or fails to read).
+// The Container Tracking section lists come from config.js (run with a stand-in window), as the page passes them;
+// --no-sections leaves them out (sections with no round all Booked/Loaded; POs below the tracker's lowest still apart).
+// Exit code 1 when a file is missing or fails to parse, counts don't add up, the balance is off, or the PO Book's
+// rules changed. Differences from the ERP are printed, never a failure.
 import { readFileSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, resolve } from 'node:path';
@@ -13,20 +25,34 @@ import { loadXLSX, core, root } from '../tests/load.mjs';
 const XOPT = { type: 'array', cellFormula: false, cellHTML: false, cellStyles: false };   // as app.js reads files
 const FILES = { msl: 'Master Sheet Live.xlsx', tracker: 'PO Status Tracker.xlsx', ct: 'Container Tracking Sheet.xlsx',
   forwarder: 'Forwarder.xlsx', drayage: 'Drayage.csv' };
+const USAGE = 'Usage: node tools/check-real.mjs <folder> [po-book index.html] [--lists <lists.json>] [--ats <ERP report.xlsx>] [--today yyyy-mm-dd] [--no-reports | --no-forwarder | --no-drayage] [--no-sections]';
 
-const args = process.argv.slice(2);
-const opt = Object.fromEntries(args.filter(a => a.startsWith('--')).map(a => { const [k, v] = a.slice(2).split('='); return [k, v ?? true]; }));
-const [folderArg, poBookArg] = args.filter(a => !a.startsWith('--'));
-if (!folderArg || opt.help) {
-  console.log('Usage: node tools/check-real.mjs <folder> [po-book index.html] [--today=yyyy-mm-dd]');
-  process.exit(folderArg ? 0 : 2);
+// Options take their value after "=" or as the next argument (--ats <file>); the rest are the two paths.
+const VALUED = ['today', 'lists', 'ats'], FLAGS = ['no-reports', 'no-forwarder', 'no-drayage', 'no-sections', 'help'];
+const opt = {}, pos = [];
+for (let i = 2, a = process.argv; i < a.length; i++) {
+  if (!a[i].startsWith('--')) { pos.push(a[i]); continue; }
+  const [k, v] = [a[i].slice(2).split('=')[0], a[i].includes('=') ? a[i].slice(a[i].indexOf('=') + 1) : undefined];
+  if (VALUED.includes(k)) {
+    const val = v ?? a[++i];
+    if (val == null || val.startsWith('--')) { console.log(`--${k} needs a value.\n${USAGE}`); process.exit(2); }
+    opt[k] = val;
+  } else if (FLAGS.includes(k)) opt[k] = true;
+  else { console.log(`Unknown option --${k}.\n${USAGE}`); process.exit(2); }
+}
+const [folderArg, poBookArg] = pos;
+if (!folderArg || opt.help || pos.length > 2) {
+  console.log(USAGE);
+  process.exit(folderArg && opt.help ? 0 : 2);
 }
 const folder = resolve(folderArg);
 
 const XLSX = loadXLSX();
-const C = core('common'), PB = core('pobook'), CT = core('ct'), SH = core('shipping');
+const C = core('common'), PB = core('pobook'), CT = core('ct'), SH = core('shipping'), UPC = core('upc'), ST = core('stages');
 const today = opt.today ? C.dayFromIso(opt.today) : C.todayNY(Date.now());
-if (today == null) { console.log(`--today=${opt.today} isn't a yyyy-mm-dd date.`); process.exit(2); }
+if (today == null) { console.log(`--today ${opt.today} isn't a yyyy-mm-dd date.`); process.exit(2); }
+const listsPath = opt.lists ? resolve(opt.lists) : existsSync(join(folder, 'lists.json')) ? join(folder, 'lists.json') : null;
+const atsPath = opt.ats ? resolve(opt.ats) : null;
 
 let failures = 0;
 const fails = msg => { failures++; console.log(`  FAILED: ${msg}`); };
@@ -73,6 +99,12 @@ function bytesOf(k) {
   return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
 }
 function readBook(bytes, extra) { return XLSX.read(bytes, { ...XOPT, ...(extra || {}) }); }
+// config.js run with a stand-in window, as the page runs it; its `sections` (undefined when it has none).
+function configSections() {
+  const win = {};
+  new Function('window', readFileSync(root('config.js'), 'utf8'))(win);
+  return win.INV_CONFIG ? win.INV_CONFIG.sections : undefined;
+}
 // One sheet's rows from A1, as app.js reads Master Sheet Live and the tracker.
 function readSheet(bytes, sheet) {
   let wb = readBook(bytes, { sheets: [sheet] }), hit = C.findSheet(wb, sheet);
@@ -115,10 +147,12 @@ if (tb) {
 
 head(`Master Sheet Live (${FILES.msl}, sheet "Master Sheet Live")`);
 const mb = bytesOf('msl');
+let mrows = null, msrc = null, mcounts = null;   // kept for the stage engine below
 if (mb) {
   try {
     const t0 = performance.now();
-    const r = readSheet(mb, 'Master Sheet Live'), mrows = r.rows;
+    const r = readSheet(mb, 'Master Sheet Live');
+    mrows = r.rows;
     console.log(`  sheet range ${r.ref}; read in ${secs(t0)}`);
     console.log(`  header row 1: ${headerLine(mrows[0])}`);
     if (!trk) fails('not counted: it is read together with the PO Status Tracker, which failed');
@@ -132,7 +166,7 @@ if (mb) {
         const open = lines.filter(l => l.status === 'open').length;
         console.log(`  parseMaster: ${n(src.lines.length)} lines (countMaster counted ${n(cm.counts.line)}: ${src.lines.length === cm.counts.line ? 'same' : 'DIFFERENT'})`);
         if (src.lines.length !== cm.counts.line) fails('parseMaster and countMaster disagree on the number of lines');
-        console.log(`  without the PO Book's marks (PO_Book_Lines isn't read locally): open ${n(open)}, shipped ${n(lines.length - open)}`);
+        console.log(`  without the PO Book's marks: open ${n(open)}, shipped ${n(lines.length - open)}`);
         // As the page lists them: countMaster's issues (with rows), then parseMaster's own except 'nostyle' (a repeat
         // of countMaster's) and 'trkonly' (listed under the tracker).
         const own = src.issues.filter(i => i.code !== 'nostyle' && i.code !== 'trkonly');
@@ -141,7 +175,7 @@ if (mb) {
         const rowIn = i => { const m = /\brow (\d+)/.exec(i.issue || ''); return m ? `row ${m[1]}` : '(no row)'; };
         issueLines([...cm.issues, ...own], i => (i.row ? `row ${i.row}` : rowIn(i)));
         if (!cm.ok || !src.lines.length) fails(cm.error || 'no lines');
-        else console.log('  result: ok');
+        else { console.log('  result: ok'); msrc = src; mcounts = cm.counts; }
       }
     }
   } catch (e) { fails(`can't read it: ${e.message}`); }
@@ -151,6 +185,7 @@ if (trkonly.length) console.log(`\n  PO Status Tracker, also listed by the PO Bo
 // ---------------- Container Tracking
 head(`Container Tracking (${FILES.ct})`);
 const cb = bytesOf('ct');
+const used = { ct: null, forwarder: null, drayage: null, upc: null };   // each parse result the page would use, or null
 if (cb) {
   try {
     const t0 = performance.now();
@@ -181,7 +216,7 @@ if (cb) {
     console.log(`  PO blocks ${n(blocks.length)} (${n(inRound)} in a round) · lines ${n(blocks.reduce((s, b) => s + b.lines.length, 0))}`);
     issueLines(r.issues, sheetRowOf);
     if (!r.ok) fails(r.error);
-    else console.log('  result: ok');
+    else { console.log('  result: ok'); used.ct = r; }
   } catch (e) { fails(`can't read it: ${e.message}`); }
 }
 
@@ -202,7 +237,7 @@ if (fb) {
     }
     issueLines(r.issues, rowOf);
     if (!r.ok) fails(r.error);
-    else console.log('  result: ok');
+    else { console.log('  result: ok'); used.forwarder = r; }
   } catch (e) { fails(`can't read it: ${e.message}`); }
 }
 
@@ -222,11 +257,326 @@ if (db) {
     }
     issueLines(r.issues, rowOf);
     if (!r.ok) fails(r.error);
-    else console.log('  result: ok');
+    else { console.log('  result: ok'); used.drayage = r; }
   } catch (e) { fails(`can't read it: ${e.message}`); }
 }
 
-console.log('\n== UPC_MASTER and PO_Book_Lines are SharePoint lists: not checked here (the page reads them).');
+// ---------------- the SharePoint lists, from a saved copy
+let pobItems = null;
+if (!listsPath) {
+  console.log('\n== UPC_MASTER and PO_Book_Lines: no --lists file (and no lists.json in the folder), so the PO Book\'s marks and');
+  console.log('   UPC_MASTER are left out below: open/shipped, descriptions and categories can differ from the page.');
+} else {
+  head(`SharePoint lists (${listsPath})`);
+  let L = null;
+  try { L = JSON.parse(readFileSync(listsPath, 'utf8')); } catch (e) { fails(`can't read it: ${e.message}`); }
+  const items = k => { const v = L && L[k]; return Array.isArray(v) ? v : v && Array.isArray(v.value) ? v.value : null; };
+  if (L) {
+    pobItems = items('PO_Book_Lines');
+    if (!pobItems) fails('it has no PO_Book_Lines array');
+    else {
+      const ov = PB.overlayFromItems(pobItems), keys = new Set(pobItems.map(i => C.S(i.fields && i.fields.LineKey)).filter(Boolean));
+      const noKey = pobItems.filter(i => !C.S(i.fields && i.fields.LineKey)).length;
+      console.log(`  PO_Book_Lines: ${n(pobItems.length)} items read · ${n(ov.size)} lines marked in the PO Book · settings item ${keys.has('__settings') ? 'yes' : 'no'} · no LineKey ${n(noKey)}`);
+      if (pobItems.length > 1 && !keys.size) fails('no PO_Book_Lines item has a LineKey (the page stops on this)');
+    }
+    const upcItems = items('UPC_MASTER');
+    if (!upcItems) fails('it has no UPC_MASTER array');
+    else {
+      const t0 = performance.now();
+      const u = UPC.fromListItems(upcItems);
+      console.log(`  UPC_MASTER: read in ${secs(t0)}`);
+      otherCounts(u.counts, []);
+      issueLines(u.issues, i => (i.row == null || i.row === '' ? '' : `item ${i.row}`));
+      if (!u.ok) fails(u.error || 'UPC_MASTER gave nothing usable');
+      else { console.log('  result: ok'); used.upc = u; }
+    }
+  }
+}
+
+// ---------------- Incoming: the stage engine on the same files, with the input app.js gives it
+head('Incoming (core/stages.js)');
+const LABEL = { noCrd: 'No CRD', inProd: 'In production', ready: 'Ready', booked: 'Booked', loaded: 'Loaded', inChina: 'In China',
+  water: 'On the water', port: 'At port', incoming: 'Incoming', pullFromChina: 'Pull from China', unmatched: 'Unmatched' };
+let R = null, sections;
+const blockers = [!trk && 'PO Status Tracker', !msrc && 'Master Sheet Live', !used.ct && 'Container Tracking'].filter(Boolean);
+if (blockers.length) fails(`not loaded: ${blockers.join(', ')} didn't load, so the page shows "not loaded" for every stage number`);
+else {
+  const ov = pobItems ? PB.overlayFromItems(pobItems) : null, cfg = pobItems ? PB.cfgFrom(pobItems) : null;
+  const lines = ov && cfg ? PB.applyOverlay(msrc, ov, cfg) : msrc.lines;   // as app.js: without the list, parseMaster's lines
+  const open = lines.filter(l => (l.status || (l.src === 'round' ? 'shipped' : 'open')) === 'open').length;
+  const fwd = opt['no-reports'] || opt['no-forwarder'] ? null : used.forwarder, dray = opt['no-reports'] || opt['no-drayage'] ? null : used.drayage;
+  const left = ['no-reports', 'no-forwarder', 'no-drayage'].filter(k => opt[k]).map(k => '--' + k).join(' ');
+  console.log(`  lines ${n(lines.length)} (open ${n(open)}, shipped ${n(lines.length - open)})${ov ? " with the PO Book's marks" : " WITHOUT the PO Book's marks (no --lists)"}`);
+  console.log(`  forwarder ${fwd ? 'used' : 'not used'} · drayage ${dray ? 'used' : 'not used'}${left ? ` (${left})` : ''} · UPC_MASTER ${used.upc ? 'used' : 'not used'} · today ${C.fmtDay(today)}`);
+  if (fwd || dray) console.log('  (the reports are used whatever their age here; the page refuses one over 7 days old)');
+  // config.js's section lists, as the page passes them (window.INV_CONFIG.sections).
+  try { sections = opt['no-sections'] ? undefined : configSections(); } catch (e) { fails(`can't read config.js: ${e.message}`); }
+  const lists = sections ? Object.entries(sections).map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(' | ') : '(not a list)'}`).join(' · ') : '';
+  console.log(`  sections ${opt['no-sections'] ? 'NOT used (--no-sections)' : sections ? `from config.js: ${lists}` : 'missing from config.js (no section rules)'} · PO Status Tracker's lowest PO ${trk && Number.isFinite(trk.minPO) ? trk.minPO : 'unknown'}`);
+  try {
+    const t0 = performance.now();
+    R = ST.build({ po: { trk, src: msrc, lines, ov, cfg, counts: mcounts, mrows }, mrows, ct: used.ct, forwarder: fwd, drayage: dray, upc: used.upc, today, sections });
+    console.log(`  built in ${secs(t0)}`);
+  } catch (e) { fails(`the stage engine stopped: ${e.message}`); }
+  if (R && R.ok === false) { fails(`the engine says not loaded: ${(R.notLoaded || []).join(', ')}`); R = null; }
+}
+if (R) {
+  const U = R.totals.units, K = R.totals.cases, NP = R.totals.noCasePackUnits;
+  console.log(`\n  ${'Totals'.padEnd(16)} ${'units'.padStart(12)} ${'cases'.padStart(10)} ${'units, no case pack'.padStart(20)}`);
+  for (const k of ST.TOTAL_KEYS) console.log(`  ${LABEL[k].padEnd(16)} ${n(U[k]).padStart(12)} ${n(K[k]).padStart(10)} ${n(NP[k]).padStart(20)}`);
+
+  // The totals add up three ways: the derived keys, the styles, and the allocations themselves.
+  const tsum = (o, ks) => ks.reduce((s, k) => s + o[k], 0);
+  const sumUp = [];
+  for (const [what, o] of [['units', U], ['cases', K], ['no-case-pack units', NP]]) {
+    if (o.inChina !== tsum(o, ST.IN_CHINA)) sumUp.push(`${what}: In China ${n(o.inChina)} isn't No CRD + In production + Ready + Booked + Loaded (${n(tsum(o, ST.IN_CHINA))})`);
+    if (o.incoming !== o.inChina + o.water + o.port) sumUp.push(`${what}: Incoming ${n(o.incoming)} isn't In China + On the water + At port (${n(o.inChina + o.water + o.port)})`);
+  }
+  const fromStyles = Object.fromEntries(ST.TOTAL_KEYS.map(k => [k, R.styles.reduce((s, x) => s + (x.units[k] || 0), 0)]));
+  const offStyles = ST.TOTAL_KEYS.filter(k => fromStyles[k] !== U[k]);
+  if (offStyles.length) sumUp.push(`the styles add up to other totals: ${offStyles.map(k => `${LABEL[k]} ${n(fromStyles[k])}`).join(', ')}`);
+  const upcOff = R.styles.filter(s => s.upcs.length && ST.TOTAL_KEYS.some(k => s.upcs.reduce((t, u) => t + (u.units[k] || 0), 0) !== (s.units[k] || 0))).length;
+  if (upcOff) sumUp.push(`${n(upcOff)} styles whose UPC lines don't add up to the style`);
+  const BUCKET_TOTALS = { water: ['water', 'incoming'], port: ['port', 'incoming'], pullFromChina: ['pullFromChina'], unmatched: ['unmatched'] };
+  for (const k of ST.IN_CHINA) BUCKET_TOTALS[k] = [k, 'inChina', 'incoming'];
+  const fromAllocs = Object.fromEntries(ST.TOTAL_KEYS.map(k => [k, 0]));
+  const outside = {};
+  for (const a of R.allocs) {
+    const hidden = a.bucket === 'unmatched' && a.stage === 'Landed';
+    if (!hidden && BUCKET_TOTALS[a.bucket]) for (const k of BUCKET_TOTALS[a.bucket]) fromAllocs[k] += a.units;
+    else { const k = hidden ? 'unmatched, landed (hidden)' : a.bucket === 'ctMore' ? `ctMore, ${a.stage === 'Landed' ? 'landed' : 'not landed'}` : a.bucket; outside[k] = (outside[k] || 0) + a.units; }
+  }
+  const offAllocs = ST.TOTAL_KEYS.filter(k => fromAllocs[k] !== U[k]);
+  if (offAllocs.length) sumUp.push(`the allocations add up to other totals: ${offAllocs.map(k => `${LABEL[k]} ${n(fromAllocs[k])}`).join(', ')}`);
+  console.log(`  totals add up (In China and Incoming from their parts; the styles; their UPC lines; the allocations): ${sumUp.length ? 'NO' : 'yes'}`);
+  for (const x of sumUp) fails(x);
+  console.log(`  outside every total (units): ${Object.entries(outside).sort().map(([k, v]) => `${k} ${n(v)}`).join(' · ') || 'none'}`);
+  // Units in Container Tracking sections with no round, by section and where they went. Only names on config.js's
+  // lists are printed (they're public); any other section is "another section".
+  const listed = new Set(Object.values(sections || {}).filter(Array.isArray).flat());
+  const known = s => { const k = C.S(s).replace(/\s+/g, ' ').toLowerCase(); return [...listed].some(x => C.S(x).replace(/\s+/g, ' ').toLowerCase() === k); };
+  const bySec = {};
+  // Container Tracking units only (a Master Sheet line at its own stage under a planning section also names it).
+  for (const a of R.allocs) if (a.section && a.ctRows.length) {
+    const k = known(a.section) ? a.section : '(another section)';
+    const m = bySec[k] || (bySec[k] = {});
+    const b = a.bucket === 'unmatched' && a.stage === 'Landed' ? 'unmatched, landed' : a.bucket;
+    m[b] = (m[b] || 0) + a.units;
+  }
+  console.log('  sections with no round (units, by where they went):');
+  for (const [s, m] of Object.entries(bySec).sort()) console.log(`    ${s.padEnd(18)} ${Object.entries(m).sort((p, q) => q[1] - p[1]).map(([k, v]) => `${k} ${n(v)}`).join(' · ')}`);
+  console.log(`  Container Tracking-only outcomes: planning ${n(R.counts.planningUnits)} · ignored ${n(R.counts.ignoredUnits)} · below the tracker's lowest PO ${n(R.counts.belowTrackerUnits)} on ${n(R.counts.belowTrackerLines)} lines (${n(R.counts.belowTrackerNotLandedUnits)} not landed)` +
+    ` · sections not on the lists ${n(R.counts.sectionsNotListed)} (${n(R.counts.sectionNotListedUnits)} units counted Booked/Loaded)`);
+
+  const b = R.balance;
+  console.log('\n  Balance');
+  console.log(`    Master Sheet Live: ${n(b.groups)} PO + style groups, ${n(b.mslUnits)} units = ${n(b.outcomeUnits)} in a stage or outcome · difference ${n(b.diff)} · groups off ${n(b.bad.length)}`);
+  console.log(`    Container Tracking: ${n(b.ct.units)} units on its lines = ${n(b.ct.outcomeUnits)} placed · difference ${n(b.ct.diff)}`);
+  if (b.diff !== 0 || b.bad.length) fails(`the Master Sheet Live balance is off by ${n(b.diff)} (${n(b.bad.length)} groups)`);
+  if (b.ct.diff !== 0) fails(`the Container Tracking balance is off by ${n(b.ct.diff)}`);
+
+  console.log('\n  Counts');
+  for (const [k, v] of Object.entries(R.counts)) console.log(`    ${k}: ${Array.isArray(v) ? v.join(', ') || '(none)' : n(v)}`);
+  const by = (list, f) => Object.entries(list.reduce((m, x) => { const k = f(x); m[k] = (m[k] || 0) + 1; return m; }, {})).sort((p, q) => q[1] - p[1]).map(([k, v]) => `${k} ${n(v)}`).join(' · ');
+  console.log(`    styles ${n(R.styles.length)} (${n(R.styles.filter(s => s.upcs.length > 1).length)} with more than one UPC) · allocations ${n(R.allocs.length)} · Pull from China rows ${n(R.pull.length)}`);
+  console.log(`    allocations by bucket: ${by(R.allocs, a => a.bucket)}`);
+  console.log(`    Pull from China by PO type: ${by(R.pull, p => p.ptype)} · by status: ${by(R.pull, p => (p.ctParts.length > 1 ? '(a mix)' : p.ctParts.length ? p.ctParts[0].status + (p.ctParts[0].section ? ' · a section' : '') : 'Not on tracker'))}`);
+  // The Pull from China tile against the Pull from China tab (open lines only): the difference is shipped lines.
+  const pfc = R.allocs.filter(a => a.bucket === 'pullFromChina'), sumU = a => a.reduce((s, x) => s + x.units, 0);
+  const pfcOpen = sumU(pfc.filter(a => a.status === 'open')), pfcShipped = pfc.filter(a => a.sheetRow != null && a.status !== 'open');
+  const pfcCt = sumU(pfc.filter(a => a.sheetRow == null));
+  // The tab's stage filter picks a line (all its units) when its PO is China Pickup or it has a direct-to-customer section.
+  const tabLines = R.pull.filter(p => p.ptype === 'China Pickup' || p.flags.includes('pull-section')), tabKeys = new Set(tabLines.map(p => p.lineKey));
+  const tabUnits = sumU(tabLines), tabPfc = sumU(pfc.filter(a => a.status === 'open' && tabKeys.has(a.lineKey)));
+  const pfcAdds = pfcOpen + sumU(pfcShipped) + pfcCt === U.pullFromChina;
+  console.log(`    Pull from China tile ${n(U.pullFromChina)} = open lines (on the Pull from China tab) ${n(pfcOpen)} + shipped lines ${n(sumU(pfcShipped))} on ${n(new Set(pfcShipped.map(a => a.lineKey)).size)} lines (not on the tab; each listed as ct-behind-msl)${pfcCt ? ` + Container Tracking only ${n(pfcCt)}` : ''}: ${pfcAdds ? 'adds up' : 'DOES NOT add up'}`);
+  console.log(`    the tab's "Pull from China" stage filter: ${n(tabLines.length)} lines, ${n(tabUnits)} units = ${n(tabPfc)} in Pull from China + ${n(tabUnits - tabPfc)} of those lines at another stage (partly covered)` +
+    (pfcOpen !== tabPfc ? ` · ${n(pfcOpen - tabPfc)} open-line units in Pull from China on lines it doesn't pick` : ''));
+  if (!pfcAdds) fails('the Pull from China tile is not open lines + shipped lines');
+  const ids = new Set(R.allocs.map(a => a.id));
+  if (ids.size !== R.allocs.length) fails(`${n(R.allocs.length - ids.size)} allocations share an id`);
+  console.log('');
+  issueLines(R.issues, i => [i.sheet, i.row == null || i.row === '' ? '' : `row ${i.row}`].filter(Boolean).join(' '));
+  if (R.issues.some(i => i.code === 'balance')) fails('the engine raised a balance issue');
+}
+
+// ---------------- the ERP's report, per style, against Incoming
+if (atsPath) {
+  head(`ERP cross-check (${atsPath})`);
+  if (!existsSync(atsPath)) fails(`${atsPath} isn't there`);
+  else if (!R) fails('not compared: the stage numbers did not load');
+  else {
+    try { erpCheck(atsPath, R); } catch (e) { fails(`can't read it: ${e.message}`); }
+  }
+}
+
+function erpCheck(path, R) {
+  const buf = readFileSync(path);
+  const wb = readBook(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
+  const hit = C.findSheet(wb, 'Report') || { name: wb.SheetNames[0], ws: wb.Sheets[wb.SheetNames[0]] };
+  const rows = C.sheetRows(XLSX, hit.ws);
+  const SPEC = { style: { names: ['Style'], required: true }, inTrans: { names: ['In Trans Qty'], required: true },
+    backlog: { names: ['Import PO Backlog Qty'], required: true }, wh: { names: ['Warehouse'] }, inWh: { names: ['In WH'] },
+    eta: { names: ['ETA Date'] } };
+  // The header row: the first of rows 1-10 with every required column (the real report has a title row first).
+  let hr = -1, fc = null;
+  for (let i = 0; i < Math.min(10, rows.length) && hr < 0; i++) { const f = C.findColumns(rows[i], SPEC); if (!f.missing.length) { hr = i; fc = f; } }
+  if (hr < 0) { fails(`sheet "${hit.name}": no header row with Style, In Trans Qty and Import PO Backlog Qty in rows 1-10`); return; }
+  console.log(`  sheet "${hit.name}", header row ${hr + 1}: ${headerLine(rows[hr])}`);
+  const col = fc.cols;
+  // A cell holds one quantity, or a list (one per shipment, "a, b, c", lined up with the ETA / ETD lists): summed.
+  let badParts = 0;
+  const qty = v => {
+    if (v == null || C.S(v) === '') return 0;
+    if (typeof v === 'number') return v;
+    let s = 0;
+    for (const p of C.S(v).split(/,\s+/)) { const x = C.num(p); if (typeof x === 'number' && Number.isFinite(x)) s += x; else if (x !== null) badParts++; }
+    return s;
+  };
+  const erp = new Map(), cnt = { blank: 0, total: 0, noStyle: 0, style: 0 }, wh = {};
+  for (let i = hr + 1; i < rows.length; i++) {
+    const r = rows[i] || [];
+    if (!r.some(v => C.S(v) !== '')) { cnt.blank++; continue; }
+    const sty = C.normStyle(r[col.style]);
+    if (!sty) { if (r.some(v => /^grand total$/i.test(C.S(v)))) cnt.total++; else cnt.noStyle++; continue; }
+    cnt.style++;
+    const w = col.wh != null ? C.S(r[col.wh]) || '(blank)' : '(no column)';
+    wh[w] = (wh[w] || 0) + 1;
+    const e = erp.get(sty) || erp.set(sty, { inTrans: 0, backlog: 0, inWh: 0, rows: 0, transPast: 0, transFuture: 0, transNoEta: 0 }).get(sty);
+    e.inTrans += qty(r[col.inTrans]); e.backlog += qty(r[col.backlog]); e.inWh += col.inWh != null ? qty(r[col.inWh]) : 0; e.rows++;
+    // In Trans split by the ETA it lines up with (one ETA per shipment): before today, or today and later.
+    const parts = C.S(r[col.inTrans]) === '' ? [] : typeof r[col.inTrans] === 'number' ? [r[col.inTrans]] : C.S(r[col.inTrans]).split(/,\s+/);
+    const etas = col.eta == null || C.S(r[col.eta]) === '' ? [] : typeof r[col.eta] === 'number' ? [r[col.eta]] : C.S(r[col.eta]).split(/,\s+/);
+    parts.forEach((p, j) => {
+      const x = typeof p === 'number' ? p : C.num(p);
+      if (typeof x !== 'number' || !Number.isFinite(x)) return;
+      const d = parts.length === etas.length ? C.toDay(etas[j], C.dayYear(today)) : null;
+      if (!d || d.day == null) e.transNoEta += x; else if (d.day < today) e.transPast += x; else e.transFuture += x;
+    });
+  }
+  sumLine('rows read', rows.length - hr - 1, [['blank', cnt.blank], ['Grand Total', cnt.total], ['no style', cnt.noStyle], ['style', cnt.style]]);
+  console.log(`  styles ${n(erp.size)} (${n([...erp.values()].filter(e => e.rows > 1).length)} on more than one row) · rows by warehouse: ${Object.entries(wh).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${n(v)}`).join(' · ')}`);
+  if (badParts) console.log(`  quantities that aren't numbers (left out): ${n(badParts)}`);
+
+  // Ours per style: On the water + At port (stock: China Pickup goes to Pull from China), and In China on LA POs.
+  const ours = new Map(), side = { unknownInChina: 0, unmatchedSailed: 0, unmatchedInChina: 0 };
+  const mine = s => ours.get(s) || ours.set(s, { inTrans: 0, backlog: 0 }).get(s);
+  for (const a of R.allocs) {
+    if (a.bucket === 'water' || a.bucket === 'port') mine(a.style).inTrans += a.units;
+    else if (ST.IN_CHINA.includes(a.bucket)) { if (a.ptype === 'LA') mine(a.style).backlog += a.units; else if (a.ptype === 'Unknown') side.unknownInChina += a.units; }
+    else if (a.bucket === 'unmatched' && a.stage !== 'Landed') { if (a.stage === 'On the water' || a.stage === 'At port') side.unmatchedSailed += a.units; else side.unmatchedInChina += a.units; }
+  }
+  // Every unit we have per style, by where it is, to show where a style the ERP has more of sits on our side.
+  const where = new Map();
+  for (const a of R.allocs) {
+    const k = a.bucket === 'unmatched' ? `Unmatched ${a.stage}` : ST.IN_CHINA.includes(a.bucket) ? (a.ptype === 'LA' ? 'In China (LA)' : 'In China (other)')
+      : { water: 'On the water', port: 'At port', landed: 'landed', short: 'short-shipped', shippedNotOnCt: 'shipped, not on Container Tracking',
+        ctMore: 'beyond Master Sheet Live', pullFromChina: 'Pull from China', duplicate: 'repeat of a shipped line',
+        planning: 'planned, not booked yet', ignored: 'ignored section', belowTracker: "below the tracker's lowest PO" }[a.bucket] || a.bucket;
+    const m = where.get(a.style) || where.set(a.style, {}).get(a.style);
+    m[k] = (m[k] || 0) + a.units;
+  }
+  const loose = s => s.replace(/\s+/g, '').replace(/-F$/, '');
+  const looseOurs = new Set([...where.keys()].map(loose));
+  // The ERP's other columns, for a style where we are higher.
+  const ERP_OTHER = { inTrans: 'In Trans Qty', backlog: 'Import PO Backlog Qty', inWh: 'In WH' };
+  const compare = (field, erpName, ourName, ourKeys) => {
+    const all = new Set([...erp.keys(), ...ours.keys()]);
+    let te = 0, to = 0, both = 0, agree = 0, same = 0, onlyErp = 0, onlyOurs = 0, notOnReport = 0;
+    let gap = 0, absent = 0, absentUnits = 0, looseHit = 0, looseUnits = 0, over = 0, offReport = 0, offReportUnits = 0;
+    const gapWhere = {}, overWhere = {};
+    const diffs = [];
+    for (const s of all) {
+      const e = erp.has(s) ? erp.get(s)[field] : 0, o = ours.has(s) ? ours.get(s)[field] : 0;
+      te += e; to += o;
+      if (!e && !o) continue;
+      both++;
+      if (e === o) same++;
+      if (Math.abs(o - e) <= 0.05 * Math.max(Math.abs(o), Math.abs(e))) agree++;
+      if (e && !o) onlyErp++;
+      if (o && !e) { onlyOurs++; if (!erp.has(s)) notOnReport++; }
+      if (e > o) {
+        gap += e - o;
+        const w = where.get(s);
+        if (!w) {
+          absent++; absentUnits += e - o;
+          if (looseOurs.has(loose(s))) { looseHit++; looseUnits += e - o; }
+        } else for (const [k, v] of Object.entries(w)) if (!ourKeys.includes(k)) {
+          const g = gapWhere[k] || (gapWhere[k] = { styles: 0, units: 0 });
+          g.styles++; g.units += Math.min(v, e - o);   // each style counts at most its own difference
+        }
+      }
+      if (o > e) {
+        over += o - e;
+        const x = erp.get(s);
+        if (!x) { offReport++; offReportUnits += o - e; } else for (const k of Object.keys(ERP_OTHER)) if (k !== field && x[k] > 0) {
+          const g = overWhere[k] || (overWhere[k] = { styles: 0, units: 0 });
+          g.styles++; g.units += Math.min(x[k], o - e);
+        }
+      }
+      diffs.push({ s, e, o, d: o - e });
+    }
+    console.log(`\n  ${erpName} vs our ${ourName}`);
+    console.log(`    totals: ERP ${n(te)} · ours ${n(to)} · ours − ERP ${n(to - te)}`);
+    console.log(`    styles with a quantity on either side ${n(both)}: within 5% ${n(agree)} (exactly equal ${n(same)}) · ERP only ${n(onlyErp)} · ours only ${n(onlyOurs)} (${n(notOnReport)} not on the ERP report at all)`);
+    console.log(`    where the ERP is higher (${n(gap)} units in all): ${n(absentUnits)} on ${n(absent)} styles we have no units of at all` +
+      ` (${n(looseHit)} of them, ${n(looseUnits)} units, are a style we have written with other spaces or -F)`);
+    console.log(`      the rest, by where else we have those styles (styles, up to that many units of the difference; a style can be in several):`);
+    console.log(`        ${Object.entries(gapWhere).sort((p, q) => q[1].units - p[1].units).map(([k, v]) => `${k} ${n(v.styles)} / ${n(v.units)}`).join(' · ') || 'none'}`);
+    console.log(`    where ours is higher (${n(over)} units in all): ${n(offReportUnits)} on ${n(offReport)} styles not on the ERP report; the rest, by what the ERP shows`);
+    console.log(`      for those styles instead (styles / up to that many units): ${Object.entries(overWhere).sort((p, q) => q[1].units - p[1].units).map(([k, v]) => `${ERP_OTHER[k]} ${n(v.styles)} / ${n(v.units)}`).join(' · ') || 'none'}`);
+    console.log('    10 biggest differences (style: ERP / ours / ours − ERP):');
+    for (const x of diffs.sort((p, q) => Math.abs(q.d) - Math.abs(p.d) || p.s.localeCompare(q.s)).slice(0, 10)) {
+      console.log(`      ${x.s.padEnd(18)} ${n(x.e).padStart(10)} ${n(x.o).padStart(10)} ${((x.d > 0 ? '+' : '') + n(x.d)).padStart(11)}${erp.has(x.s) ? '' : '   (not on the ERP report)'}`);
+    }
+  };
+  compare('inTrans', 'In Trans Qty', 'On the water + At port', ['On the water', 'At port']);
+  compare('backlog', 'Import PO Backlog Qty', 'In China on LA POs', ['In China (LA)']);
+
+  // The differences by their two definitional causes. The ERP keeps goods In Trans until it receives them (we take
+  // them off once landed), and counts goods booked on a vessel with an ETD as In Trans (we count them In China); its
+  // Backlog includes China Pickup POs (our Pull from China).
+  const tot = f => [...erp.values()].reduce((s, e) => s + e[f], 0);
+  const ourTot = f => [...per.values()].reduce((s, e) => s + e[f], 0);
+  const per = new Map(), mineX = s => per.get(s) || per.set(s, { landedRecent: 0, umLandedRecent: 0, sailed: 0, bookedEtd: 0, inChinaLa: 0, pullNotSailed: 0 }).get(s);
+  for (const a of R.allocs) {
+    const recent = a.eta != null && a.eta >= today - 30;
+    if (a.bucket === 'landed' && recent) mineX(a.style).landedRecent += a.units;
+    else if (a.bucket === 'unmatched' && a.stage === 'Landed' && recent) mineX(a.style).umLandedRecent += a.units;
+    else if (a.bucket === 'water' || a.bucket === 'port') mineX(a.style).sailed += a.units;
+    if (ST.IN_CHINA.includes(a.bucket) && a.ptype === 'LA') {
+      mineX(a.style).inChinaLa += a.units;
+      if ((a.bucket === 'booked' || a.bucket === 'loaded') && a.etd != null) mineX(a.style).bookedEtd += a.units;
+    }
+    if (a.bucket === 'pullFromChina' && a.stage !== 'On the water' && a.stage !== 'At port') mineX(a.style).pullNotSailed += a.units;
+  }
+  // Per style, how much of an ERP quantity our figures explain, taking ours in order (each up to what is left).
+  const explain = (ef, ofs) => {
+    const got = ofs.map(() => 0);
+    let all = 0;
+    for (const [s, e0] of erp) {
+      let e = ef(e0); all += e;
+      const o = per.get(s);
+      ofs.forEach((of, j) => { const x = o ? Math.max(0, Math.min(e, of(o))) : 0; got[j] += x; e -= x; });
+    }
+    return { all, got, rest: all - got.reduce((p, x) => p + x, 0) };
+  };
+  console.log('\n  The differences by cause (per style, each of ours counted up to what the ERP still has left to explain)');
+  console.log(`    ERP In Trans ${n(tot('inTrans'))} = ETA before today ${n(tot('transPast'))} + ETA today or later ${n(tot('transFuture'))}${tot('transNoEta') ? ` + no ETA it lines up with ${n(tot('transNoEta'))}` : ''}`);
+  const past = explain(e => e.transPast, [o => o.landedRecent, o => o.umLandedRecent]);
+  console.log(`    ETA before today ${n(past.all)} (the ERP hasn't received them yet): ${n(past.got[0])} is goods we count as landed with an ETA in the last 30 days,` +
+    ` ${n(past.got[1])} more is Unmatched landed; ${n(past.rest)} not explained`);
+  const fut = explain(e => e.transFuture, [o => o.sailed, o => o.bookedEtd]);
+  console.log(`    ETA today or later ${n(fut.all)}: ${n(fut.got[0])} is our On the water + At port, ${n(fut.got[1])} more is our Booked / Loaded in a round with an ETD` +
+    ` (the ERP counts booked-on-a-vessel as in transit); ${n(fut.rest)} not explained`);
+  const bl = explain(e => e.backlog, [o => o.inChinaLa - o.bookedEtd, o => o.pullNotSailed, o => o.bookedEtd]);
+  console.log(`    Import PO Backlog ${n(bl.all)}: ${n(bl.got[0])} is our In China (LA) not yet on a vessel with an ETD, ${n(bl.got[1])} more is our Pull from China` +
+    ` (China Pickup POs and direct-to-customer sections), ${n(bl.got[2])} more is our Booked / Loaded with an ETD; ${n(bl.rest)} not explained`);
+  console.log(`    ours, for scale: landed with an ETA in the last 30 days ${n(ourTot('landedRecent'))} · On the water + At port ${n(ourTot('sailed'))} · Booked / Loaded with an ETD ${n(ourTot('bookedEtd'))}` +
+    ` · In China (LA) ${n(ourTot('inChinaLa'))} · Pull from China not sailed ${n(ourTot('pullNotSailed'))}`);
+  console.log(`\n  Not in either comparison (ours): In China on POs of unknown type ${n(side.unknownInChina)} · Unmatched, not landed: at On the water / At port ${n(side.unmatchedSailed)}, Booked / Loaded ${n(side.unmatchedInChina)}`);
+}
 
 // ---------------- the copied PO Book code
 head('PO Book copy (core/pobook.js)');

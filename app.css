@@ -125,6 +125,94 @@ table.grid{border-collapse:separate;border-spacing:0;font-size:12.5px;width:max-
 .grid td.more{background:transparent;color:var(--muted)}
 .code{font-family:Consolas,"Cascadia Mono",monospace;font-size:11.5px}
 
+/* step 2: tiles, filters, the windowed tables, the side panel */
+select{font:inherit;border-radius:11px;border:1px solid var(--edge);background:rgba(255,255,255,.85);color:var(--ink);padding:6px 10px;outline:none;max-width:190px}
+select:focus{box-shadow:0 0 0 3px rgba(47,155,214,.18)}
+select:focus-visible{outline:2px solid var(--sel);outline-offset:1px}
+.tiles{display:grid;grid-template-columns:repeat(6,minmax(0,1fr)) repeat(3,minmax(0,.75fr));gap:8px;margin-bottom:10px}
+@media (max-width:1280px){.tiles{grid-template-columns:repeat(auto-fill,minmax(160px,1fr))}}
+.tile{display:block;width:100%;padding:10px 12px;border-radius:14px;text-align:left;cursor:pointer;color:var(--ink);font:inherit;white-space:normal;min-width:0}
+button.tile:hover{background:rgba(255,255,255,.82)}
+.tile.on{outline:2px solid var(--sel);outline-offset:-2px}
+.tile .n{font-size:21px;font-weight:700;margin-top:2px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tile .n small{font-size:11.5px;font-weight:600;color:var(--muted);margin-left:3px}
+.tile .cs{font-size:11.5px;color:var(--muted);min-height:16px;overflow-wrap:anywhere}
+.tile .lbl i{font-style:normal;font-weight:600;text-transform:none;letter-spacing:0;color:var(--accentink);margin-left:4px}
+.tile.nl,.tile.off{cursor:default}
+.tile.nl .n{font-size:15px;color:var(--muted);padding:3px 0}
+.tile.off{background:rgba(255,255,255,.4);box-shadow:none}
+.tile.off .n{font-size:15px;color:var(--off);padding:3px 0}
+.tile.off .cs{color:var(--off)}
+.fbar{margin:4px 0 8px}
+.fbar input[type=search]{width:280px;max-width:100%}
+.vpane{height:calc(100vh - 330px);min-height:360px}
+#pullPane{height:calc(100vh - 250px)}
+.grid.vt td{white-space:nowrap;vertical-align:middle}
+.grid.vt th{vertical-align:bottom}
+.grid.vt th[data-s]{cursor:pointer;user-select:none}
+.grid.vt th[data-s]:hover{color:var(--ink)}
+.grid th .ar{font-size:9px;margin-left:3px}
+.grid tr.spc td{padding:0;border:0;background:transparent}
+.grid.vt td.empty{white-space:normal;text-align:left;padding:22px 28px}
+.grid td.desc{max-width:300px;overflow:hidden;text-overflow:ellipsis}
+.grid td.cut{max-width:180px;overflow:hidden;text-overflow:ellipsis}
+.grid td.off,.grid th.off{color:var(--off)}
+.grid td.off{font-size:11px}
+.grid td.sum{font-weight:600;background:rgba(236,243,250,.75)}
+.grid th.sum{color:var(--ink)}
+.grid td.fz.f-sty,.grid th.fz.f-sty{width:200px;min-width:200px;max-width:200px;overflow:hidden;text-overflow:ellipsis}
+.grid td.fz.f-po,.grid th.fz.f-po{width:108px;min-width:108px;max-width:108px;overflow:hidden;text-overflow:ellipsis}
+.grid td.fz.f-sty2,.grid th.fz.f-sty2{left:108px;width:170px;min-width:170px;max-width:170px;overflow:hidden;text-overflow:ellipsis}
+.grid td.fz.f-po{box-shadow:none}
+.grid tr.upc td{font-size:11.5px;color:var(--muted);background:rgba(248,250,253,.5)}
+.grid tr.upc td.fz{padding-left:24px;background:#f9fbfd}
+.grid tr.upc td.sum{background:rgba(240,245,251,.6)}
+.grid.vt tbody tr.r:hover td{background:rgba(255,255,255,.85)}
+.grid.vt tbody tr.r:hover td.fz{background:#eef4fa}
+.grid .u{font-size:11px;color:var(--muted)}
+.grid.two .u{display:block;line-height:1.2}
+.grid td.cut .u,.grid td.from .u{overflow:hidden;text-overflow:ellipsis}
+.grid td.from{max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.grid td.cut.st{max-width:230px}
+/* The Style cell: the UPC gives way (ellipsis) so a tag after it always shows. */
+.grid td .sc{display:flex;align-items:center;min-width:0}
+.grid td .sc .sb,.grid td .sc .tag{flex:none}
+.grid td .sc .u{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-left:4px}
+/* One height for every windowed Inventory row, UPC lines (smaller text) included. */
+#invTable tbody tr.r td{line-height:18px}
+button.nb,button.sb{font:inherit;color:var(--accentink);background:none;border:0;padding:0 1px;border-radius:4px;cursor:pointer;font-variant-numeric:tabular-nums;white-space:nowrap}
+button.nb:hover,button.sb:hover{text-decoration:underline;background:none}
+button.sb{font-weight:600;color:var(--ink)}
+.grid tr.upc button.nb{color:#3b7fb5}
+.np{font-size:10.5px;color:var(--amb);margin-left:3px}
+.tag{display:inline-block;font:inherit;font-size:10.5px;line-height:1.5;padding:0 6px;border-radius:6px;border:0;background:rgba(95,108,125,.12);color:var(--muted);margin-left:6px;cursor:pointer;vertical-align:1px;white-space:nowrap}
+button.tag:hover{background:rgba(95,108,125,.2)}
+.tag.um{background:var(--ambbg);color:var(--amb)}
+.flag{color:var(--amb)}
+.nt{color:var(--muted)}
+.srcbox{margin-top:12px}
+.srcbox>summary{cursor:pointer;font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);padding:4px 2px;margin-bottom:6px}
+.balance{padding:10px 14px;margin-bottom:12px;border-radius:14px;border:1px solid var(--edge);font-size:12.5px}
+.balance.ok{background:var(--grnbg);color:#1d5f3e}
+.balance.bad{background:var(--redbg);color:#7d2416;border-color:rgba(200,65,47,.3)}
+.balance.off{background:rgba(255,255,255,.55);color:var(--muted)}
+.balance .bp{margin-top:3px;color:inherit;opacity:.9}
+.chk{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);cursor:pointer}
+.chk input{margin:0}
+.grid td .ck{margin:0 6px 0 0;vertical-align:-2px}
+.pill.new{background:rgba(47,155,214,.14);color:var(--accentink);margin-right:5px}
+.grid tr.isnew td{background:rgba(234,244,252,.85)}
+.grid tr.isnew td.fz{background:#eaf3fb}
+.grid tr.isck td{opacity:.6}
+.panel{position:fixed;top:12px;right:12px;bottom:12px;width:min(1240px,calc(100vw - 24px));z-index:15;display:flex;flex-direction:column;gap:8px;padding:12px 14px;background:rgba(255,255,255,.93)}
+.panel .ph{display:flex;align-items:flex-start;gap:10px}
+.panel .pt{flex:1;min-width:0}
+.panel h3{margin:2px 0 2px;font-size:15px;overflow-wrap:anywhere}
+.panel .note{overflow-wrap:anywhere}
+.panel .px{font-size:16px;line-height:1;padding:4px 8px}
+.panel .pane{flex:1;min-height:0}
+.panel .pf{display:flex;align-items:center;gap:8px}
+
 /* toast, spinners */
 #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);z-index:20;padding:9px 16px;display:none;max-width:min(680px,92vw)}
 .mini{display:inline-block;width:12px;height:12px;border:2px solid rgba(27,111,174,.25);border-top-color:var(--accentink);border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px}
@@ -134,4 +222,7 @@ table.grid{border-collapse:separate;border-spacing:0;font-size:12.5px;width:max-
 @keyframes drift{from{transform:translateX(0)}to{transform:translateX(-40px)}}
 @keyframes spin{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){.ship,.wave,.mini,.chip.load .dot,.scard.load .sh .dot{animation:none}}
-@media (max-width:760px){.wrap{padding:10px}.health{max-width:100%;white-space:normal}.chip.src{max-width:100%}}
+@media (max-width:760px){.wrap{padding:10px}.health{max-width:100%;white-space:normal}.chip.src{max-width:100%}
+  .tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.fbar input[type=search]{width:100%}select{max-width:48%}
+  .grid td.fz.f-sty,.grid th.fz.f-sty{width:150px;min-width:150px;max-width:150px}
+  .panel{top:0;right:0;bottom:0;width:100vw;border-radius:0}}

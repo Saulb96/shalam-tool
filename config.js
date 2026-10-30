@@ -12,6 +12,8 @@ window.INV_CONFIG = {
     drayage: '/sites/Reports/Shared Documents/Reports/Shipping Reports/Drayage',
     ats: '/sites/Production/Shared Documents/Inventory/ATS',
   },
+  // Container Tracking sections with no round: straight to the customer (Pull from China), not booked yet (Master Sheet stage), or ignored.
+  sections: { pullFromChina: ['GT', 'Giant Tiger', 'TJX Mexico', 'TJX Aus', 'TJX UK', 'FOB Loaded'], planning: ['Unshipped', 'Planning - NB', 'Planning - other'], ignore: ['CT - Hidden Rows'] },
   errorEmailTo: 'saul@metro1solutions.com',
   errorEmailName: 'Saul',
 };

@@ -1,5 +1,6 @@
-// Shalam Tool: sign-in, reading every source from SharePoint, the source chips, the failure rules, the error email
-// and the Problems tab. Parsing lives in core/*.js; this file fetches, calls the parsers and draws.
+// Shalam Tool: sign-in, reading every source from SharePoint, the source chips, the failure rules, the error email,
+// the stage numbers (Inventory and Pull from China tabs, the side panel) and the Problems tab. Parsing and the stage
+// rules live in core/*.js; this file fetches, calls them and draws.
 // The page is read-only: the one request it makes that isn't a GET is the error email (POST /me/sendMail).
 (function () {
   'use strict';
@@ -49,6 +50,11 @@
   const BY_K = Object.fromEntries(SOURCES.map(x => [x.k, x]));
   const CORE_KEYS = ['msl', 'tracker', 'pobook', 'ct'];   // red here: the stage numbers are not loaded
   const REPORT_KEYS = ['forwarder', 'drayage'];            // trouble here: amber banner, numbers still shown
+  // What the stages can't see without each report (the amber banner and the error email say it).
+  const REPORT_EFFECT = {
+    forwarder: "sailings and rolled vessels can't be seen, so a PO entry counts On the water once Container Tracking's ETD passes and At port once its ETA passes",
+    drayage: "pickups and deliveries can't be seen, so a container on an Open round stays At port until its round moves to Complete",
+  };
   const locText = k => String((CFG.sources && CFG.sources[k]) || '').trim();
 
   const LABELS = { rowsRead: 'Rows read', sectionRows: 'Round / section header rows', styleRows: 'Style rows', counted: 'Counted',
@@ -87,6 +93,21 @@
     noupc: 'No UPC', badupc: 'UPC not 12-13 digits', dupupc: 'UPC on two styles', repeat: 'Same UPC and style twice',
     upconly: 'Rows with only a UPC',
     'no-linekey': 'Item with no LineKey',
+    // Incoming: matching Master Sheet Live to Container Tracking, and the stages (core/stages.js)
+    'near-miss': 'Near-miss: PO or style written differently', unmatched: 'On Container Tracking, not on Master Sheet Live',
+    'ct-more': 'Container Tracking holds more than Master Sheet Live', short: 'Short-shipped',
+    'shipped-not-on-ct': 'Shipped, not on Container Tracking', 'msl-behind-ct': 'Master Sheet behind Container Tracking',
+    'ct-behind-msl': 'Container Tracking behind Master Sheet', 'both-tabs': 'On Booking and Loaded, same round (counted once)',
+    'no-etd': 'Booked or loaded, no ETD yet', 'etd-passed-booked': 'ETD passed, still on Booking',
+    'unknown-type': 'PO type unknown (not on the PO Status Tracker)', 'no-case-pack': 'No case pack (Master) for the style',
+    'part-case': 'Quantity not in whole cases', balance: "Units don't add up (a bug in Shalam Tool)",
+    'page-sum': "The page's sums differ from the stage engine's (a bug in Shalam Tool)",
+    'missing-column': 'Column missing on Master Sheet Live', 'negative-qty': 'Quantity below zero',
+    'other-trip': 'Container number reused (another trip)', 'round-open-and-complete': 'Round on both Open and Complete',
+    'complete-in-transit': 'On Complete, but a report still says in transit', 'dup-round': 'Repeat of a line inside a Round',
+    // Container Tracking sections with no round (config.js's sections), and POs below the tracker's lowest PO
+    'below-tracker': 'Older than the PO Status Tracker', 'ignored-section': 'Ignored section', 'section-not-listed': 'Section not in the list',
+    'pull-section': 'Straight to the customer from China', 'planning-section': 'Planned, not booked yet',
   };
   const codeLabel = c => CODE_LABELS[c] || (c ? String(c).replace(/-/g, ' ') : '(no code)');
 
@@ -423,9 +444,11 @@
   // state: ok (green) · warn (amber) · err (red) · off (grey: not set, waiting, or no report yet) · load
   // short: the chip's second line when there is no saved date to show (the full message is in its tooltip and card).
   // stale: the time it was last read, when a later refresh couldn't read it.
+  // data: what the parser gave, set only when this state's file was read and used: the stage numbers take a source's
+  // data from its state, so a chip and the numbers can never disagree about which file they come from.
   function fresh(k) {
     return { k, state: 'off', label: '', message: '', short: '', headers: '', file: '', webUrl: '', savedAt: '', savedBy: '',
-      read: null, counted: null, rows: [], issues: [], notes: [], mailProblem: '', mail: null, blocked: false, status: 0, stale: null };
+      read: null, counted: null, rows: [], issues: [], notes: [], mailProblem: '', mail: null, blocked: false, status: 0, stale: null, data: null };
   }
   const ok = s => { s.state = 'ok'; s.label = 'ok'; };
   const warn = (s, label, message) => { s.state = 'warn'; s.label = label; s.message = message; };
@@ -676,11 +699,12 @@
       if (i.code === 'trkonly') S.tracker.issues.push(normIssue('PO Status Tracker', i));
       else S.msl.issues.push(normIssue('Master Sheet Live', i));
     }
+    // The stage engine joins these lines to Container Tracking on normPo / normStyle, never on l.key or l.base: the
+    // PO Book's keys fold inner spaces and -F, which this tool keeps apart. It reads each line's Barcode, Master,
+    // Category and Sub from the raw rows (mrows) by the line's row number.
+    data.po = { trk, src, lines, ov, cfg, counts: cm.counts, mrows };
     if (!cm.ok || !src.lines.length) fail(S.msl, problem('empty', unprefix('Master Sheet Live', cm.error) || 'No PO lines found on Master Sheet Live.'));
-    else ok(S.msl);
-    // Step 2 joins these lines to Container Tracking on C.normPo(l.po) and C.normStyle(l.sty), never on l.key or
-    // l.base: the PO Book's keys fold inner spaces and -F, which this tool keeps apart.
-    data.po = { trk, src, lines, ov, cfg, counts: cm.counts };
+    else { ok(S.msl); S.msl.data = data.po; }
   }
 
   // ---------- Container Tracking ----------
@@ -704,7 +728,7 @@
         s.rows.unshift(['Rows read (all four tabs)', s.read], ['Rows used (style lines + container rows)', s.counted]);
         if (!r.ok) fail(s, problem(labelFor(r.error), unprefix('Container Tracking', r.error) || "Container Tracking couldn't be read."));
         else if (!(r.blocks || []).length) fail(s, problem('empty', 'No lines on the Booking or Loaded tabs.'));
-        else { ok(s); data.ct = r; }
+        else { ok(s); data.ct = r; s.data = r; }
       }
     }
     commit('ct', s);
@@ -765,7 +789,7 @@
         if (failed.length) warn(s, 'older file used', `Used ${meta.name}: the newer file couldn't be read (${failed.join('; ')}).`);
         else if (c.amber || (c.businessDaysOld || 0) >= AMBER_BDAYS) warn(s, `${plural(c.businessDaysOld, 'business day')} old`, `${meta.name} was saved ${plural(c.businessDaysOld, 'business day')} ago, so its dates may be behind.`);
         else ok(s);
-        data[k] = r;
+        data[k] = r; s.data = r;
         return;
       }
       if (failed.length) {
@@ -835,7 +859,7 @@
         s.rows = countRows(c);
         s.read = firstNum(c, ['rows']) ?? items.length; s.counted = firstNum(c, ['used']);
         if (!items.length || r.ok === false) fail(s, problem('empty', unprefix('UPC_MASTER', r.error) || 'The UPC_MASTER list has no items.'));
-        else { ok(s); data.upc = r; }
+        else { ok(s); data.upc = r; s.data = r; }
       } catch (e) { console.error(e); fail(s, problem("can't read the list", 'Reading UPC_MASTER failed: ' + e.message)); }
     }
     commit('upc', s);
@@ -895,7 +919,7 @@
   }
   function effectOf(src) {
     if (CORE_KEYS.includes(src.k)) return "The stage numbers stay off until it's fixed.";
-    if (REPORT_KEYS.includes(src.k)) return "Stages come from Container Tracking dates only until it's fixed.";
+    if (REPORT_KEYS.includes(src.k)) return `Until it's fixed, ${REPORT_EFFECT[src.k]}.`;
     if (src.k === 'ats') return 'On hand comes from this report, so it would be out of date.';
     if (src.k === 'upc') return "Styles can't be matched to their UPCs until it's fixed.";
     return '';
@@ -1010,6 +1034,7 @@
     st = {};
     for (const x of SOURCES) { const s = fresh(x.k); off(s, 'not read', 'Not read: Shalam Tool stopped because of its sign-in permissions (see the red banner).', 'see the red banner'); st[x.k] = s; }
     for (const k of Object.keys(data)) data[k] = null;
+    stages = null; stageErr = ''; idx = null;
     lastLoaded = null;
   }
 
@@ -1027,6 +1052,8 @@
       // Master Sheet Live, the tracker and Container Tracking first; UPC_MASTER last.
       await Promise.all([loadPoGroup(force, signal), loadCT(today, force, signal)]);
       await Promise.all([loadReport('forwarder', today, force, signal), loadReport('drayage', today, force, signal), loadAts(today, signal)]);
+      // The stage numbers as soon as their sources are in; UPC_MASTER (descriptions, categories) fills in after.
+      if (!signal.aborted) { buildStages(today); renderStageViews(); }
       await loadUpc(force, signal);
       if (force || copyCheck == null) await checkPoBookCopy(signal);
       if (signal.aborted) throw abortErr();
@@ -1057,8 +1084,11 @@
     } finally {
       loading = null; cycleDone = true;
       setBusy(null);
+      schedule();   // first, so the 5-minute refresh re-arms whatever the drawing below does
+      // After every cycle, finished or not: built from what each chip shows as read (a stopped page has nothing).
+      if (scopeFatal) { stages = null; stageErr = ''; idx = null; } else buildStages(today);
+      try { markNew(); } catch (e) { console.error(e); }
       renderAll();
-      schedule();
       if (again) { again = false; loadAll(true); }
     }
   }
@@ -1066,10 +1096,15 @@
   function schedule() {
     clearTimeout(timer);
     if (!account || scopeFatal) return;   // stopped over the sign-in's permissions: only Sign in again helps
+    // Never while the side panel is open: it waits until the panel closes.
     timer = setTimeout(() => {
-      if (document.hidden || loading) { due = true; schedule(); }
+      if (document.hidden || loading || panel) { due = true; schedule(); }
       else loadAll(false);
     }, REFRESH_MS);
+  }
+  // A refresh that came due while the page was hidden or the panel open runs once both are past.
+  function runDue() {
+    if (due && account && !document.hidden && !panel && !loading) { due = false; loadAll(false); }
   }
 
   // ---------- drawing ----------
@@ -1118,22 +1153,44 @@
     if (scopeFatal) { el.innerHTML = `<span class="r"><b>Stopped: sign-in permissions</b></span>`; el.title = scopeFatal; return; }
     if (fatal) { el.innerHTML = `<span class="r"><b>Couldn't load</b></span>`; el.title = ''; return; }
     if (!cycleDone) { el.innerHTML = ''; return; }
+    const [xh, xt] = stageHealth();
     const bad = SOURCES.filter(x => st[x.k] && (st[x.k].state === 'err' || st[x.k].state === 'warn'));
     if (bad.length) {
-      el.innerHTML = bad.map(x => `<span class="${st[x.k].state === 'err' ? 'r' : 'a'}"><b>${esc(x.name)}</b> ${esc(statusWord(st[x.k]))}</span>`).join(' · ');
-      el.title = bad.map(x => `${x.name}: ${st[x.k].message}`).join('\n');
+      el.innerHTML = bad.map(x => `<span class="${st[x.k].state === 'err' ? 'r' : 'a'}"><b>${esc(x.name)}</b> ${esc(statusWord(st[x.k]))}</span>`).join(' · ') + xh;
+      el.title = bad.map(x => `${x.name}: ${st[x.k].message}`).concat(xt).join('\n');
       return;
     }
     const unset = SOURCES.filter(x => st[x.k] && st[x.k].state === 'off' && st[x.k].label === 'not set').length;
     const notRead = SOURCES.filter(x => !st[x.k] || st[x.k].stale || /^not read/.test(st[x.k].label || ''));
     if (notRead.length) {
-      el.innerHTML = `<span class="a"><b>Not read this time:</b> ${esc(notRead.map(x => x.name).join(', '))}</span>`;
-      el.title = 'Click Refresh to read them.';
+      el.innerHTML = `<span class="a"><b>Not read this time:</b> ${esc(notRead.map(x => x.name).join(', '))}</span>` + xh;
+      el.title = ['Click Refresh to read them.', ...xt].join('\n');
       return;
     }
-    el.innerHTML = `<span class="g">${unset ? 'All sources with a location loaded' : 'All sources loaded'}</span> at ${esc(new Date(lastLoaded || Date.now()).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }))}${unset ? ` · ${plural(unset, 'source')} not set in config.js` : ''}`;
-    el.title = '';
+    el.innerHTML = `<span class="g">${unset ? 'All sources with a location loaded' : 'All sources loaded'}</span> at ${esc(new Date(lastLoaded || Date.now()).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }))}${unset ? ` · ${plural(unset, 'source')} not set in config.js` : ''}` + xh;
+    el.title = xt.join('\n');
   }
+  // The health line's stage part: Unmatched units, and the balance when it doesn't add up. [html, tooltip lines]
+  function stageHealth() {
+    if (stageErr) return [' · <span class="r"><b>Stage numbers not worked out</b></span>', ['The stage numbers couldn\'t be worked out (see the red banner).']];
+    if (!stages || !stages.ok) return ['', []];
+    const um = (stages.totals.units && stages.totals.units.unmatched) || 0, o = balanceOff();
+    const h = [`<span class="${um ? 'a' : 'g'}">Unmatched <b>${fmtN(um)}</b> units</span>`];
+    const t = [`Unmatched: ${fmtN(um)} units on Container Tracking with no Master Sheet Live line (not landed), never in the stage totals.`];
+    if (balanceBad()) {
+      h.push(`<span class="r"><b>${o.msl ? `Balance off by ${fmtN(Math.abs(o.msl))} units` : o.bad ? `Balance off in ${plural(o.bad, 'group')}` : `Container Tracking balance off by ${fmtN(Math.abs(o.ct))} units`}</b></span>`);
+      t.push(`Balance: ${fmtN(stages.balance.mslUnits)} units on Master Sheet Live, ${fmtN(stages.balance.outcomeUnits)} in the outcomes (a bug in Shalam Tool; see Problems).`);
+    } else t.push(`Balance: every one of the ${fmtN(stages.balance.mslUnits)} units on Master Sheet Live is in exactly one outcome.`);
+    return [' · ' + h.join(' · '), t];
+  }
+  // How far each balance is off: Master Sheet Live units against their outcomes (in total and per PO + style), and
+  // Container Tracking units against where they were placed. Anything but zero is a bug, and the page says so.
+  function balanceOff() {
+    if (!stages || !stages.ok) return null;
+    const b = stages.balance;
+    return { msl: units(b.diff), bad: Array.isArray(b.bad) ? b.bad.length : 0, ct: units(b.ct && b.ct.diff) };
+  }
+  const balanceBad = () => { const o = balanceOff(); return !!o && !!(o.msl || o.bad || o.ct); };
 
   const banner = (kind, html) => `<div class="banner ${kind}"><div class="bt">${html}</div></div>`;
   // A message after "Source:" reads on from the colon ("PO Status Tracker: your account can't open it…").
@@ -1155,13 +1212,41 @@
       } else if (unset.length) {
         out.push(banner('info', `<b>The stage numbers are not loaded:</b> the location of ${esc(unset.map(k => BY_K[k].name).join(', '))} is blank in config.js.`));
       }
+      if (stageErr) {
+        out.push(`<div class="banner err" id="stageBanner"><div class="bt"><b>The stage numbers couldn't be worked out:</b> ${esc(stageErr)}. This is a bug in Shalam Tool, not a problem in the files: tell Saul. Every stage number says "not loaded" until it's fixed.</div></div>`);
+      } else if (balanceBad()) {
+        const b = stages.balance, o = balanceOff();
+        const what = [o.msl || o.bad ? `${fmtN(b.mslUnits)} units on Master Sheet Live, ${fmtN(b.outcomeUnits)} in the outcomes${o.msl ? `, ${fmtN(Math.abs(o.msl))} apart` : ''}${o.bad ? ` (${plural(o.bad, 'PO + style group')} off)` : ''}` : '',
+          o.ct ? `Container Tracking has ${fmtN(b.ct.units)} units on its lines, ${fmtN(b.ct.outcomeUnits)} were placed` : ''].filter(Boolean).join('; ');
+        out.push(`<div class="banner err" id="balanceBanner"><div class="bt"><b>Units don't add up:</b> ${what}. This is a bug in Shalam Tool, not a problem in the files: tell Saul. The stage numbers may be wrong until it's fixed; Problems has the details.</div></div>`);
+      }
+      // A report missing or not used: the stages it would have given come from Container Tracking's own dates.
       const amb = REPORT_KEYS.filter(k => st[k] && (st[k].state === 'warn' || st[k].state === 'err'));
-      if (amb.length) {
+      const unused = stages && stages.ok ? REPORT_KEYS.filter(k => !got(k)) : [];
+      if (amb.length || unused.length) {
         const items = amb.map(k => {
           const s = st[k];
-          return `<li><b>${esc(BY_K[k].name)} report</b>: ${esc(onFromColon(s.message))}${s.state === 'err' ? ' Stages come from Container Tracking dates only.' : ''}${s.mail ? ` <i>${esc(s.mail.text)}</i>` : ''}</li>`;
-        }).join('');
-        out.push(banner('warn', `<b>Shipping reports:</b><ul>${items}</ul>`));
+          return `<li><b>${esc(BY_K[k].name)} report</b>: ${esc(onFromColon(s.message))}${s.mail ? ` <i>${esc(s.mail.text)}</i>` : ''}</li>`;
+        }).concat(unused.filter(k => !amb.includes(k)).map(k => {
+          const s = st[k];
+          const why = !s || s.state === 'load' ? 'not read yet.' : s.label === 'not set' ? 'its location is blank in config.js.' : onFromColon(s.message || statusWord(s));
+          return `<li><b>${esc(BY_K[k].name)} report</b>: ${esc(why)}</li>`;
+        })).join('');
+        let head = '<b>Shipping reports:</b>';
+        if (unused.length) {
+          // Said by which report is missing: with one still used, only the blocks no report covers use dates alone.
+          const n = stages.counts && stages.counts.trackerOnly, one = n === 1, num = typeof n === 'number';
+          const entries = num ? `${fmtN(n)} PO ${one ? 'entry' : 'entries'} on Booking and Loaded` : '';
+          const takes = `take${one ? 's its' : ' their'} stage from Container Tracking's ETD and ETA alone`;
+          if (unused.length > 1) {
+            head = `<b>Stages from Container Tracking dates only:</b> the Forwarder and Drayage reports aren't used, so ${num ? `${entries} ${takes}` : "stages come from Container Tracking's ETD and ETA alone"}.`;
+          } else {
+            const k = unused[0];
+            head = `<b>${esc(BY_K[k].name)} report not used:</b> ${esc(REPORT_EFFECT[k])}.` +
+              (num ? ` ${entries} ${one ? 'has' : 'have'} no report covering ${one ? 'it' : 'them'} and ${takes}.` : '');
+          }
+        }
+        out.push(`<div class="banner warn" id="reportsBanner"><div class="bt">${head}<ul>${items}</ul></div></div>`);
       }
     }
     $('banners').innerHTML = out.join('');
@@ -1182,60 +1267,841 @@
     $('srcTable').innerHTML = h + '</tbody>';
   }
 
-  let pq = '';
+  let pq = '', showChecked = false;
   const expanded = new Set();
-  const allIssues = () => SOURCES.flatMap(x => (st[x.k] && st[x.k].state !== 'load' ? st[x.k].issues : []));
+  // The stage engine's issues come first, under "Incoming"; then every parser's, by source.
+  const stageIssues = () => (stages && stages.ok ? [...(stages.issues || []).map(i => normIssue('Incoming', i)), ...pageIssues] : []);
+  const allIssues = () => [...stageIssues(), ...SOURCES.flatMap(x => (st[x.k] && st[x.k].state !== 'load' ? st[x.k].issues : []))];
+
+  // A problem marked checked is kept in this browser only, under inv:checked:<source>:<code>:<po>:<style>:<row>, with
+  // its message: it comes back when the message changes. With storage blocked the mark lasts for this page session.
+  const issKey = i => [i.source, i.code, i.po, i.style, i.row].join(':');
+  const checkedMem = new Map();
+  function isChecked(i) {
+    const k = 'checked:' + issKey(i);
+    const v = checkedMem.has(k) ? checkedMem.get(k) : store.get(k);
+    return v != null && v === i.message;
+  }
+  let checkedTold = false;
+  function setChecked(i, on) {
+    const k = 'checked:' + issKey(i);
+    if (on) {
+      checkedMem.set(k, i.message);
+      const kept = store.set(k, i.message);
+      if (!checkedTold || !kept) toast(kept ? 'Marked checked: it\'s hidden until its message changes. "Show checked" brings it back.' : "Marked checked for now: this browser doesn't keep marks, so it comes back next time.", 6000);
+      checkedTold = true;
+    } else { checkedMem.set(k, null); store.del(k); }
+  }
+  // "New since you last looked": each issue's key and message, by source, as of the last time this person had the
+  // Problems tab open, kept in this browser (inv:seen). Refreshes only work out what is new against it; leaving
+  // Problems (or the page while on it) marks what it showed as seen. A source that wasn't read this time keeps its
+  // earlier list, so its issues aren't new when it's back; a source seen for the first time has nothing new.
+  let seenBy = null, curBy = new Map(), newSet = new Set();
+  function hash(t) { let h = 0x811c9dc5; for (let i = 0; i < t.length; i++) { h ^= t.charCodeAt(i); h = Math.imul(h, 0x01000193); } return (h >>> 0).toString(36); }
+  const issHash = i => hash(issKey(i) + '\n' + i.message);
+  const saveSeen = () => store.set('seen', JSON.stringify(Object.fromEntries([...seenBy].map(([k, v]) => [k, [...v]]))));
+  function markNew() {
+    if (!seenBy) {
+      try { const j = JSON.parse(store.get('seen') || 'null'); seenBy = j && typeof j === 'object' ? new Map(Object.entries(j).map(([k, v]) => [k, new Set(v)])) : null; } catch (e) { seenBy = null; }
+      if (!seenBy) seenBy = new Map();
+    }
+    const cur = new Map(), keys = new Map();
+    for (const i of allIssues()) {
+      if (!cur.has(i.source)) { cur.set(i.source, new Set()); keys.set(i.source, new Set()); }
+      cur.get(i.source).add(issHash(i)); keys.get(i.source).add(issKey(i));
+    }
+    const read = SOURCES.filter(x => st[x.k] && !st[x.k].stale && (st[x.k].state === 'ok' || st[x.k].state === 'warn')).map(x => x.name);
+    if (stages && stages.ok) read.push('Incoming');
+    newSet = new Set(); curBy = new Map();
+    let first = false;
+    for (const name of new Set([...cur.keys(), ...read])) {
+      const set = cur.get(name) || new Set(), was = seenBy.get(name);
+      curBy.set(name, set);
+      if (was) { for (const h of set) if (!was.has(h)) newSet.add(h); } else { seenBy.set(name, set); first = true; }
+    }
+    if (first) saveSeen();
+    // Checked marks of a source read this time whose problem is gone: dropped, so old marks don't pile up.
+    const readSet = new Set(read);
+    store.prune('checked:', rest => { const src = rest.slice(0, rest.indexOf(':')); return !readSet.has(src) || (keys.has(src) && keys.get(src).has(rest)); });
+  }
+  // The person has had the Problems tab open: what it showed is now seen (the "new" marks go on the next load).
+  function commitSeen() {
+    if (!seenBy || !curBy.size) return;
+    for (const [name, set] of curBy) seenBy.set(name, set);
+    saveSeen();
+  }
+
+  let shownIss = [];
   function renderIssues() {
     const all = allIssues(), q = pq.toLowerCase();
     const groups = new Map();
+    let nChecked = 0, open = 0;
     for (const i of all) {
+      const ck = isChecked(i);
+      if (ck) nChecked++; else open++;
+      if (ck && !showChecked) continue;
       if (q && ![i.source, i.code, codeLabel(i.code), i.sheet, i.row, i.po, i.style, i.message].join(' ').toLowerCase().includes(q)) continue;
       if (!groups.has(i.source)) groups.set(i.source, []);
-      groups.get(i.source).push(i);
+      groups.get(i.source).push({ i, ck, nw: newSet.has(issHash(i)) });
     }
-    const order = SOURCES.map(x => x.name);
+    const order = ['Incoming', ...SOURCES.map(x => x.name)];
     const names = [...groups.keys()].sort((a, b) => ((order.indexOf(a) + 1) || 99) - ((order.indexOf(b) + 1) || 99) || a.localeCompare(b));
     let h = '<thead><tr><th class="fz">What</th><th>Sheet</th><th class="num">Row / item</th><th>PO</th><th>Style</th><th>Message</th></tr></thead><tbody>';
     let matched = 0;
+    shownIss = [];
     for (const name of names) {
-      const list = groups.get(name);
+      // New since the last load first, each part in the order the files gave.
+      const list = groups.get(name).map((x, n) => ({ ...x, n })).sort((a, b) => (b.nw - a.nw) || (a.n - b.n));
       matched += list.length;
       const byCode = new Map();
-      for (const i of list) byCode.set(i.code, (byCode.get(i.code) || 0) + 1);
+      for (const { i } of list) byCode.set(i.code, (byCode.get(i.code) || 0) + 1);
       const codes = [...byCode].sort((a, b) => b[1] - a[1]).map(([c, n]) => `<span title="${esc(c || '')}">${esc(codeLabel(c))} ${fmtN(n)}</span>`).join(' · ');
-      h += `<tr class="gh"><td colspan="6"><b>${esc(name)}</b> · ${plural(list.length, 'issue')}<span class="codes">${codes}</span></td></tr>`;
+      const nNew = list.filter(x => x.nw).length;
+      h += `<tr class="gh"><td colspan="6"><b>${esc(name)}</b> · ${plural(list.length, 'issue')}${nNew ? ` · <b>${fmtN(nNew)} new</b>` : ''}<span class="codes">${codes}</span></td></tr>`;
       const show = expanded.has(name) ? list : list.slice(0, ISSUE_PAGE);
-      for (const i of show) {
-        h += `<tr><td class="nw fz" title="${esc(i.code)}">${esc(codeLabel(i.code))}</td><td class="nw">${esc(i.sheet)}</td><td class="num">${esc(i.row)}</td><td class="nw">${esc(i.po)}</td><td class="nw">${esc(i.style)}</td><td class="msg">${esc(i.message)}</td></tr>`;
+      for (const { i, ck, nw } of show) {
+        const ix = shownIss.push(i) - 1;
+        h += `<tr class="${nw ? 'isnew' : ''}${ck ? ' isck' : ''}"><td class="nw fz" title="${esc(i.code)}"><input type="checkbox" class="ck" data-ix="${ix}"${ck ? ' checked' : ''} title="Checked: hidden from this list until its message changes" aria-label="Checked">${nw ? '<span class="pill new">new</span>' : ''}${esc(codeLabel(i.code))}</td><td class="nw">${esc(i.sheet)}</td><td class="num">${esc(i.row)}</td><td class="nw">${esc(i.po)}</td><td class="nw">${esc(i.style)}</td><td class="msg">${esc(i.message)}</td></tr>`;
       }
       if (show.length < list.length) {
         h += `<tr><td colspan="6" class="more">Showing ${fmtN(show.length)} of ${fmtN(list.length)}. <button type="button" class="ghost" data-more="${esc(name)}">Show all ${fmtN(list.length)}</button></td></tr>`;
       }
     }
     if (!matched) {
-      const why = all.length ? 'No issues match the filter.' : lastLoaded ? 'No issues found in the files that loaded.' : '';
+      const why = all.length ? (open || showChecked ? 'No issues match the filter.' : 'Every issue is marked checked.') : lastLoaded ? 'No issues found in the files that loaded.' : '';
       h += `<tr><td colspan="6" class="empty">${esc(why)}</td></tr>`;
     }
     $('issTable').innerHTML = h + '</tbody>';
-    $('pqInfo').textContent = q ? `${fmtN(matched)} of ${plural(all.length, 'issue')} match` : plural(all.length, 'issue');
-    $('cProb').textContent = fmtN(all.length);
-    document.querySelector('#tabs .tab.iss').classList.toggle('bad', SOURCES.some(x => st[x.k] && st[x.k].state === 'err'));
+    const ckText = nChecked ? ` · ${fmtN(nChecked)} checked${showChecked ? '' : ', hidden'}` : '';
+    $('pqInfo').textContent = (q ? `${fmtN(matched)} of ${plural(all.length, 'issue')} match` : plural(all.length, 'issue')) + ckText;
+    $('pqCheckedWrap').hidden = !nChecked && !showChecked;
+    $('nChecked').textContent = fmtN(nChecked);
+    $('cProb').textContent = fmtN(open);
+    document.querySelector('#tabs .tab.iss').classList.toggle('bad', SOURCES.some(x => st[x.k] && st[x.k].state === 'err') || !!stageErr || balanceBad());
   }
-  function renderProblems() { renderSrcTable(); renderIssues(); }
+  function renderProblems() { renderSrcTable(); renderBalance(); renderIssues(); }
 
   function renderAll() {
-    renderSources(); renderHealth(); renderBanners(); renderProblems();
+    renderSources(); renderHealth(); renderBanners(); renderProblems(); fitPanes(); renderStageViews();
+  }
+  // Each tab's pane fills the window below where it starts (banners and tiles above it vary), so its own scroll bars
+  // stay on screen and the page itself needs no second scroll to reach them.
+  function fitPanes() {
+    for (const id of ['invPane', 'pullPane', 'issPane']) {
+      const p = $(id);
+      if (!p || !p.getClientRects().length) continue;   // on a hidden tab: sized when it's shown
+      const top = p.getBoundingClientRect().top + scrollY;
+      p.style.height = Math.max(id === 'issPane' ? 320 : 360, Math.floor(innerHeight - top - 14)) + 'px';
+    }
   }
 
   function showTab(t) {
     if (!['inv', 'pull', 'problems'].includes(t)) t = 'inv';
+    if (tab === 'problems' && t !== 'problems') commitSeen();
     tab = t;
     for (const b of document.querySelectorAll('#tabs .tab')) {
       b.classList.toggle('on', b.dataset.tab === t);
       b.setAttribute('aria-selected', String(b.dataset.tab === t));
     }
     for (const x of ['inv', 'pull', 'problems']) $('tab-' + x).hidden = x !== t;
+    // One set of filters for the Inventory and Pull from China tabs: the bar moves to the tab shown.
+    const fbar = $('fbar');
+    if (t === 'inv') $('tab-inv').insertBefore(fbar, $('invPane'));
+    else if (t === 'pull') $('tab-pull').insertBefore(fbar, $('pullPane'));
+    fbar.hidden = t === 'problems';
+    fitPanes();
+    if (t === 'inv' && vtInv) vtInv.show();
+    if (t === 'pull' && vtPull) vtPull.show();
+    if (vtInv) setInfo();
     store.set('tab', t);
+  }
+
+  // ---------- step 2: the stage numbers (core/stages.js) ----------
+  // Every unit on Master Sheet Live ends in one allocation with one bucket. The page only sums allocations: the rows,
+  // the tiles and the side panel are all sums of the same allocations, after the same filters.
+  const BUCKET_LABEL = { noCrd: 'No CRD', inProd: 'In production', ready: 'Ready', booked: 'Booked', loaded: 'Loaded', inChina: 'In China',
+    water: 'On the water', port: 'At port', incoming: 'Incoming', landed: 'Landed', pullFromChina: 'Pull from China', short: 'Short-shipped',
+    shippedNotOnCt: 'Shipped, not on Container Tracking', duplicate: 'Repeat of a shipped line', ctMore: 'Container Tracking holds more',
+    unmatched: 'Unmatched', planning: 'Planned, not booked yet', ignored: 'Ignored section', belowTracker: 'Older than the PO Status Tracker',
+    casesIncoming: 'Incoming' };
+  // The outcomes outside every total, in running text (proper names keep their capitals).
+  const OUT_WORD = { landed: 'landed', short: 'short-shipped', shippedNotOnCt: 'shipped, not on Container Tracking', duplicate: 'repeats of a shipped line', ctMore: 'beyond Master Sheet Live',
+    planning: 'planned, not booked yet', ignored: 'in an ignored section', belowTracker: 'older than the PO Status Tracker' };
+  const IN_CHINA = ['noCrd', 'inProd', 'ready', 'booked', 'loaded'];
+  const INCOMING = [...IN_CHINA, 'water', 'port'];
+  // In the balance and the side panel, never in a total. The last three are Container Tracking units only, like ctMore.
+  const OUTSIDE = ['landed', 'short', 'shippedNotOnCt', 'duplicate', 'ctMore', 'planning', 'ignored', 'belowTracker'];
+  const CT_ONLY = ['ctMore', 'unmatched', 'planning', 'ignored', 'belowTracker'];
+  // config.js's direct-to-customer sections, named where Pull from China is explained.
+  const PULL_SECTIONS = (CFG.sections && Array.isArray(CFG.sections.pullFromChina) ? CFG.sections.pullFromChina : []).filter(x => typeof x === 'string' && x.trim());
+  const PULL_TIP = `China Pickup POs${PULL_SECTIONS.length ? `, and Container Tracking's ${PULL_SECTIONS.join(', ')} sections (straight to the customer)` : ''}: picked up in China, never in In China or Incoming`;
+  const TOT = ['noCrd', 'inProd', 'ready', 'booked', 'loaded', 'inChina', 'water', 'port', 'incoming', 'pullFromChina', 'unmatched'];
+  const NUM_COLS = ['noCrd', 'inProd', 'ready', 'booked', 'loaded', 'inChina', 'water', 'port', 'incoming', 'pullFromChina'];
+  const bucketsOf = k => (k === 'inChina' ? IN_CHINA : k === 'incoming' || k === 'casesIncoming' ? INCOMING : [k]);
+  // The totals an allocation adds to: its bucket, plus In China and Incoming for the stages they are sums of.
+  const totalsOf = b => (IN_CHINA.includes(b) ? [b, 'inChina', 'incoming'] : b === 'water' || b === 'port' ? [b, 'incoming']
+    : b === 'pullFromChina' || b === 'unmatched' ? [b] : []);
+  const isLandedStage = v => /^landed$/i.test(String(v || '').trim());
+  // Saul: once Container Tracking-only goods land they show nowhere (they come back through the ATS report).
+  const hiddenAlloc = a => (a.bucket === 'unmatched' || a.bucket === 'belowTracker' || a.bucket === 'ignored') && isLandedStage(a.stage);
+  const units = v => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+  const nz = n => (n ? fmtN(n) : '');
+  const fmtD = d => (typeof d === 'number' ? window.InvCommon.fmtDay(d) : d ? String(d) : '');
+  const fmtList = v => (Array.isArray(v) ? v.filter(x => x != null && x !== '').join(', ') : v == null ? '' : String(v));
+  const stageText = v => BUCKET_LABEL[v] || String(v || '');
+  // A stage with the Container Tracking section it sits under, when that section has no round ("Loaded · Direct A").
+  const stageSec = a => stageText(a.stage) + (a.section ? ' · ' + a.section : '');
+  const flagText = f => (Array.isArray(f) ? f : f ? [f] : []).map(codeLabel).join(' · ');
+  const lc = v => String(v ?? '').toLowerCase();
+  function ptypeOf(x) {
+    const t = String((x && x.ptype) || '');
+    if (/china/i.test(t)) return 'China Pickup';
+    if (/unknown/i.test(t) || (x && x.tracked === false) || (Array.isArray(x && x.flags) && x.flags.includes('unknown-type'))) return 'Unknown';
+    return t;
+  }
+  function casesText(c, np, u) {
+    if (!u) return '';
+    const p = [];
+    if (c) p.push(plural(c, 'case'));
+    if (np) p.push(`${fmtN(np)} units with no case pack`);
+    return p.join(' + ');
+  }
+
+  let stages = null;     // the last InvStages.build result, or { ok:false, block:[…] }; null before the first build
+  let stageErr = '';     // the engine stopped or gave an answer the page can't read: a bug, said so
+  let idx = null;        // per build: allocations by style, the filter lists
+  let pageIssues = [];   // the page's own check that its sums equal the engine's
+  const got = k => (st[k] && st[k].data) || null;
+
+  // The PO Book group and Container Tracking, each read and used, or why not (one line each).
+  function stageBlockers() {
+    const out = [];
+    for (const k of CORE_KEYS) {
+      const s = st[k];
+      const used = s && !s.blocked && (s.state === 'ok' || s.state === 'warn') && ((k !== 'msl' && k !== 'ct') || s.data);
+      if (used) continue;
+      out.push({ k, name: BY_K[k].name, why: !s || (s.state === 'load' && !s.data) ? 'not read yet' : s.state === 'load' ? 'loading' : statusWord(s) });
+    }
+    return out;
+  }
+  // An error in the page's own stage code shows as the red "couldn't be worked out" banner, never as a load failure.
+  const stageCodeErr = e => { console.error(e); stageErr = `the page couldn't draw them (${(e && e.message) || e})`; stages = { ok: false, notLoaded: [], block: [] }; idx = null; };
+  function buildStages(today) {
+    try { buildStagesNow(today); } catch (e) { stageCodeErr(e); }
+  }
+  function buildStagesNow(today) {
+    stageErr = ''; pageIssues = [];
+    const block = stageBlockers();
+    if (block.length) { stages = { ok: false, notLoaded: block.map(b => b.name), block }; indexStages(); return; }
+    const po = got('msl');
+    let r;
+    try {
+      r = window.InvStages.build({ po, mrows: po.mrows, ct: got('ct'), forwarder: got('forwarder'), drayage: got('drayage'), upc: got('upc'), today, sections: CFG.sections });
+    } catch (e) {
+      console.error(e);
+      stageErr = `the stage engine stopped (${(e && e.message) || e})`; stages = { ok: false, notLoaded: [], block: [] }; indexStages(); return;
+    }
+    if (r && r.ok === false) {
+      const names = Array.isArray(r.notLoaded) ? r.notLoaded : [];
+      stages = { ok: false, notLoaded: names, block: names.map(n => ({ name: n, why: 'not loaded' })) };
+      if (!names.length) stageErr = "the stage engine said the numbers aren't loaded without saying which source";
+    } else if (!r || !Array.isArray(r.styles) || !Array.isArray(r.allocs) || !Array.isArray(r.pull) || !r.totals || !r.totals.units || !r.balance) {
+      stageErr = "the stage engine gave an answer the page can't read"; stages = { ok: false, notLoaded: [], block: [] };
+    } else stages = r;
+    indexStages();
+  }
+
+  function indexStages() {
+    idx = null;
+    if (!stages || !stages.ok) return;
+    const byStyle = new Map();
+    for (const s of stages.styles) if (s && !byStyle.has(s.style)) byStyle.set(s.style, { s, allocs: [] });
+    for (const a of stages.allocs) {
+      if (!a || hiddenAlloc(a)) continue;
+      let e = byStyle.get(a.style);
+      if (!e) { e = { s: { style: a.style, styleRaw: a.style, desc: '', category: '', sub: '', factories: [], factory: '', upcs: [] }, allocs: [] }; byStyle.set(a.style, e); }
+      e.allocs.push(a);
+    }
+    const facs = new Set(), cats = new Set();
+    for (const { s, allocs } of byStyle.values()) { cats.add(s.category || ''); for (const a of allocs) facs.add(a.factory || ''); }
+    for (const r of stages.pull) facs.add(r.factory || '');
+    const byId = new Map(), byLine = new Map();
+    for (const a of stages.allocs) {
+      if (a && a.id != null) byId.set(a.id, a);
+      if (a && a.lineKey && a.status === 'open' && !hiddenAlloc(a)) (byLine.get(a.lineKey) || byLine.set(a.lineKey, []).get(a.lineKey)).push(a);
+    }
+    idx = { byStyle, byId, byLine, list: [...byStyle.values()], facs, cats };
+    // The page's sums of every allocation must equal the engine's totals, unit for unit.
+    const all = agg0();
+    for (const e of idx.list) for (const a of e.allocs) addTo(all, a);
+    const off = TOT.filter(k => units(stages.totals.units[k]) !== all.units[k]);
+    if (off.length) {
+      const msg = `The page adds the allocations up to different totals than the stage engine: ${off.map(k => `${BUCKET_LABEL[k]} ${fmtN(all.units[k])} here, ${fmtN(units(stages.totals.units[k]))} in the engine`).join('; ')}. This is a bug in Shalam Tool: tell Saul.`;
+      console.error(msg);
+      pageIssues = [{ source: 'Incoming', code: 'page-sum', sheet: '', row: '', po: '', style: '', message: msg }];
+    }
+  }
+  const catOf = style => { const e = idx && idx.byStyle.get(window.InvCommon.normStyle(style)); return (e && e.s.category) || ''; };
+
+  function agg0() { const z = () => Object.fromEntries(TOT.map(k => [k, 0])); return { units: z(), cases: z(), noPack: z() }; }
+  function addTo(g, a) {
+    const u = units(a.units);
+    for (const k of totalsOf(a.bucket)) {
+      g.units[k] += u;
+      if (typeof a.cases === 'number') g.cases[k] += a.cases; else g.noPack[k] += u;
+    }
+  }
+
+  // ---------- filters: one set for the Inventory and Pull from China tabs ----------
+  const F = { q: '', fac: '', cat: '', stage: '', type: '' };
+  const NONE = '__none__';   // the choice for a blank factory or category
+  const fOn = () => !!(F.q || F.fac || F.cat || F.stage || F.type);
+  const facOk = v => !F.fac || (F.fac === NONE ? !v : v === F.fac);
+  const catOk = v => !F.cat || (F.cat === NONE ? !v : v === F.cat);
+  const styleHit = s => lc(s.style).includes(F.q) || lc(s.styleRaw).includes(F.q) || lc(s.desc).includes(F.q);
+  const allocHit = a => lc(a.upc).includes(F.q) || lc(a.po).includes(F.q) || lc(a.poShown).includes(F.q);
+  const passes = (a, sHit) => facOk(a.factory || '') && (!F.type || ptypeOf(a) === F.type) &&
+    (!F.stage || bucketsOf(F.stage).includes(a.bucket)) && (sHit || !F.q || allocHit(a));
+  const STAGE_OPTS = [['inChina', 'In China (any)'], ...IN_CHINA.map(k => [k, '· ' + BUCKET_LABEL[k]]), ['water', 'On the water'], ['port', 'At port'],
+    ['incoming', 'Incoming (any)'], ['pullFromChina', 'Pull from China'], ['unmatched', 'Unmatched']];
+  const STAGE_OUT = OUTSIDE.map(k => [k, BUCKET_LABEL[k]]);
+  const TYPE_OPTS = [['LA', 'LA'], ['China Pickup', 'China Pickup'], ['Unknown', 'Unknown']];
+  function fillSelect(el, all, opts, cur, extra) {
+    const o = list => list.map(([v, t]) => `<option value="${esc(v)}"${v === cur ? ' selected' : ''}>${esc(t)}</option>`).join('');
+    let h = `<option value="">${esc(all)}</option>${o(opts)}${extra || ''}`;
+    if (cur && !opts.some(x => x[0] === cur) && !(extra && extra.includes(`value="${esc(cur)}"`))) h += `<option value="${esc(cur)}" selected>${esc(cur === NONE ? '(blank)' : cur)} (none now)</option>`;
+    el.innerHTML = h;
+  }
+  function renderFilterLists() {
+    const named = set => [...set].filter(Boolean).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    const facs = idx ? idx.facs : new Set(), cats = idx ? idx.cats : new Set();
+    fillSelect($('fFac'), 'All factories', [...named(facs).map(v => [v, v]), ...(facs.has('') ? [[NONE, '(no factory)']] : [])], F.fac);
+    fillSelect($('fCat'), 'All categories', [...named(cats).map(v => [v, v]), ...(cats.has('') ? [[NONE, '(no category)']] : [])], F.cat);
+    fillSelect($('fStage'), 'All stages', STAGE_OPTS, F.stage,
+      `<optgroup label="Not counted (side panel and Problems)">${STAGE_OUT.map(([v, t]) => `<option value="${v}"${v === F.stage ? ' selected' : ''}>${esc(t)}</option>`).join('')}</optgroup>`);
+    fillSelect($('fType'), 'All PO types', TYPE_OPTS, F.type);
+    $('btnClearF').hidden = !fOn();
+  }
+
+  // ---------- tables that draw only the rows in view ----------
+  // Every row has one height (measured from the first one drawn); a spacer row above and below stands in for the
+  // rest, so the scroll bar, the sticky header and the frozen columns work as in the full table.
+  function vtable(paneId, tableId, o) {
+    const pane = $(paneId), table = $(tableId), OVER = 14;
+    const v = { rows: [], rowH: o.rowH || 29, a: -1, b: -1, top: 0, raf: 0 };
+    const body = () => table.tBodies[0] || table.appendChild(document.createElement('tbody'));
+    function draw(force, depth) {
+      const headH = (table.tHead && table.tHead.offsetHeight) || 0;
+      const top = Math.max(0, pane.scrollTop - headH), h = pane.clientHeight || 640;
+      const a = Math.max(0, Math.floor(top / v.rowH) - OVER), b = Math.min(v.rows.length, Math.ceil((top + h) / v.rowH) + OVER);
+      if (!force && a === v.a && b === v.b) return;
+      v.a = a; v.b = b;
+      const cols = o.cols();
+      if (!v.rows.length) { body().innerHTML = `<tr><td colspan="${cols}" class="empty">${o.empty()}</td></tr>`; return; }
+      const spc = px => `<tr class="spc" aria-hidden="true"><td colspan="${cols}" style="height:${px}px"></td></tr>`;
+      let html = a ? spc(a * v.rowH) : '';
+      for (let i = a; i < b; i++) html += o.row(v.rows[i], i);
+      if (b < v.rows.length) html += spc((v.rows.length - b) * v.rowH);
+      body().innerHTML = html;
+      // Measured on a main row (a UPC line under a style is drawn to the same height by app.css, but a style row is the reference).
+      const tr = body().querySelector('tr.r:not(.upc)') || body().querySelector('tr.r');
+      const rh = tr ? tr.getBoundingClientRect().height : 0;
+      if (rh > 0 && Math.abs(rh - v.rowH) > 0.5 && (depth || 0) < 2) { v.rowH = rh; draw(true, (depth || 0) + 1); }
+    }
+    pane.addEventListener('scroll', () => {
+      v.top = pane.scrollTop;
+      if (!v.raf) v.raf = requestAnimationFrame(() => { v.raf = 0; draw(false); });
+    }, { passive: true });
+    return {
+      get rows() { return v.rows; },
+      // New rows. toTop: a filter or sort change; a refresh keeps the place.
+      set(rows, toTop) {
+        v.rows = rows || [];
+        if (table.tHead) table.tHead.innerHTML = o.head(); else table.createTHead().innerHTML = o.head();
+        if (toTop) { v.top = 0; pane.scrollTop = 0; }
+        draw(true);
+      },
+      // A tab shown again: back to where it was (a hidden pane can lose its place), then the rows for it.
+      show() { if (Math.abs(pane.scrollTop - v.top) > 1) pane.scrollTop = v.top; draw(true); },
+      redraw() { draw(true); },
+    };
+  }
+  let vtInv = null, vtPull = null, vtPanel = null;
+  const sortHead = (cols, srt) => `<tr>${cols.map(c => {
+    const on = srt && srt.k === c.k, cls = [c.cls, c.n || c.b || c.off ? 'num' : '', c.sum ? 'sum' : '', c.off ? 'off' : ''].filter(Boolean).join(' ');
+    const sortable = !c.off && !c.nosort;
+    return `<th class="${cls}"${sortable ? ` data-s="${c.k}" aria-sort="${on ? (srt.dir > 0 ? 'ascending' : 'descending') : 'none'}"` : ''}${c.tip ? ` title="${esc(c.tip)}"` : ''}>${esc(c.t)}${on ? `<span class="ar">${srt.dir > 0 ? '▲' : '▼'}</span>` : ''}</th>`;
+  }).join('')}</tr>`;
+  // Blanks always last; numbers big-first on the first click, text A to Z.
+  function cmpBy(val, dir) {
+    return (x, y) => {
+      const a = val(x), b = val(y), ea = a == null || a === '' || a === 0, eb = b == null || b === '' || b === 0;
+      if (ea || eb) return ea === eb ? 0 : ea ? 1 : -1;
+      return (typeof a === 'number' && typeof b === 'number' ? a - b : String(a).localeCompare(String(b), undefined, { numeric: true })) * dir;
+    };
+  }
+  function nextSort(srt, cols, k) {
+    const c = cols.find(x => x.k === k);
+    if (!c) return srt;
+    if (srt && srt.k === k) return { k, dir: -srt.dir };
+    return { k, dir: c.n || c.b || c.date ? (c.date ? 1 : -1) : 1 };
+  }
+
+  // ---------- Inventory tab ----------
+  const INV_COLS = [
+    { k: 'style', t: 'Style', cls: 'fz f-sty' }, { k: 'desc', t: 'Description' }, { k: 'category', t: 'Category' }, { k: 'factory', t: 'Factory' },
+    { k: 'onHand', t: 'On hand', off: 1, tip: 'Comes with the ATS report (step 3)' },
+    ...NUM_COLS.map(k => ({ k, t: BUCKET_LABEL[k], b: 1, sum: k === 'inChina' || k === 'incoming',
+      tip: k === 'inChina' ? 'No CRD + In production + Ready + Booked + Loaded' : k === 'incoming' ? 'In China + On the water + At port'
+        : k === 'pullFromChina' ? PULL_TIP : '' })),
+    { k: 'casesIncoming', t: 'Cases incoming', b: 1, tip: 'Incoming in cases: units ÷ the Master column on Master Sheet Live, rounded up' },
+    { k: 'nextEta', t: 'Next ETA', date: 1, tip: 'The earliest ETA of the units on the water or at port' },
+  ];
+  let sortInv = { k: 'style', dir: 1 };
+  let invShown = { styles: 0, empty: 0 };
+
+  // One style's numbers from its allocations (already filtered). Tags: units outside the columns worth a look.
+  function sumRow(allocs) {
+    const g = agg0(), tags = {};
+    let eta = null;
+    for (const a of allocs) {
+      addTo(g, a);
+      if ((a.bucket === 'water' || a.bucket === 'port') && typeof a.eta === 'number' && (eta == null || a.eta < eta)) eta = a.eta;
+      if (OUTSIDE.includes(a.bucket) && F.stage === a.bucket) tags[a.bucket] = (tags[a.bucket] || 0) + units(a.units);
+    }
+    if (g.units.unmatched) tags.unmatched = g.units.unmatched;
+    const any = NUM_COLS.some(k => g.units[k]) || Object.values(tags).some(Boolean);
+    return { units: g.units, cases: g.cases, noPack: g.noPack, nextEta: eta, tags, any };
+  }
+  function invRows() {
+    const rows = [];
+    let empty = 0;
+    for (const e of idx.list) {
+      const s = e.s;
+      if (!catOk(s.category || '')) continue;
+      const sHit = !F.q || styleHit(s);
+      const allocs = e.allocs.filter(a => passes(a, sHit));
+      if (!allocs.length) { if (sHit && !F.fac && !F.type && !F.stage) empty++; continue; }
+      const sum = sumRow(allocs);
+      if (!sum.any) { empty++; continue; }
+      const factories = Array.isArray(s.factories) ? s.factories : [];
+      rows.push({ kind: 'style', key: s.style, s, styleRaw: s.styleRaw || s.style, desc: s.desc || '', category: s.category || '', sub: s.sub || '',
+        factory: F.fac && F.fac !== NONE ? F.fac : s.factory || factories[0] || '', factories, allocs, ...sum });
+    }
+    const k = sortInv.k;
+    const val = k === 'style' ? r => r.styleRaw : ['desc', 'category', 'factory', 'nextEta'].includes(k) ? r => r[k]
+      : k === 'casesIncoming' ? r => r.cases.incoming : r => r.units[k];
+    rows.sort(cmpBy(val, sortInv.dir));
+    invShown = { styles: rows.length, empty };
+    // UPC lines under a style with more than one UPC (with the filters on, only the UPCs they leave).
+    const out = [];
+    for (const r of rows) {
+      out.push(r);
+      const by = new Map();
+      if (!fOn()) for (const u of r.s.upcs || []) by.set((u && (u.upc || u.upcRaw)) || '', []);
+      for (const a of r.allocs) if (totalsOf(a.bucket).length || r.tags[a.bucket]) { const k = a.upc || ''; if (!by.has(k)) by.set(k, []); by.get(k).push(a); }
+      r.upc1 = by.size === 1 ? [...by.keys()][0] : '';
+      if (by.size < 2) continue;
+      const subs = [...by].sort((x, y) => (x[0] ? 0 : 1) - (y[0] ? 0 : 1) || x[0].localeCompare(y[0]));
+      for (const [upc, list] of subs) out.push({ kind: 'upc', key: r.key, upc, styleRaw: r.styleRaw, allocs: list, ...sumRow(list) });
+    }
+    return out;
+  }
+  function invRowHtml(r, i) {
+    const nb = k => (r.units[k] ? `<button type="button" class="nb" data-b="${k}">${fmtN(r.units[k])}</button>` : '');
+    const up = r.kind === 'upc';
+    let h = `<tr class="r${up ? ' upc' : ''}" data-i="${i}">`;
+    if (up) h += `<td class="fz f-sty" title="UPC ${esc(r.upc || 'none')} of ${esc(r.styleRaw)}">${esc(r.upc || 'no UPC')}</td><td></td><td></td><td></td>`;
+    else {
+      const tagWords = (b, n) => (b === 'unmatched' ? `${fmtN(n)} units unmatched: on Container Tracking with no Master Sheet Live line, in the Unmatched tile, never in the stage columns`
+        : `${fmtN(n)} units ${OUT_WORD[b] || stageText(b).toLowerCase()}: not counted in any column`);
+      const tags = Object.entries(r.tags).map(([b, n]) => `<button type="button" class="tag${b === 'unmatched' ? ' um' : ''}" data-b="${b}" title="${esc(tagWords(b, n))}">${fmtN(n)} ${esc(b === 'unmatched' ? 'unmatched' : OUT_WORD[b] || stageText(b).toLowerCase())}</button>`).join('');
+      const tip = [r.styleRaw, r.upc1 ? 'UPC ' + r.upc1 : '', ...Object.entries(r.tags).map(([b, n]) => tagWords(b, n)), 'Click for every line behind this style'].filter(Boolean).join('\n');
+      // The UPC gives way first, so a tag always shows whatever the UPC's length.
+      h += `<td class="fz f-sty" title="${esc(tip)}"><div class="sc"><button type="button" class="sb" data-b="all">${esc(r.styleRaw)}</button>${r.upc1 ? `<span class="u">${esc(r.upc1)}</span>` : ''}${tags}</div></td>` +
+        `<td class="desc" title="${esc(r.desc)}">${esc(r.desc)}</td><td class="cut" title="${esc([r.category, r.sub].filter(Boolean).join(' · '))}">${esc(r.category)}</td>` +
+        `<td class="cut" title="${esc(r.factories.join(', '))}">${esc(r.factory)}</td>`;
+    }
+    h += `<td class="num off">${up ? '' : 'step 3'}</td>`;
+    for (const k of NUM_COLS) h += `<td class="num${k === 'inChina' || k === 'incoming' ? ' sum' : ''}">${nb(k)}</td>`;
+    const c = r.cases.incoming, np = r.noPack.incoming;
+    const ci = !r.units.incoming ? '' : `<button type="button" class="nb" data-b="casesIncoming" title="${esc(casesText(c, np, r.units.incoming))}">${c ? fmtN(c) : ''}${np ? `<span class="np">${c ? '+ no case pack' : 'no case pack'}</span>` : ''}</button>`;
+    return h + `<td class="num">${ci}</td><td class="nw">${esc(fmtD(r.nextEta))}</td></tr>`;
+  }
+
+  // ---------- the tiles ----------
+  const TILES = [['inChina', 'In China', 'No CRD + In production + Ready + Booked + Loaded'], ['water', 'On the water', 'Sailed, not arrived'],
+    ['port', 'At port', 'Arrived or picked up, not delivered'], ['incoming', 'Incoming', 'In China + On the water + At port'],
+    ['pullFromChina', 'Pull from China', PULL_TIP],
+    ['unmatched', 'Unmatched', 'On Container Tracking with no Master Sheet Live line (not landed): never in the stage numbers']];
+  function renderTiles(g) {
+    const lead = stageLead();
+    const live = TILES.map(([k, t, tip]) => {
+      if (!g) return `<div class="glass tile nl" data-t="${k}"><div class="lbl">${esc(t)}</div><div class="n">${esc(lead.word)}</div><div class="cs"></div></div>`;
+      return `<button type="button" class="glass tile${panel && panel.kind === 'tile' && panel.b === k ? ' on' : ''}" data-t="${k}" title="${esc(tip + '. Click for the lines behind it.')}" aria-label="${esc(`${t}: ${fmtN(g.units[k])} units`)}">` +
+        `<div class="lbl">${esc(t)}${fOn() ? '<i>filtered</i>' : ''}</div><div class="n">${fmtN(g.units[k])}<small>units</small></div>` +
+        `<div class="cs">${esc(casesText(g.cases[k], g.noPack[k], g.units[k]))}</div></button>`;
+    });
+    const later = ['On hand', 'Held', 'Available'].map(t => `<div class="glass tile off"><div class="lbl">${t}</div><div class="n">—</div><div class="cs">comes with the ATS report (step 3)</div></div>`);
+    $('tiles').innerHTML = live.concat(later).join('');
+  }
+
+  // What the Inventory and Pull from China tabs say while there are no numbers: loading, not loaded, or a bug.
+  // short: the line in an empty table.
+  function stageLead() {
+    if (stages && stages.ok) return null;
+    if (scopeFatal || fatal) return { word: 'not loaded', h: 'Stage numbers not loaded', p: 'Nothing could be read: see the red banner.', short: 'Not loaded: nothing could be read (see the red banner).' };
+    if (stageErr) return { word: 'not loaded', h: "The stage numbers couldn't be worked out", p: `${cap(stageErr)}. This is a bug in Shalam Tool, not a problem in the files: tell Saul.`, short: "Not loaded: the stage numbers couldn't be worked out (see the red banner)." };
+    if (!stages) {
+      const busy = !!loading || !cycleDone;
+      return { word: busy ? 'loading…' : 'not loaded', h: busy ? 'Loading the sources…' : 'Stage numbers not loaded',
+        p: busy ? 'Master Sheet Live, the PO Status Tracker and Container Tracking first; the numbers appear as soon as they are in.' : '', short: busy ? 'Loading…' : 'Not loaded.' };
+    }
+    const items = (stages.block || []).map(b => `${b.name} (${b.why})`);
+    // A red or blank source has a banner saying what to fix; one that wasn't read (Cancel) only needs a Refresh.
+    const banner = (stages.block || []).some(b => { const s = b.k && st[b.k]; return !!s && (s.state === 'err' || s.blocked || s.label === 'not set'); });
+    return { word: 'not loaded', h: 'Stage numbers not loaded',
+      p: `Nothing is shown until the PO Book group (Master Sheet Live, PO Status Tracker, PO Book lines) and Container Tracking are all read.${items.length ? ` Not read now: ${items.join(', ')}.` : ''} ${banner ? 'The banner above says what to fix.' : 'Click Refresh to read them.'}`,
+      short: `Not loaded${items.length ? ': ' + items.join(', ') : ''}.` };
+  }
+  function renderLead() {
+    const L = stageLead();
+    $('invState').hidden = !L;
+    $('pullState').hidden = !L;
+    if (!L) return;
+    $('invStateH').textContent = L.h; $('invStateP').textContent = L.p;
+    $('pullStateH').textContent = L.h === 'Loading the sources…' ? L.h : 'Not loaded'; $('pullStateP').textContent = L.p;
+  }
+  const emptyText = what => { const L = stageLead(); return esc(L ? L.short : what); };
+
+  function renderInv(toTop) {
+    let g = null, rows = [];
+    if (idx) {
+      rows = invRows();
+      g = agg0();
+      for (const r of rows) if (r.kind === 'style') for (const a of r.allocs) addTo(g, a);
+    }
+    renderTiles(g);
+    vtInv.set(rows, toTop);
+    setInfo();
+  }
+  // The line at the end of the filter bar, for the tab it sits on.
+  function setInfo() {
+    $('fInfo').textContent = !idx ? '' : tab === 'pull' ? pullInfo
+      : `${plural(invShown.styles, 'style')}${invShown.empty ? ` · ${fmtN(invShown.empty)} more ${fOn() ? (invShown.empty === 1 ? 'matches but has' : 'match but have') : (invShown.empty === 1 ? 'has' : 'have')} nothing in these columns (shipped, landed or not counted)` : ''}`;
+  }
+
+  // ---------- Pull from China tab ----------
+  const PULL_COLS = [
+    { k: 'po', t: 'PO', cls: 'fz f-po' }, { k: 'style', t: 'Style', cls: 'fz f-sty2' }, { k: 'desc', t: 'Description' }, { k: 'customer', t: 'Customer' },
+    { k: 'ptype', t: 'PO type' }, { k: 'factory', t: 'Factory' }, { k: 'crd', t: 'CRD', date: 1 }, { k: 'units', t: 'Units', n: 1 }, { k: 'cases', t: 'Cases', n: 1 },
+    { k: 'ctStatus', t: 'Container Tracking status' }, { k: 'round', t: 'Round' }, { k: 'containers', t: 'Container' },
+    { k: 'etd', t: 'ETD', date: 1 }, { k: 'eta', t: 'ETA', date: 1 }, { k: 'flags', t: 'Flags' },
+  ];
+  let sortPull = null, pullInfo = '';
+  // The stage filter on a Pull from China line: by its Container Tracking status, and its CRD while it's not on it.
+  function pullStageOk(r) {
+    // By the status of each part (a section name such as "Direct Loaded" is not a stage); "Planned" is at its CRD stage.
+    const st = Array.isArray(r.ctParts) ? r.ctParts.map(p => String(p.status || '')) : String(r.ctStatus || '').split(' · ').map(x => x.replace(/\s[\d,]+$/, ''));
+    const is = w => st.includes(w), not = is('Not on tracker') || is('Planned'), today = stages.today;
+    const flags = Array.isArray(r.flags) ? r.flags : [];
+    const has = { booked: is('Booked'), loaded: is('Loaded'), water: is('On the water'), port: is('At port'), landed: is('Landed'),
+      noCrd: not && r.crd == null, inProd: not && typeof r.crd === 'number' && r.crd >= today, ready: not && typeof r.crd === 'number' && r.crd < today,
+      pullFromChina: ptypeOf(r) === 'China Pickup' || flags.includes('pull-section'), ctMore: flags.includes('ct-more'),
+      planning: flags.includes('planning-section') };
+    return bucketsOf(F.stage).some(b => has[b]);
+  }
+  function pullRows() {
+    const rows = stages.pull.filter(r => r && facOk(r.factory || '') && (!F.type || ptypeOf(r) === F.type) && (!F.cat || catOk(catOf(r.style))) &&
+      (!F.q || [r.style, r.styleRaw, r.desc, r.upc, r.po, r.poShown].some(v => lc(v).includes(F.q))) && (!F.stage || pullStageOk(r)));
+    if (sortPull) {
+      const k = sortPull.k;
+      rows.sort(cmpBy(r => (k === 'flags' ? flagText(r.flags) : k === 'containers' || k === 'round' ? fmtList(r[k]) : k === 'ptype' ? ptypeOf(r)
+        : k === 'style' ? r.styleRaw || r.style : r[k]), sortPull.dir));
+    }
+    const u = rows.reduce((p, r) => p + units(r.units), 0), cp = rows.filter(r => ptypeOf(r) === 'China Pickup').reduce((p, r) => p + units(r.units), 0);
+    pullInfo = `${plural(rows.length, 'open line')} · ${fmtN(u)} units${cp ? ` (China Pickup ${fmtN(cp)})` : ''}`;
+    return rows;
+  }
+  function pullRowHtml(r, i) {
+    const st2 = String(r.ctStatus || ''), sty = r.styleRaw || r.style;
+    const poTip = r.poShown ? `PO ${r.po} on Master Sheet Live; the PO Book shows it as ${r.poShown}` : `PO ${r.po}`;
+    return `<tr class="r" data-i="${i}"><td class="fz f-po" title="${esc(poTip)}">${esc(r.po)}<span class="u">${r.poShown ? esc('as ' + r.poShown) : '&nbsp;'}</span></td>` +
+      `<td class="fz f-sty2" title="${esc([sty, r.upc ? 'UPC ' + r.upc : ''].filter(Boolean).join('\n'))}">${esc(sty)}<span class="u">${r.upc ? esc(r.upc) : '&nbsp;'}</span></td>` +
+      `<td class="desc" title="${esc(r.desc)}">${esc(r.desc)}</td><td class="cut" title="${esc(r.customer)}">${esc(r.customer)}</td><td class="nw">${esc(ptypeOf(r))}</td>` +
+      `<td class="cut" title="${esc(r.factory)}">${esc(r.factory)}</td><td class="nw">${esc(fmtD(r.crd))}</td>` +
+      `<td class="num">${r.units ? `<button type="button" class="nb" data-b="line" title="Click for this line's stages and where each fact came from">${fmtN(r.units)}</button>` : ''}</td>` +
+      `<td class="num">${typeof r.cases === 'number' ? nz(r.cases) : r.units ? '<span class="np" title="No case pack (Master) for this line">no case pack</span>' : ''}</td>` +
+      // A mix of stages takes two lines: the first part, then the rest.
+      `<td class="cut st${/^(not on tracker$|planned · )/i.test(st2) ? ' nt' : ''}" title="${esc(st2)}">${esc(st2.split(' · ')[0])}<span class="u">${st2.includes(' · ') ? esc(st2.split(' · ').slice(1).join(' · ')) : '&nbsp;'}</span></td><td class="nw">${esc(fmtList(r.round))}</td>` +
+      `<td class="cut" title="${esc(fmtList(r.containers))}">${esc(fmtList(r.containers))}</td><td class="nw">${esc(fmtD(r.etd))}</td><td class="nw">${esc(fmtD(r.eta))}</td>` +
+      `<td class="cut flag" title="${esc(flagText(r.flags))}">${esc(flagText(r.flags))}</td></tr>`;
+  }
+  function renderPull(toTop) {
+    const rows = idx ? pullRows() : [];
+    vtPull.set(rows, toTop);
+    const c = $('cPull');
+    c.hidden = !idx; c.textContent = idx ? fmtN(rows.length) : '';
+    setInfo();
+  }
+
+  // ---------- the side panel: the allocations behind a number ----------
+  // panel: { kind: 'cell' | 'style' | 'tile' | 'pull', key (style), upc (a UPC line, '' for no UPC), b (bucket), po }
+  let panel = null, panelFrom = null;
+  const FACT_LABEL = { units: 'Units', qty: 'Quantity', status: 'Open or shipped', po: 'PO', poShown: 'PO in the PO Book', style: 'Style', upc: 'UPC', customer: 'Customer', ptype: 'PO type',
+    factory: 'Factory', crd: 'CRD', round: 'Round', containers: 'Containers', etd: 'ETD', eta: 'ETA', stage: 'Stage', master: 'Master (case pack)',
+    cases: 'Cases', desc: 'Description', category: 'Category' };
+  const PANEL_COLS = [
+    { k: 'style', t: 'Style', many: 1 }, { k: 'upc', t: 'UPC' }, { k: 'po', t: 'PO' }, { k: 'poShown', t: 'PO in the PO Book' }, { k: 'customer', t: 'Customer' },
+    { k: 'bucket', t: 'Counts in' }, { k: 'units', t: 'Units', n: 1 }, { k: 'cases', t: 'Cases', n: 1 }, { k: 'crd', t: 'CRD', date: 1 },
+    { k: 'round', t: 'Round' }, { k: 'containers', t: 'Containers' }, { k: 'etd', t: 'ETD', date: 1 }, { k: 'eta', t: 'ETA', date: 1 },
+    { k: 'stage', t: 'Stage' }, { k: 'flags', t: 'Flags' }, { k: 'from', t: 'From' },
+  ];
+  let sortPanel = null, panelCols = PANEL_COLS;
+  const BUCKET_ORDER = [...INCOMING, 'pullFromChina', 'unmatched', ...OUTSIDE];
+  // Which file each fact came from. The facts with a column of their own show it under their value (FROM_IN_CELL);
+  // the From column names the rest fact by fact, with the sheet rows on its second line.
+  const FROM_IN_CELL = ['upc', 'po', 'poShown', 'customer', 'units', 'cases', 'crd', 'round', 'containers', 'etd', 'eta', 'stage'];
+  const factName = k => FACT_LABEL[k] || cap(String(k).replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase());
+  function fromOf(a) {
+    const f = a.from && typeof a.from === 'object' ? a.from : {};
+    const all = Object.entries(f).filter(([, v]) => v).map(([k, v]) => `${factName(k)}: ${v}`);
+    const rest = Object.entries(f).filter(([k, v]) => v && !FROM_IN_CELL.includes(k)).map(([k, v]) => `${factName(k)}: ${v}`);
+    const rows = [];
+    if (a.sheetRow != null && a.sheetRow !== '') rows.push(`Master Sheet Live row ${a.sheetRow}`);
+    for (const r of [].concat(a.ctRows || [])) if (r != null) rows.push('Container Tracking ' + (typeof r === 'object' ? `${r.sheet || ''} row ${r.row ?? ''}`.trim() : `row ${r}`));
+    return { text: rest.join(' · '), rows: rows.join(' · '), tip: [...all, ...rows].join('\n') };
+  }
+  // A near-miss says what Master Sheet Live has instead.
+  const flagsOf = a => flagText(a.flags) + (a.nearMiss ? ` (Master Sheet Live has PO ${a.nearMiss.po}, style ${a.nearMiss.style})` : '');
+  function panelAllocs(p) {
+    if (!idx) return [];
+    if (p.kind === 'pull') {
+      // The line's own allocations, by its PO Book key (an allocation's id changes when its stage moves or rows move);
+      // with no key, by id. If the line is gone, the style's allocations on that PO, and the panel says so.
+      const mine = p.lineKey ? idx.byLine.get(p.lineKey) || [] : Array.isArray(p.ids) ? p.ids.map(id => idx.byId.get(id)).filter(a => a && !hiddenAlloc(a)) : null;
+      p.gone = !!p.lineKey && !mine.length;
+      if (mine && (mine.length || !p.lineKey)) return mine.slice();
+      const e = idx.byStyle.get(window.InvCommon.normStyle(p.key));
+      const po = window.InvCommon.normPo(p.po);
+      return e ? e.allocs.filter(a => window.InvCommon.normPo(a.po) === po || window.InvCommon.normPo(a.poShown) === po) : [];
+    }
+    const pick = p.kind === 'style' ? null : new Set(bucketsOf(p.b));
+    const list = p.kind === 'tile' ? idx.list : [idx.byStyle.get(p.key)].filter(Boolean);
+    const out = [];
+    for (const e of list) {
+      if (!catOk(e.s.category || '')) continue;
+      const sHit = !F.q || styleHit(e.s);
+      for (const a of e.allocs) {
+        if (!passes(a, sHit) || (pick && !pick.has(a.bucket)) || (p.upc != null && (a.upc || '') !== p.upc)) continue;
+        out.push(a);
+      }
+    }
+    return out;
+  }
+  function panelRowHtml(a, i) {
+    const f = fromOf(a), shown = a.poShown && a.poShown !== a.po ? a.poShown : '';
+    const fr = a.from && typeof a.from === 'object' ? a.from : {};
+    // The file a fact came from, on the line under it (every row two lines, so the windowed rows keep one height).
+    const by = (k, has = true) => `<span class="u">${has && fr[k] ? esc(fr[k]) : '&nbsp;'}</span>`;
+    const cells = {
+      style: `<td class="nw">${esc(a.styleRaw || a.style)}<span class="u">&nbsp;</span></td>`, upc: `<td class="nw">${esc(a.upc || '')}${by('upc', !!a.upc)}</td>`,
+      po: `<td class="nw"><b>${esc(a.po)}</b>${by('po')}</td>`,
+      poShown: `<td class="nw">${esc(shown)}${by('poShown', !!shown)}</td>`, customer: `<td class="cut" title="${esc(a.customer)}">${esc(a.customer)}${by('customer', !!a.customer)}</td>`,
+      bucket: `<td class="nw${OUTSIDE.includes(a.bucket) ? ' nt' : ''}">${esc(stageText(a.bucket))}<span class="u">${OUTSIDE.includes(a.bucket) ? 'not counted' : '&nbsp;'}</span></td>`,
+      units: `<td class="num">${fmtN(units(a.units))}${by('units')}</td>`,
+      cases: `<td class="num">${typeof a.cases === 'number' ? fmtN(a.cases) : '<span class="np" title="No case pack (Master) for this line">no case pack</span>'}${by('cases', typeof a.cases === 'number')}</td>`,
+      crd: `<td class="nw">${esc(fmtD(a.crd))}${by('crd', a.crd != null)}</td>`, round: `<td class="nw">${esc(fmtList(a.round))}${by('round', !!fmtList(a.round))}</td>`,
+      containers: `<td class="cut" title="${esc(fmtList(a.containers))}">${esc(fmtList(a.containers))}${by('containers', !!fmtList(a.containers))}</td>`,
+      etd: `<td class="nw">${esc(fmtD(a.etd))}${by('etd', a.etd != null)}</td>`, eta: `<td class="nw">${esc(fmtD(a.eta))}${by('eta', a.eta != null)}</td>`,
+      // A section with no round goes with the stage ("Loaded · Direct A").
+      stage: `<td class="nw" title="${esc(stageSec(a))}">${esc(stageSec(a))}${by('stage')}</td>`,
+      flags: `<td class="cut flag" title="${esc(flagsOf(a))}">${esc(flagsOf(a))}<span class="u">&nbsp;</span></td>`,
+      from: `<td class="from" title="${esc(f.tip)}">${esc(f.text) || '&nbsp;'}<span class="u">${esc(f.rows) || '&nbsp;'}</span></td>`,
+    };
+    return `<tr class="r" data-i="${i}">${panelCols.map(c => cells[c.k]).join('')}</tr>`;
+  }
+  const markTile = () => { for (const t of $('tiles').querySelectorAll('.tile[data-t]')) t.classList.toggle('on', !!panel && panel.kind === 'tile' && panel.b === t.dataset.t); };
+  function openPanel(p, from) {
+    panel = p; panelFrom = from || null; sortPanel = null;
+    $('panel').hidden = false;
+    renderPanel(true);
+    markTile();
+    $('btnPanelX').focus();
+  }
+  function closePanel() {
+    if (!panel) return;
+    panel = null; $('panel').hidden = true;
+    markTile();
+    if (panelFrom && document.contains(panelFrom)) panelFrom.focus();
+    panelFrom = null;
+    runDue();
+  }
+  function panelTitle(p) {
+    const e = idx && idx.byStyle.get(p.key), name = (e && (e.s.styleRaw || e.s.style)) || p.key || '';
+    if (p.kind === 'tile') return `${BUCKET_LABEL[p.b]}: every style`;
+    if (p.kind === 'pull') return `PO ${p.po}${p.poShown ? ` (${p.poShown})` : ''} · ${p.name || p.key}${p.upc ? ' · UPC ' + p.upc : ''}`;
+    const upc = p.upc != null ? ` · UPC ${p.upc || 'none'}` : '';
+    if (p.kind === 'style') return `${name}${upc}: every line`;
+    return `${name}${upc} · ${p.b === 'casesIncoming' ? 'Incoming (cases)' : BUCKET_LABEL[p.b] || p.b}`;
+  }
+  function filterWords() {
+    const w = [];
+    if (F.q) w.push(`search "${F.q}"`);
+    if (F.fac) w.push(`factory ${F.fac === NONE ? '(none)' : F.fac}`);
+    if (F.cat) w.push(`category ${F.cat === NONE ? '(none)' : F.cat}`);
+    if (F.stage) w.push(`stage ${BUCKET_LABEL[F.stage] || F.stage}`);
+    if (F.type) w.push(`PO type ${F.type}`);
+    return w.join(', ');
+  }
+  function renderPanel(toTop) {
+    if (!panel) return;
+    $('panelTitle').textContent = panelTitle(panel);
+    panelCols = PANEL_COLS.filter(c => !c.many || panel.kind === 'tile');
+    if (!idx) {
+      $('panelSub').textContent = 'The stage numbers are not loaded, so there is nothing behind them now.';
+      $('panelNote').textContent = '';
+      vtPanel.set([], toTop);
+      return;
+    }
+    const list = panelAllocs(panel);
+    let rows = list.slice().sort((x, y) => (BUCKET_ORDER.indexOf(x.bucket) - BUCKET_ORDER.indexOf(y.bucket)) || String(x.style).localeCompare(String(y.style)) ||
+      String(x.po).localeCompare(String(y.po), undefined, { numeric: true }) || ((x.crd ?? 1e9) - (y.crd ?? 1e9)));
+    if (sortPanel) {
+      const k = sortPanel.k;
+      rows = rows.sort(cmpBy(a => (k === 'from' ? fromOf(a).text : k === 'flags' ? flagText(a.flags) : k === 'round' || k === 'containers' ? fmtList(a[k]) : k === 'bucket' ? BUCKET_ORDER.indexOf(a.bucket) + 1 : a[k]), sortPanel.dir));
+    }
+    const g = agg0(); for (const a of list) addTo(g, a);
+    const key = panel.kind === 'style' || panel.kind === 'pull' ? null : panel.b === 'casesIncoming' ? 'incoming' : panel.b;
+    const sumOf = pred => list.filter(pred).reduce((p, a) => p + units(a.units), 0);
+    // Unmatched units are never "counted" in the stage numbers: said apart. Units outside every total by why.
+    const counted = key ? (key === 'unmatched' ? 0 : g.units[key]) : sumOf(a => totalsOf(a.bucket).length && a.bucket !== 'unmatched');
+    const um = key ? (key === 'unmatched' ? g.units.unmatched : 0) : sumOf(a => a.bucket === 'unmatched');
+    const outBy = {};
+    for (const a of list) if (!totalsOf(a.bucket).length) outBy[a.bucket] = (outBy[a.bucket] || 0) + units(a.units);
+    const outside = Object.values(outBy).reduce((p, n) => p + n, 0);
+    const cs = key ? casesText(g.cases[key], g.noPack[key], g.units[key]) : '';
+    $('panelSub').textContent = [plural(list.length, 'line'), key !== 'unmatched' ? `${fmtN(counted)} units counted` : '',
+      um ? `${fmtN(um)} units unmatched (never in the stage numbers)` : '', cs,
+      outside ? `${fmtN(outside)} units not counted (${Object.entries(outBy).map(([b, n]) => `${fmtN(n)} ${OUT_WORD[b] || stageText(b).toLowerCase()}`).join(', ')})` : ''].filter(Boolean).join(' · ');
+    $('panelNote').textContent = panel.kind === 'pull' ? (panel.gone ? "This line isn't on Master Sheet Live as it was (its PO or style changed, or it shipped): showing this style's lines on the PO instead." : '')
+      : fOn() ? `Filters on: ${filterWords()}.` : '';
+    vtPanel.set(rows, toTop);
+  }
+
+  // ---------- Problems: the balance line ----------
+  function renderBalance() {
+    const el = $('balance');
+    if (!stages || !stages.ok) {
+      el.className = 'balance off';
+      el.innerHTML = `<b>Balance check:</b> ${stageErr ? "not worked out, because the stage numbers couldn't be (see the red banner)." : 'not loaded, because the stage numbers are not loaded.'}`;
+      return;
+    }
+    const b = stages.balance, by = {};
+    for (const a of stages.allocs) if (a && !CT_ONLY.includes(a.bucket)) by[a.bucket] = (by[a.bucket] || 0) + units(a.units);
+    const inChina = IN_CHINA.reduce((p, k) => p + (by[k] || 0), 0);
+    const parts = [[inChina, 'in China'], [by.water, 'on the water'], [by.port, 'at port'], [by.landed, 'landed'], [by.pullFromChina, 'to pull from China'],
+      [by.short, 'short-shipped'], [by.shippedNotOnCt, 'shipped, not on Container Tracking (treated as landed)'],
+      [by.duplicate, 'repeats of a line already inside a Round (shipped once)']].filter(([n]) => n);
+    const sum = parts.reduce((p, [n]) => p + n, 0);
+    const eq = parts.map(([n, w]) => `${fmtN(n)} ${w}`).join(' + ') || '0';
+    // Container Tracking-only units (landed Unmatched ones show nowhere); the planning, ignored and older ones in full.
+    const co = {};
+    for (const a of stages.allocs) if (a && CT_ONLY.includes(a.bucket) && (a.bucket !== 'unmatched' || !hiddenAlloc(a))) co[a.bucket] = (co[a.bucket] || 0) + units(a.units);
+    // Planned units have no Problems line (they're planned, not wrong): said where they show instead.
+    const CO_WORD = { ctMore: 'beyond Master Sheet Live', unmatched: 'unmatched', planning: "planned, not booked yet (config.js; not listed below: they show in each style's side panel)",
+      ignored: 'in an ignored section (config.js)', belowTracker: "on POs below the PO Status Tracker's lowest PO" };
+    const coText = CT_ONLY.filter(k => co[k]).map(k => `${fmtN(co[k])} units ${CO_WORD[k]}`).join(', ');
+    const listedBelow = CT_ONLY.some(k => co[k] && k !== 'planning');
+    const extra = coText ? `<div class="bp">Not part of it (on Container Tracking only${listedBelow ? ', listed below' : ''}): ${esc(coText)}.</div>` : '';
+    const groups = typeof b.groups === 'number' ? ` across ${plural(b.groups, 'PO + style group')}` : '';
+    const o = balanceOff();
+    if (!balanceBad() && sum === units(b.outcomeUnits)) {
+      el.className = 'balance ok';
+      el.innerHTML = `<b>Every unit adds up:</b> ${fmtN(b.mslUnits)} units on Master Sheet Live = ${eq}${groups}.${extra}`;
+      return;
+    }
+    el.className = 'balance bad';
+    const lines = [];
+    if (o.msl || o.bad) {
+      const bad = (b.bad || []).slice(0, 8).map(x => `PO ${x.po} ${x.style}: ${fmtN(x.mslUnits)} on Master Sheet Live, ${fmtN(x.outcomeUnits)} in outcomes`).join('; ');
+      lines.push(`${fmtN(b.mslUnits)} units on Master Sheet Live, ${fmtN(b.outcomeUnits)} in the outcomes (${eq})${o.msl ? `, ${fmtN(Math.abs(o.msl))} apart` : ''}` +
+        `${o.bad ? `; ${plural(o.bad, 'PO + style group')} off${bad ? ` (${bad}${o.bad > 8 ? ', …' : ''})` : ''}` : ''}`);
+    }
+    if (o.ct) lines.push(`Container Tracking has ${fmtN(b.ct.units)} units on its lines (not counting lines on both Booking and Loaded), but ${fmtN(b.ct.outcomeUnits)} were placed`);
+    // The engine's balance holds, but its allocations add up to something else here.
+    if (!lines.length) lines.push(`the stage engine counts ${fmtN(b.outcomeUnits)} units in the outcomes, but its lines add up to ${fmtN(sum)} here (${eq})`);
+    el.innerHTML = `<b>Units don't add up:</b> ${esc(lines.join('. '))}. This is a bug in Shalam Tool, not a problem in the files: tell Saul.${extra}`;
+  }
+
+  // ---------- drawing the stage views ----------
+  function renderStageViews(toTop) {
+    if (!vtInv) return;
+    try {
+      renderLead();
+      renderFilterLists();
+      renderInv(toTop);
+      renderPull(toTop);
+      renderPanel(false);
+    } catch (e) {
+      if (stageErr) throw e;   // drawing "not loaded" itself failed: nothing more to fall back to
+      stageCodeErr(e);
+      renderBanners(); renderProblems(); renderStageViews(toTop);
+    }
+  }
+
+  function bindStageUi() {
+    const cellOf = (vt, e) => { const tr = e.target.closest('tr.r'); return tr ? vt.rows[+tr.dataset.i] : null; };
+    vtInv = vtable('invPane', 'invTable', { cols: () => INV_COLS.length, head: () => sortHead(INV_COLS, sortInv), row: invRowHtml,
+      empty: () => emptyText(fOn() ? 'Nothing matches these filters.' : 'No styles with goods in China, on the way or to pull.') });
+    vtPull = vtable('pullPane', 'pullTable', { rowH: 40, cols: () => PULL_COLS.length, head: () => sortHead(PULL_COLS, sortPull), row: pullRowHtml,
+      empty: () => emptyText(fOn() ? 'No open line matches these filters.' : 'No open lines on Master Sheet Live.') });
+    vtPanel = vtable('panelPane', 'panelTable', { cols: () => panelCols.length, head: () => sortHead(panelCols, sortPanel), row: panelRowHtml,
+      empty: () => (idx ? 'No lines behind this number now.' : 'Not loaded.') });
+    $('invTable').addEventListener('click', e => {
+      const th = e.target.closest('th[data-s]');
+      if (th) { sortInv = nextSort(sortInv, INV_COLS, th.dataset.s); renderInv(true); return; }
+      const btn = e.target.closest('button[data-b]'), r = btn && cellOf(vtInv, e);
+      if (!r) return;
+      const b = btn.dataset.b;
+      openPanel({ kind: b === 'all' ? 'style' : 'cell', key: r.key, upc: r.kind === 'upc' ? r.upc : undefined, b }, btn);
+    });
+    $('pullTable').addEventListener('click', e => {
+      const th = e.target.closest('th[data-s]');
+      if (th) { sortPull = nextSort(sortPull, PULL_COLS, th.dataset.s); renderPull(true); return; }
+      const btn = e.target.closest('button[data-b]'), r = btn && cellOf(vtPull, e);
+      if (r) openPanel({ kind: 'pull', key: r.style, name: r.styleRaw || r.style, po: r.po, poShown: r.poShown || '', upc: r.upc || '', lineKey: r.lineKey || '', ids: Array.isArray(r.allocs) ? r.allocs.slice() : null }, btn);
+    });
+    $('panelTable').addEventListener('click', e => {
+      const th = e.target.closest('th[data-s]');
+      if (th) { sortPanel = nextSort(sortPanel, panelCols, th.dataset.s); renderPanel(true); }
+    });
+    $('tiles').addEventListener('click', e => {
+      const t = e.target.closest('button.tile[data-t]');
+      if (t) openPanel({ kind: 'tile', b: t.dataset.t }, t);
+    });
+    $('btnPanelX').onclick = $('btnPanelClose').onclick = closePanel;
+    document.addEventListener('keydown', e => { if (e.key === 'Escape' && panel) { e.preventDefault(); closePanel(); } });
+    // Filters: the rows, the tiles and an open panel follow them.
+    let ft = null;
+    const apply = () => { $('btnClearF').hidden = !fOn(); renderInv(true); renderPull(true); renderPanel(true); };
+    $('fq').addEventListener('input', e => { clearTimeout(ft); ft = setTimeout(() => { F.q = e.target.value.trim().toLowerCase(); apply(); }, 150); });
+    for (const [id, k] of [['fFac', 'fac'], ['fCat', 'cat'], ['fStage', 'stage'], ['fType', 'type']]) $(id).addEventListener('change', e => { F[k] = e.target.value; apply(); });
+    $('btnClearF').onclick = () => { Object.assign(F, { q: '', fac: '', cat: '', stage: '', type: '' }); $('fq').value = ''; renderFilterLists(); apply(); };
+    addEventListener('resize', () => { fitPanes(); if (tab === 'inv') vtInv.redraw(); else if (tab === 'pull') vtPull.redraw(); if (panel) vtPanel.redraw(); });
+    // Problems: checked marks and the switch that shows them.
+    $('issTable').addEventListener('change', e => {
+      const ck = e.target.closest('input.ck');
+      if (!ck) return;
+      const i = shownIss[+ck.dataset.ix];
+      if (i) { setChecked(i, ck.checked); renderIssues(); }
+    });
+    $('pqChecked').addEventListener('change', e => { showChecked = e.target.checked; renderIssues(); });
+    // The sources box stays as each person left it.
+    const box = $('srcBox');
+    box.open = store.get('srcOpen') === '1';
+    box.addEventListener('toggle', () => store.set('srcOpen', box.open ? '1' : '0'));
+    renderStageViews(true);
   }
 
   // ---------- toast ----------
@@ -1280,9 +2146,9 @@
     let qt = null;
     $('pq').addEventListener('input', e => { clearTimeout(qt); qt = setTimeout(() => { pq = e.target.value.trim(); renderIssues(); }, 150); });
     $('issTable').addEventListener('click', e => { const b = e.target.closest('button[data-more]'); if (b) { expanded.add(b.dataset.more); renderIssues(); } });
-    document.addEventListener('visibilitychange', () => {
-      if (!document.hidden && due && account) { due = false; loadAll(false); }
-    });
+    document.addEventListener('visibilitychange', runDue);
+    addEventListener('pagehide', () => { if (tab === 'problems') commitSeen(); });
+    bindStageUi();
   }
 
   // Drifting dots behind the glass, as on the PO Book; still under prefers-reduced-motion.
@@ -1310,7 +2176,7 @@
     bindUi();
     startBg();
     const parts = [['InvCommon', 'core/common.js'], ['PoBookCore', 'core/pobook.js'], ['InvUpc', 'core/upc.js'], ['InvCT', 'core/ct.js'],
-      ['InvShipping', 'core/shipping.js'], ['XLSX', 'vendor/xlsx-js-style/xlsx.bundle.js']];
+      ['InvShipping', 'core/shipping.js'], ['InvStages', 'core/stages.js'], ['XLSX', 'vendor/xlsx-js-style/xlsx.bundle.js']];
     const missing = parts.filter(([name]) => !window[name]).map(p => p[1]);
     if (missing.length) { showSignin(`Part of the page didn't load (${missing.join(', ')}). Reload the page; if it keeps happening, tell Saul.`, true); return; }
     initAuth();
