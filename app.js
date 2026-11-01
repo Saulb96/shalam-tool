@@ -119,7 +119,9 @@
     'dates-disagree': 'Ready dates disagree (more than 7 days apart)', 'no-date': 'No date to sell from',
     oversold: 'Oversold: more customer orders than stock and goods coming', 'orders-unknown': 'Customer orders not known (no ATS report, or not on it)',
     'erp-only': 'On the ATS report only', estimate: 'Date estimated from the order date',
-    'orders-may-include-sold': 'Orders may be the goods sold to ship from China',
+    'orders-below-sold': 'Customer orders fewer than the goods sold to ship from China not loaded yet (all taken off the stock: check)',
+    'f-style-orders': 'Style ending in -F with customer orders and goods sold to ship from China',
+    'orders-ship-china': 'Some customer orders ship from China (goods sold there)', 'f-style-sold': 'Ends in -F: its sold goods have no orders on the ATS report',
     'erp-eta-mismatch': "In Trans with no ETA (the ATS report's ETA dates don't line up)",
     'no-in-trans-column': 'No In Trans column on the ATS report (Arriving from our shipping data)',
     'negative-in-trans': 'In Trans below zero',
@@ -2133,7 +2135,7 @@
     }
     sx = { list, byStyle, byAlloc, cats, facs, memo: new WeakMap() };
     // The rows must add up to the engine's totals, unit for unit.
-    const KEYS = ['now', 'fromChina', 'arriving', 'arrivingErp', 'arrivingOurs', 'total', 'soldChina', 'oversold'];
+    const KEYS = ['now', 'fromChina', 'arriving', 'arrivingErp', 'arrivingOurs', 'total', 'soldChina', 'oversold', 'ordersShipChina'];
     const off = KEYS.filter(k => typeof sell.totals[k] === 'number' && Math.abs(sell.totals[k] - list.reduce((p, r) => p + units(r.s[k]), 0)) > 1e-6);
     if (off.length) {
       const msg = `The page adds the styles up to different totals than the selling engine: ${off.map(k => `${SELL_TILE_LABEL[k] || k} ${fmtN(list.reduce((p, r) => p + units(r.s[k]), 0))} here, ${fmtN(sell.totals[k])} in the engine`).join('; ')}. This is a bug in Shalam Tool: tell Saul.`;
@@ -2154,8 +2156,8 @@
     { k: 'style', t: 'Style', cls: 'fz f-sty' }, { k: 'desc', t: 'Description' },
     { k: 'casePack', t: 'Case pack', n: 1, tip: 'Units in a master carton (Master on Master Sheet Live); "mixed" when its goods come in different ones' },
     { k: 'inWh', t: 'In warehouse', n: 1, tip: 'In WH on the weekly ATS report: physical stock' },
-    { k: 'orders', t: 'Customer orders', n: 1, tip: 'Total Customer Orders on the ATS report: sold, not shipped yet' },
-    { k: 'now', t: 'Available now', b: 1, tip: 'In warehouse minus customer orders, when above zero. Orders beyond the stock come off the earliest goods from China' },
+    { k: 'orders', t: 'Customer orders', n: 1, tip: "Total Customer Orders on the ATS report: sold, not shipped yet. They include the orders for goods sold to ship from China that aren't loaded yet (China Pickup, or straight to the customer; never on a style ending in -F): those ship from China, so they aren't taken off the stock" },
+    { k: 'now', t: 'Available now', b: 1, tip: "In warehouse minus customer orders (less the orders that ship from China with goods sold there), when above zero. Orders beyond the stock come off the earliest goods from China" },
     { k: 'fromChina', t: 'Available from China', b: 1, tip: "Still in China (in production, ready, booked, loaded), after customer orders. Goods on a vessel that the ATS report already counts In Trans are in Arriving instead" },
     { k: 'firstPull', t: 'First pull date', date: 1, tip: 'The first date goods in China can be pulled: 10 days before the ETD, else 5 days before the CRD, else about 75 days after the order date. "now": that date has passed' },
     { k: 'arriving', t: 'Arriving', b: 1, sub: () => arrivingSub(), tip: ARRIVING_TIP },
@@ -2181,9 +2183,37 @@
     return rows;
   }
   const sellInfo = () => `${plural(sellShown.styles, 'style')}${fOnSell() ? ` of ${fmtN(sellShown.all)}` : ''}`;
+  // Customer orders that ship from China with goods sold there (not loaded yet): in the ERP's Total Customer Orders, not
+  // taken off the stock (Saul, Nov 1).
+  const shipChina = s => units(s.ordersShipChina);
   function stockTip(s) {
-    const net = numOr(s.stockNet) ?? (units(s.inWh) - units(s.orders));
-    return `In warehouse ${fmtN(units(s.inWh))} − customer orders ${fmtN(units(s.orders))} = ${fmtN(net)}${net < 0 ? `: the ${fmtN(-net)} ordered beyond the stock come off the earliest goods from China` : ''}. Click for its lots.`;
+    const y = shipChina(s), net = numOr(s.stockNet) ?? (units(s.inWh) - units(s.orders) + y);
+    return `In warehouse ${fmtN(units(s.inWh))} − customer orders ${fmtN(units(s.orders))}${y ? ` + ${fmtN(y)} that ship from China` : ''} = ${fmtN(net)}${y ? ` (those ${fmtN(y)} orders are for goods sold to ship from China, not loaded yet, so they don't come off the stock)` : ''}${net < 0 ? `: the ${fmtN(-net)} ordered beyond the stock come off the earliest goods from China` : ''}. Click for its lots.`;
+  }
+  // The Customer orders cell: the ERP's figure, and how many of them ship from China (or why none do).
+  function ordersTip(s) {
+    const o = units(s.orders), y = shipChina(s), open = units(s.soldNotLoaded), of = asOfText();
+    if (y) return `Total Customer Orders on the ATS report${of}: ${fmtN(o)}. ${fmtN(y)} of them ship from China: they're for goods sold there (China Pickup, or straight to the customer) that aren't loaded yet, so they aren't taken off the stock. ${fmtN(o - y)} are.`;
+    if (hasFlag(s, 'orders-below-sold')) return `Total Customer Orders on the ATS report${of}: ${fmtN(o)}. They're fewer than the ${fmtN(open)} units sold to ship from China that aren't loaded yet, so none of them are treated as those goods: they all come off the stock. Check in the ERP which orders are for the sold goods (listed on Problems).`;
+    if (hasFlag(s, 'f-style-sold') && o) return `Total Customer Orders on the ATS report${of}: ${fmtN(o)}. This style ends in -F: the ERP's orders on it aren't for its ${fmtN(open)} units sold to ship from China, so they all come off the stock.`;
+    return '';
+  }
+  // Why customer orders aren't taken off at all, in a few words (the stock cells' tooltips give the detail): the page's
+  // own state of the ATS report ('ok' here: the engine ran without it).
+  const ATS_NOT_USED = { bad: "the ATS report couldn't be used", none: 'no ATS report yet', unset: "the ATS report's folder isn't set",
+    unread: "the ATS report wasn't read this time", wait: 'the ATS report is still loading', ok: "the ATS report wasn't used" };
+  // The Sold (ships from China) cell: which of those goods have their orders on the ATS report.
+  function soldTip(s) {
+    const sold = units(s.soldChina), open = Math.min(sold, units(s.soldNotLoaded)), rest = sold - open, o = units(s.orders);
+    if (!sold) return '';
+    const known = stockOk() && !notOnReport(s) && !stockUnknown(s);
+    const t = [`${fmtN(sold)} sold to ship from China (China Pickup, or straight to the customer): never available to sell.`];
+    if (!known) t.push(`${open ? `${fmtN(open)} aren't loaded yet. ` : ''}Customer orders aren't taken off for this style (${!stockOk() ? ATS_NOT_USED[atsMode()] || ATS_NOT_USED.ok : notOnReport(s) ? 'not on the ATS report' : "its stock on the ATS report can't be read"}).`);
+    else if (shipChina(s)) t.push(`${fmtN(open)} aren't loaded yet: their orders are in the ATS report's customer orders, so those ${fmtN(shipChina(s))} orders ship from China and aren't taken off the stock.`);
+    else if (hasFlag(s, 'orders-below-sold')) t.push(`${fmtN(open)} aren't loaded yet, but the style's customer orders (${fmtN(o)}) are fewer, so none of the orders are treated as these goods: they all come off the stock (listed on Problems).`);
+    else if (hasFlag(s, 'f-style-sold')) t.push(`This style ends in -F: the ATS report's customer orders don't include its sold goods (${fmtN(open)} not loaded yet), so all of its orders come off the stock.`);
+    if (known && rest) t.push(`${open ? `The other ${fmtN(rest)} are` : `All ${fmtN(rest)} are`} loaded or shipped already: their orders aren't in the ATS report's customer orders.`);
+    return t.join(' ');
   }
   function firstPullHtml(r) {
     const fp = r.fp;
@@ -2255,8 +2285,10 @@
     const s = r.s, ok = stockOk(), partial = ok && (notOnReport(s) || stockUnknown(s));
     const nb = (k, v) => (v ? `<button type="button" class="nb" data-b="${k}">${fmtN(v)}</button>` : '');
     const tags = [];
-    const maybe = [hasFlag(s, 'orders-may-include-sold') ? `${fmtN(s.soldChina)} units are sold to ship from China: the orders may be those` : ''].filter(Boolean);
-    if (units(s.oversold) > 0) tags.push(`<button type="button" class="tag ov" data-b="all" title="${esc(`Oversold by ${fmtN(s.oversold)} units: customer orders are more than the stock and every lot coming${maybe.length ? '. Check first: ' + maybe.join('; ') : ''}`)}">oversold ${fmtN(s.oversold)}</button>`);
+    // Customer orders fewer than its goods sold to ship from China not loaded yet: none are treated as those goods (listed).
+    const below = hasFlag(s, 'orders-below-sold') ? `its customer orders (${fmtN(units(s.orders))}) are fewer than its ${fmtN(units(s.soldNotLoaded))} units sold to ship from China that aren't loaded yet, so none of them are treated as those goods: they all come off the stock` : '';
+    if (units(s.oversold) > 0) tags.push(`<button type="button" class="tag ov" data-b="all" title="${esc(`Oversold by ${fmtN(s.oversold)} units: customer orders are more than the stock and every lot coming${below ? `. Check first: ${below}` : ''}`)}">oversold ${fmtN(s.oversold)}</button>`);
+    if (below) tags.push(`<button type="button" class="tag um" data-b="all" title="${esc(`Check: ${below}. Listed on Problems.`)}">check orders</button>`);
     if (hasFlag(s, 'erp-eta-mismatch')) tags.push(`<button type="button" class="tag um" data-b="all" title="${esc("Some of its In Trans on the ATS report has no ETA: the report's ETA dates don't line up with its In Trans quantities (listed on Problems)")}">no ETA</button>`);
     // In Trans on the ATS report our sheets can't place (not sailed, landed or taken off China): listed on Problems.
     if (units(s.erpUnplaced)) {
@@ -2279,7 +2311,8 @@
       h += `<td class="num${inWh < 0 ? ' neg' : ''}">${inWh == null ? cantRead : inWh ? fmtN(inWh) : ''}</td><td class="num">${orders == null ? cantRead : nz(orders)}</td>` +
         '<td class="num nr" title="In WH or customer orders can\'t be read on the ATS report, so stock after orders isn\'t known (never 0)">not known</td>';
     } else {
-      h += `<td class="num${inWh < 0 ? ' neg' : ''}">${inWh ? fmtN(inWh) : ''}</td><td class="num">${nz(orders)}</td>` +
+      const oTip = ordersTip(s);
+      h += `<td class="num${inWh < 0 ? ' neg' : ''}">${inWh ? fmtN(inWh) : ''}</td><td class="num"${oTip ? ` title="${esc(oTip)}"` : ''}>${nz(orders)}</td>` +
         `<td class="num" title="${esc(stockTip(s))}">${nb('now', numOr(s.now))}</td>`;
     }
     const aTip = arrivingTip(s);
@@ -2293,14 +2326,16 @@
     h += !ok ? `<td class="num sum nr" title="${esc(atsWhy())}">${esc(stockWord())}</td>`
       : partial ? `<td class="num sum pt" title="Stock not known: this is from China and arriving only">${nb('total', numOr(s.total))}</td>`
         : `<td class="num sum">${nb('total', numOr(s.total))}</td>`;
-    return h + `<td class="num">${nb('soldChina', numOr(s.soldChina))}</td></tr>`;
+    const sTip = soldTip(s);
+    return h + `<td class="num"${sTip ? ` title="${esc(sTip)}"` : ''}>${nb('soldChina', numOr(s.soldChina))}</td></tr>`;
   }
 
   // ---------- its tiles: sums of the rows shown, in units and cases ----------
   const SELL_TILE_LABEL = { now: 'Available now', fromChina: 'Available from China', arriving: 'Arriving', total: 'Total available', oversold: 'Oversold styles',
-    soldChina: 'Sold (ships from China)', arrivingErp: "Arriving (the ATS report's In Trans)", arrivingOurs: 'Arriving (our shipping data)' };
+    soldChina: 'Sold (ships from China)', arrivingErp: "Arriving (the ATS report's In Trans)", arrivingOurs: 'Arriving (our shipping data)',
+    ordersShipChina: 'Customer orders that ship from China' };
   const SELL_TILES = [
-    ['now', 'In warehouse minus customer orders (the ATS report), where above zero', false],
+    ['now', 'In warehouse minus customer orders (the ATS report; orders that ship from China with goods sold there are not taken off), where above zero', false],
     ['fromChina', 'Still in China (in production, ready, booked, loaded), after customer orders. Click for the lots and their pull-from dates', true],
     ['arriving', `${ARRIVING_TIP}. Click for the shipments and their ETAs, with our own goods on the water or at port and how they meet the report`, true],
     ['total', 'Available now + from China + arriving. Click for the lots', true],
@@ -2473,10 +2508,10 @@
     if (stockUnknown(s) || numOr(s.inWh) == null || numOr(s.orders) == null) {
       return `Stock (ATS report${of}): in warehouse ${numOr(s.inWh) == null ? "can't be read" : fmtN(s.inWh)}, customer orders ${numOr(s.orders) == null ? "can't be read" : fmtN(s.orders)}: stock after orders isn't known (never 0), so customer orders aren't taken off${has ? ' and ' + full : ''}.`;
     }
-    const net = numOr(s.stockNet) ?? (s.inWh - units(s.orders));
-    let t = `Stock (ATS report${of}): ${fmtN(s.inWh)} in warehouse − ${fmtN(units(s.orders))} customer orders = ${fmtN(net)} net`;
-    // A cross-check with the ATS report (listed on Problems; never counted).
-    const notes = hasFlag(s, 'orders-may-include-sold') ? ` Check: ${fmtN(s.soldChina)} units of this style are sold to ship from China; if those orders are in the ERP's customer orders, they're taken off twice.` : '';
+    const y = shipChina(s), net = numOr(s.stockNet) ?? (s.inWh - units(s.orders) + y);
+    let t = `Stock (ATS report${of}): ${fmtN(s.inWh)} in warehouse − ${fmtN(units(s.orders))} customer orders${y ? ` + ${fmtN(y)} that ship from China (goods sold there, not loaded yet)` : ''} = ${fmtN(net)} net`;
+    // Customer orders fewer than its goods sold to ship from China not loaded yet (listed on Problems).
+    const notes = hasFlag(s, 'orders-below-sold') ? ` Check: its customer orders are fewer than its ${fmtN(units(s.soldNotLoaded))} units sold to ship from China that aren't loaded yet, so none of them are treated as those goods (listed on Problems).` : '';
     if (net >= 0) return t + (net ? `: ${fmtN(net)} available now.` : ': nothing available now.') + notes;
     if (!has) return t + `: ${fmtN(-net)} more ordered than in stock, ${full}: oversold.` + notes;
     const taken = r.lots.reduce((p, l) => p + units(l.taken), 0);

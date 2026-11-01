@@ -59,8 +59,14 @@ function sumsHold(r) {
     assert.equal(s.total, (s.now ?? 0) + s.fromChina + s.arriving);
     assert.equal(s.arriving, s.arrivingErp + s.arrivingOurs, `style ${s.style}: arriving`);
     assert.equal(s.arrivingErp, s.lots.filter(l => l.source === 'erp').reduce((t, l) => t + l.available, 0));
+    // Stock after orders: In WH − the orders taken off the stock (the ERP's, less those that ship from China).
+    assert.equal(s.ordersOffStock, s.orders == null ? null : s.orders - s.ordersShipChina, `style ${s.style}: orders off the stock`);
+    if (s.stockNet != null) assert.equal(s.stockNet, s.inWh - s.ordersOffStock, `style ${s.style}: stock after orders`);
+    assert.ok(s.ordersShipChina >= 0 && s.ordersShipChina <= s.soldNotLoaded && (!s.ordersShipChina || (s.stockNet != null && !s.endsInF && s.orders >= s.ordersShipChina)), `style ${s.style}: ships from China`);
+    assert.equal(s.ordersTaken + s.oversold, s.stockNet == null ? 0 : Math.max(0, -s.stockNet), `style ${s.style}: orders beyond the stock`);
   }
   const t = r.totals;
+  assert.equal(t.ordersShipChina, r.styles.reduce((p, s) => p + s.ordersShipChina, 0));
   assert.equal(t.total, t.now + t.fromChina + t.arriving);
   assert.equal(t.fromChina, r.lots.filter(l => l.inChina).reduce((s, l) => s + l.available, 0));
   assert.equal(t.arriving, r.lots.filter(l => !l.inChina).reduce((s, l) => s + l.available, 0));
@@ -511,6 +517,15 @@ function reconcile(r, allocs, ats) {
     const e = ats && ats.styles && ats.styles.get(s.style);
     const ships = s.arrivingFrom === 'erp' && e ? e.rows.flatMap(x => x.inTransList.map((n, i) => ({ units: n, eta: (x.etaParts || [])[i] ?? null }))) : [];
     const inTrans = sumU(ships);
+    // Customer orders that ship from China, against the inputs: the style's goods sold to ship from China not loaded yet
+    // (by their stage), on a style not ending in -F, when its orders are at least those goods (Saul, Nov 1).
+    const notLoaded = sumU(mine.filter(a => (a.bucket === 'pullFromChina' || (lotB.includes(a.bucket) && sold(a))) && ['No CRD', 'In production', 'Ready', 'Booked'].includes(a.stage)));
+    const known = !!e && Number.isFinite(e.inWh) && Number.isFinite(e.orders), fS = /-F$/i.test(String(s.styleRaw).trim());
+    const ship = known && !fS && notLoaded > 0 && e.orders >= notLoaded ? notLoaded : 0;
+    assert.deepEqual([s.soldNotLoaded, s.ordersShipChina, s.flags.includes('orders-below-sold'), s.flags.includes('f-style-sold'), s.flags.includes('orders-ship-china')],
+      [notLoaded, ship, known && !fS && notLoaded > 0 && e.orders < notLoaded, known && fS && notLoaded > 0, ship > 0], `${s.style}: orders that ship from China`);
+    if (known) assert.equal(s.stockNet, e.inWh - (e.orders - ship), `${s.style}: stock after orders`);
+    assert.equal(r.issues.filter(i => i.code === 'orders-below-sold' && i.style === s.style).length, s.flags.includes('orders-below-sold') ? 1 : 0, `${s.style}: one Problems line`);
     assert.equal(s.ourIncoming, incoming, `${s.style}: our lots hold Incoming`);
     assert.equal(s.lots.filter(l => l.source === 'ours').reduce((t, l) => t + l.units, 0), incoming, `${s.style}: our lots`);
     assert.equal(s.lots.filter(l => l.source === 'erp').reduce((t, l) => t + l.units, 0), inTrans, `${s.style}: the ERP's lots hold its In Trans`);
@@ -558,7 +573,7 @@ function reconcile(r, allocs, ats) {
     if (l.inErpTransit) assert.ok(l.source === 'ours' && l.inChina && SELL.TIERS.includes(l.erpTier) && (l.erpTier !== 'vessel' || (['booked', 'loaded'].includes(l.bucket) && l.etd != null)), `${l.id}: in the ERP's transit`);
   }
   assert.equal(r.totals.offeredTwice, 0);
-  assert.ok(!r.issues.some(i => ['maybe-twice', 'taken-in-backlog', 'erp-in-trans-unmatched'].includes(i.code)), 'the old cross-checks are gone');
+  assert.ok(!r.issues.some(i => ['maybe-twice', 'taken-in-backlog', 'erp-in-trans-unmatched', 'orders-may-include-sold'].includes(i.code)), 'the old cross-checks are gone');
 }
 
 test('ERP In Trans ≥ our sailed units: ours are matched (not lots any more); the excess due after the report day comes off Booked / Loaded lots by ETD first', () => {
@@ -626,7 +641,9 @@ test('step 1: In Trans our sheets have landed in the last 60 days is landed, not
   assert.ok(e.flags.includes('landed-not-received') && s.flags.includes('landed-not-received') && !s.flags.includes('in-erp-transit'));
   assert.deepEqual([s.fromChina, s.arriving, s.total, s.oversold], [10008, 4272, 14280, 0]);
   const s1 = styleOf(r, 'AB501');
-  assert.deepEqual([s1.landedOurs, s1.inErpTransitTaken, s1.erpUnplaced, s1.ordersTaken, s1.oversold, s1.fromChina, s1.arriving], [3504, 0, 0, 4848, 480, 0, 0]);
+  // Its orders 5,328 are the landed 3,504 + the Loaded 1,344 + the 480 sold, not loaded yet: those 480 ship from China
+  // (Saul, Nov 1), so nothing is oversold.
+  assert.deepEqual([s1.landedOurs, s1.inErpTransitTaken, s1.erpUnplaced, s1.ordersTaken, s1.oversold, s1.fromChina, s1.arriving, s1.ordersShipChina], [3504, 0, 0, 4848, 0, 0, 0, 480]);
   assert.deepEqual(erpLots(r, 'AB501').map(l => l.place.landedOurs), [240, 1440, 240, 336, 1248], 'each Landed lot on the shipment of its quantity');
   assert.deepEqual([lotOf(r, '900979').inErpTransit, lotOf(r, '900979').taken], [0, 1344]);
   assert.deepEqual([r.counts.landedOursStyles, r.counts.landedNotReceivedStyles, r.totals.landedOurs, r.totals.landedLater], [2, 2, 8544, 0]);
@@ -1124,17 +1141,179 @@ test('In Trans that cannot be read, a style not on the report, no In Trans colum
   }
 });
 
-test('orders-may-include-sold stays: orders beyond stock no more than the goods sold to ship from China', () => {
-  const r = sell([alloc({ style: 'AB300', styleRaw: 'AB300', po: '901001', bucket: 'pullFromChina', units: 1104, ptype: 'China Pickup' })],
-    atsE({ AB300: [0, 1104] }));
-  const s3 = styleOf(r, 'AB300');
-  assert.deepEqual([s3.oversold, s3.soldInOrders, s3.flags.includes('orders-may-include-sold')], [1104, 1104, true]);
-  assert.match(r.issues.find(i => i.code === 'oversold').message, /1,104 units of this style are sold to ship from China: if those orders are in the ERP's Total Customer Orders, they're taken off twice/);
-  assert.equal(r.issues.filter(i => i.code === 'orders-may-include-sold').length, 1);
-  assert.deepEqual([r.counts.soldInOrdersStyles, r.counts.soldInOrdersUnits], [1, 1104]);
-  // An oversold style with nothing that may cover it still says so plainly.
+// ---------- customer orders that ship from China with goods sold there (Saul, Nov 1)
+
+// A sold allocation (China Pickup PO, or a direct-to-customer section with o.section) at a stage.
+const soldAt = (style, stage, units, o = {}) => alloc({ style, styleRaw: o.styleRaw ?? style, po: o.po ?? '901001', bucket: o.bucket ?? 'pullFromChina', stage, units,
+  ...(o.section ? { flags: ['pull-section'], section: 'Customer Direct' } : { ptype: 'China Pickup', customer: 'Customer 2' }), ...(o.extra || {}) });
+const nettingOf = s => [s.orders, s.soldNotLoaded, s.ordersShipChina, s.ordersOffStock, s.stockNet, s.now, s.ordersTaken, s.oversold];
+
+test('orders that are the stock plus the sold goods not loaded yet: those ship from China, not taken off the stock again', () => {
+  const as = [
+    // Stock 3,000 and goods sold to ship from China not loaded yet (a China Pickup PO Ready 720, a section Booked 384):
+    // the ERP's orders 4,104 are both. Until now 1,104 were taken off twice (oversold 1,104).
+    soldAt('AB700', 'Ready', 720), soldAt('AB700', 'Booked', 384, { po: '901002', section: true }),
+    // Orders beyond the stock that netting removes: the lot on the water is no longer oversold beyond (AB701) or taken (AB702).
+    alloc({ style: 'AB701', styleRaw: 'AB701', po: '901011', bucket: 'water', stage: 'On the water', units: 600, eta: D(11, 20) }), soldAt('AB701', 'Booked', 400, { po: '901012' }),
+    alloc({ style: 'AB702', styleRaw: 'AB702', po: '901021', bucket: 'inProd', units: 500, crd: D(12, 1), dates: { factoryCrd: D(12, 1) } }), soldAt('AB702', 'In production', 300, { po: '901022' }),
+  ];
+  const r = sell(as, atsOf({ AB700: [3000, 4104], AB701: [0, 1000], AB702: [1000, 1300] }));
+  assert.deepEqual(nettingOf(styleOf(r, 'AB700')), [4104, 1104, 1104, 3000, 0, 0, 0, 0], 'the ERP figure stays; 1,104 ship from China');
+  assert.deepEqual(nettingOf(styleOf(r, 'AB701')), [1000, 400, 400, 600, -600, 0, 600, 0]);
+  assert.deepEqual(nettingOf(styleOf(r, 'AB702')), [1300, 300, 300, 1000, 0, 0, 0, 0]);
+  assert.equal(lotOf(r, '901021').available, 500, 'no lot taken by orders the sold goods serve');
+  for (const k of ['AB700', 'AB701', 'AB702']) {
+    const s = styleOf(r, k);
+    assert.ok(s.flags.includes('orders-ship-china') && !s.flags.includes('oversold') && !s.flags.includes('orders-below-sold'), k);
+    assert.equal(s.soldChina, s.soldNotLoaded, `${k}: the sold goods stay out of the lots`);
+  }
+  assert.deepEqual([r.counts.ordersShipChinaStyles, r.counts.ordersShipChinaUnits, r.totals.ordersShipChina, r.totals.oversold], [3, 1804, 1804, 0]);
+  assert.ok(!codes(r).some(c => ['oversold', 'orders-below-sold', 'f-style-orders', 'orders-may-include-sold'].includes(c)), codes(r).join());
+  sumsHold(r);
+});
+
+test('orders exactly the sold goods not loaded yet: all of them ship from China (the edge of the rule)', () => {
+  const as = [
+    // No stock, and the ERP's orders are exactly its sold goods not loaded yet (720 Ready + 384 Booked): netted in full.
+    soldAt('AB705', 'Ready', 720), soldAt('AB705', 'Booked', 384, { po: '901003', section: true }),
+    // Stock, and orders equal to the sold goods: the stock is all available.
+    soldAt('AB706', 'In production', 300, { po: '901004' }),
+    // No sold goods, orders below zero (a credit?): nothing to net, never "fewer than its sold goods".
+    alloc({ style: 'AB707', styleRaw: 'AB707', po: '901005', bucket: 'inProd', units: 200, crd: D(12, 1), dates: { factoryCrd: D(12, 1) } }),
+  ];
+  const r = sell(as, atsOf({ AB705: [0, 1104], AB706: [500, 300], AB707: [100, -50], AB708: [0, -10] }));
+  assert.deepEqual(nettingOf(styleOf(r, 'AB705')), [1104, 1104, 1104, 0, 0, 0, 0, 0]);
+  assert.deepEqual(nettingOf(styleOf(r, 'AB706')), [300, 300, 300, 0, 500, 500, 0, 0]);
+  assert.deepEqual(nettingOf(styleOf(r, 'AB707')), [-50, 0, 0, -50, 150, 150, 0, 0]);
+  assert.deepEqual(nettingOf(styleOf(r, 'AB708')), [-10, 0, 0, -10, 10, 10, 0, 0]);
+  for (const k of ['AB705', 'AB706']) assert.ok(styleOf(r, k).flags.includes('orders-ship-china') && !styleOf(r, k).flags.includes('orders-below-sold'), k);
+  for (const k of ['AB707', 'AB708']) assert.ok(!['orders-ship-china', 'orders-below-sold', 'f-style-sold'].some(f => styleOf(r, k).flags.includes(f)), k);
+  assert.ok(!codes(r).some(c => ['oversold', 'orders-below-sold', 'f-style-orders'].includes(c)), codes(r).join());
+  assert.deepEqual([r.counts.ordersShipChinaStyles, r.counts.ordersShipChinaUnits, r.counts.ordersBelowSoldStyles, r.totals.ordersShipChina], [2, 1404, 0, 1404]);
+  sumsHold(r);
+});
+
+test("the ERP's own ATS that differs, on a style whose orders ship from China: the ATS report's line never says the tool uses a figure it doesn't", () => {
+  // A blank warehouse row: In WH 0, orders 1,008, the ERP's ATS 0; the style's 1,008 sold straight to the customer are Booked.
+  const X = loadXLSX();
+  const HEAD = ['Color Code', 'Style', 'Style Description', 'Warehouse', 'In WH', 'Total Customer Orders', 'ATS from in WH'];
+  const rows = [['Inventory Report'], HEAD, ['XX', 'AB790', 'Item', '', 0, 1008, 0], ['Grand Total', null, null, null, 0, 1008, '']];
+  const ats = A.parseAts(X, readBook(xlsxBytes({ Report: rows })), 'Inventory Report - On Hand_In Transit_In Production 10-29-2026.xlsx', TODAY);
+  assert.equal(ats.ok, true, ats.error);
+  const r = SELL.buildSell({ stages: stagesOf([soldAt('AB790', 'Booked', 1008, { section: true })]), ats, today: TODAY });
+  assert.deepEqual(nettingOf(styleOf(r, 'AB790')), [1008, 1008, 1008, 0, 0, 0, 0, 0]);
+  const d = ats.issues.filter(i => i.code === 'erp-ats-differs');
+  assert.equal(d.length, 1, 'the comparison is kept, with the ERP figures as they are');
+  assert.match(d[0].message, /^Style AB790 \(row 3\): the ERP's "ATS from in WH" is 0, but In WH 0 − Total Customer Orders 1,008 = -1,008\. The tool goes by In WH and Total Customer Orders, not by the ERP's ATS/);
+  assert.ok(!/The tool uses/.test(d[0].message), d[0].message);
+  sumsHold(r);
+});
+
+test('orders fewer than the sold goods not loaded yet: nothing ships from China, the style is flagged and listed once', () => {
+  const as = [
+    soldAt('AB710', 'Ready', 5000),                                   // orders equal the stock, not the sold goods
+    soldAt('AB711', 'Booked', 600), alloc({ style: 'AB711', styleRaw: 'AB711', po: '901031', bucket: 'inProd', units: 400, crd: D(12, 1), dates: { factoryCrd: D(12, 1) } }),
+    soldAt('AB712', 'In production', 100),                            // no orders at all
+  ];
+  const r = sell(as, atsOf({ AB710: [2000, 2000], AB711: [0, 500], AB712: [50, 0] }));
+  assert.deepEqual(nettingOf(styleOf(r, 'AB710')), [2000, 5000, 0, 2000, 0, 0, 0, 0]);
+  assert.deepEqual(nettingOf(styleOf(r, 'AB711')), [500, 600, 0, 500, -500, 0, 400, 100], 'as before: the orders come off the stock and the lot');
+  assert.deepEqual(nettingOf(styleOf(r, 'AB712')), [0, 100, 0, 0, 50, 50, 0, 0]);
+  const below = r.issues.filter(i => i.code === 'orders-below-sold');
+  assert.deepEqual(below.map(i => i.style), ['AB710', 'AB711', 'AB712'], 'one line per style');
+  assert.equal(below[0].message, "Style AB710: its customer orders on the ATS report (2,000) are fewer than its goods sold to ship from China that aren't loaded yet (5,000 units), so none of the orders are treated as those goods: they all come off the warehouse stock, as for any other style. Check in the ERP which orders are for the sold goods.");
+  for (const k of ['AB710', 'AB711', 'AB712']) assert.ok(styleOf(r, k).flags.includes('orders-below-sold') && !styleOf(r, k).flags.includes('orders-ship-china'), k);
+  assert.deepEqual([r.counts.ordersBelowSoldStyles, r.counts.ordersBelowSoldUnits, r.counts.ordersShipChinaStyles, r.totals.ordersShipChina], [3, 5700, 0, 0]);
+  // The oversold line is plain: no note about sold goods any more.
+  assert.equal(r.issues.find(i => i.code === 'oversold').message, 'Style AB711: customer orders (500) are 100 units more than the warehouse stock (0) and every open lot from China (400 units). Nothing is available to sell.');
   const r2 = sell([], atsE({ AB500: [0, 50] }));
   assert.match(r2.issues.find(i => i.code === 'oversold').message, /with no open lot from China\. Nothing is available to sell\./);
+  sumsHold(r);
+});
+
+test('loaded or shipped sold goods never have their orders netted', () => {
+  const as = [
+    soldAt('AB720', 'Loaded', 1000, { section: true }),
+    soldAt('AB720', 'Loaded', 500, { po: '901041', bucket: 'loaded', extra: { etd: D(11, 2) } }),   // a sold lot at Loaded (counted bucket)
+    soldAt('AB720', 'On the water', 50, { po: '901042' }), soldAt('AB720', 'Shipped', 70, { po: '901043' }),
+  ];
+  const r = sell(as, atsOf({ AB720: [0, 1620] }));
+  const s = styleOf(r, 'AB720');
+  assert.deepEqual(nettingOf(s), [1620, 0, 0, 1620, -1620, 0, 0, 1620]);
+  assert.equal(s.soldChina, 1620);
+  assert.ok(!['orders-ship-china', 'orders-below-sold', 'f-style-sold'].some(f => s.flags.includes(f)), s.flags.join());
+  assert.equal(r.issues.find(i => i.code === 'oversold').message, 'Style AB720: customer orders (1,620) are 1,620 units more than the warehouse stock (0) with no open lot from China. Nothing is available to sell.');
+  sumsHold(r);
+});
+
+test('a style ending in -F: its sold goods never have their orders netted; counted, and one summary line when it has orders', () => {
+  assert.deepEqual(['AB730-F', 'ab730-f', ' AB730-F ', 'AB730F', 'AB-FF', 'AB-F1', '-F'].map(SELL.endsInF), [true, true, true, false, false, false, true]);
+  const as = [
+    soldAt('AB730-F', 'Ready', 2000),                                  // no orders: counted only
+    soldAt('AB731-F', 'Booked', 800, { section: true }),               // orders at least its sold goods: still never netted
+    soldAt('AB732-F', 'Loaded', 300),                                  // loaded: nothing not loaded yet, not counted
+    soldAt('AB733', 'Ready', 800),                                     // the same numbers without -F: netted
+  ];
+  const r = sell(as, atsOf({ 'AB730-F': [0, 0], 'AB731-F': [1000, 1800], 'AB732-F': [0, 300], AB733: [1000, 1800] }));
+  assert.deepEqual(nettingOf(styleOf(r, 'AB730-F')), [0, 2000, 0, 0, 0, 0, 0, 0]);
+  assert.deepEqual(nettingOf(styleOf(r, 'AB731-F')), [1800, 800, 0, 1800, -800, 0, 0, 800]);
+  assert.deepEqual(nettingOf(styleOf(r, 'AB732-F')), [300, 0, 0, 300, -300, 0, 0, 300]);
+  assert.deepEqual(nettingOf(styleOf(r, 'AB733')), [1800, 800, 800, 1000, 0, 0, 0, 0]);
+  assert.ok(styleOf(r, 'AB730-F').endsInF && styleOf(r, 'AB731-F').flags.includes('f-style-sold') && !styleOf(r, 'AB732-F').flags.includes('f-style-sold') && !styleOf(r, 'AB733').endsInF);
+  assert.deepEqual([r.counts.fStyleSoldStyles, r.counts.fStyleSoldUnits, r.counts.fStyleOrdersStyles, r.counts.ordersShipChinaStyles, r.counts.ordersBelowSoldStyles], [2, 2800, 1, 1, 0]);
+  const f = r.issues.filter(i => i.code === 'f-style-orders');
+  assert.equal(f.length, 1, 'one summary line');
+  assert.equal(f[0].message, "1 style ending in -F has customer orders on the ATS report and goods sold to ship from China that aren't loaded yet. On a -F style the ERP's customer orders don't include its sold goods, so all of the orders come off the warehouse stock. Check if any are for the sold goods: AB731-F (orders 1,800, sold, not loaded yet 800).");
+  assert.ok(!codes(r).includes('orders-below-sold'), 'a -F style is never listed as orders fewer than its sold goods');
+  // No orders on any -F style: no summary line.
+  const r2 = sell([soldAt('AB730-F', 'Ready', 2000)], atsOf({ 'AB730-F': [0, 0] }));
+  assert.ok(!codes(r2).includes('f-style-orders') && r2.counts.fStyleSoldStyles === 1);
+  sumsHold(r);
+});
+
+test('mixed sold stages: only goods not loaded yet (No CRD, In production, Ready, Booked) have their orders netted', () => {
+  const as = [
+    soldAt('AB740', 'No CRD', 100, { po: '901051' }), soldAt('AB740', 'In production', 200, { po: '901052' }), soldAt('AB740', 'Ready', 300, { po: '901053' }),
+    soldAt('AB740', 'Booked', 400, { po: '901054', section: true }), soldAt('AB740', 'Loaded', 1000, { po: '901055', section: true }),
+    soldAt('AB740', 'On the water', 50, { po: '901056' }),
+    soldAt('AB740', 'Booked', 70, { po: '901057', bucket: 'booked' }), soldAt('AB740', 'Loaded', 30, { po: '901058', bucket: 'loaded' }),
+  ];
+  const r = sell(as, atsOf({ AB740: [500, 2000] }));
+  const s = styleOf(r, 'AB740');
+  assert.deepEqual(nettingOf(s), [2000, 1070, 1070, 930, -430, 0, 0, 430]);
+  assert.equal(s.soldChina, 2150);
+  assert.equal(r.issues.find(i => i.code === 'oversold').message, 'Style AB740: customer orders (2,000 on the ATS report less 1,070 that ship from China with goods sold there: 930) are 430 units more than the warehouse stock (500) with no open lot from China. Nothing is available to sell.');
+  sumsHold(r);
+});
+
+test('nothing is netted where the stock is not known: not on the report, stock unreadable, no ATS report', () => {
+  const as = [soldAt('AB750', 'Ready', 300), soldAt('AB751', 'Ready', 300, { po: '901061' }),
+    alloc({ style: 'AB751', styleRaw: 'AB751', po: '901062', bucket: 'inProd', units: 200 })];
+  const r = sell(as, atsOf({ AB751: [null, 500], AB100: [0, 0] }));
+  assert.deepEqual(nettingOf(styleOf(r, 'AB750')), [null, 300, 0, null, null, null, 0, 0]);
+  assert.deepEqual(nettingOf(styleOf(r, 'AB751')), [500, 300, 0, 500, null, null, 0, 0]);
+  for (const k of ['AB750', 'AB751']) assert.ok(!['orders-ship-china', 'orders-below-sold'].some(f => styleOf(r, k).flags.includes(f)), k);
+  assert.ok(!codes(r).includes('orders-below-sold') && r.totals.ordersShipChina === 0);
+  for (const a of [null, { ok: false, error: 'red', styles: new Map() }]) {
+    const r2 = sell(as.map(x => ({ ...x })), a);
+    assert.ok(r2.styles.every(s => s.ordersShipChina === 0 && s.ordersOffStock === null && s.stockNet === null));
+    assert.deepEqual([r2.totals.ordersShipChina, r2.counts.ordersShipChinaStyles, r2.counts.ordersBelowSoldStyles, r2.counts.fStyleSoldStyles], [0, 0, 0, 0]);
+    sumsHold(r2);
+  }
+  sumsHold(r);
+});
+
+test('negative customer orders and negative In WH keep their rules (used as they are)', () => {
+  const as = [soldAt('AB760', 'Ready', 200), soldAt('AB761', 'Ready', 200, { po: '901071' }),
+    alloc({ style: 'AB761', styleRaw: 'AB761', po: '901072', bucket: 'inProd', units: 1000, crd: D(12, 1), dates: { factoryCrd: D(12, 1) } })];
+  const r = sell(as, atsOf({ AB760: [100, -50], AB761: [-100, 500] }));
+  // Orders below zero are fewer than the sold goods: nothing netted (listed); Available now is more than In WH, as before.
+  assert.deepEqual(nettingOf(styleOf(r, 'AB760')), [-50, 200, 0, -50, 150, 150, 0, 0]);
+  assert.ok(styleOf(r, 'AB760').flags.includes('orders-below-sold'));
+  // In WH below zero: netted as any other; the stock after orders stays below zero and comes off the lot.
+  assert.deepEqual(nettingOf(styleOf(r, 'AB761')), [500, 200, 200, 300, -400, 0, 400, 0]);
+  assert.equal(lotOf(r, '901072').taken, 400);
+  sumsHold(r);
 });
 
 test('every unit accounted for on a large random mix with the ERP In Trans: Incoming, In Trans, received, landed, off China, unplaced', () => {
@@ -1160,6 +1339,10 @@ test('every unit accounted for on a large random mix with the ERP In Trans: Inco
     // The Import PO Backlog: a number, blank (0), or no column for the style's row.
     map['AB' + (100 + i)] = [rnd(20000), rnd(30000), ships, rnd(3) ? [rnd(9000)] : []];
   }
+  // Twenty styles end in -F (their sold goods' orders are never netted), the same draws otherwise.
+  const fName = k => (k >= 'AB160' && k < 'AB180' ? k + '-F' : k);
+  for (const a of as) { a.style = fName(a.style); a.styleRaw = a.style; }
+  for (const k of Object.keys(map)) if (fName(k) !== k) { map[fName(k)] = map[k]; delete map[k]; }
   const ats = atsE(map);
   const r = sell(as, ats);
   reconcile(r, as, ats);
@@ -1174,6 +1357,10 @@ test('every unit accounted for on a large random mix with the ERP In Trans: Inco
   for (const k of ['erpMoreStyles', 'erpLessStyles', 'landedOursStyles', 'landedDueStyles', 'erpUnplacedStyles', 'unplacedInChinaStyles',
     'backlogGuardStyles', 'receivedStyles', 'keptExtraStyles', 'inErpTransitStyles', 'receivedCappedStyles', 'takenDueByStyles', 'lessTakenStyles']) assert.ok(r.counts[k] > 0, k);
   for (const k of SELL.TIERS) assert.ok(r.counts.inErpTransitTierLots[k] > 0, k);
+  // ... and orders that ship from China: netted, orders fewer than the sold goods, -F styles counted.
+  for (const k of ['ordersShipChinaStyles', 'ordersBelowSoldStyles', 'fStyleSoldStyles', 'fStyleOrdersStyles']) assert.ok(r.counts[k] > 0, k);
+  assert.equal(r.issues.filter(i => i.code === 'f-style-orders').length, 1);
+  assert.equal(t.ordersShipChina, r.counts.ordersShipChinaUnits);
   // Received only with an ETA on or before the report's day; in the ERP's transit only our lots still in China.
   for (const l of r.lots) {
     if (l.received) assert.ok(l.eta != null && l.eta <= D(10, 29), l.id);

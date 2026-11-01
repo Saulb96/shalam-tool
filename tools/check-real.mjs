@@ -13,7 +13,9 @@
 // page reads it (its date from the file name, else the day the file was saved, as on the page), then Available to sell
 // (core/sell.js) with it: Arriving from its In Trans, and how our own lots meet it (matched, received, kept; beyond ours:
 // landed, taken off China, unplaced, each worked out here again from the files), reconciled per style with Incoming and
-// the report's In Trans (a failure if they don't add up, or if anything is offered twice);
+// the report's In Trans (a failure if they don't add up, or if anything is offered twice); customer orders that ship
+// from China with goods sold there (Saul, Nov 1), worked out here again from the files and compared style by style, with
+// the totals before and after;
 // and compared per style with Incoming: In Trans Qty vs On the water + At port, Import PO
 // Backlog Qty vs In China (LA POs only). Available to sell is also worked out without the report (as when it's missing),
 // with or without --ats. Its sums, Saul's pull-from date rule and the ready dates are checked lot by lot here, on their
@@ -591,6 +593,89 @@ function erpCrossChecks(S, R, erpS) {
   if (T.offeredTwice !== 0 || T.landedOurs !== sum(L.landedOurs, x => x[1]) || T.erpUnplaced !== sum(L.unplaced, x => x[1])) fails("Available to sell: the engine's ERP totals aren't the ones worked out here");
 }
 
+// Customer orders that ship from China with goods sold there (Saul, Nov 1), worked out here from the files on their own
+// and set against the engine's numbers. The ERP's Total Customer Orders include the orders of goods sold to ship from
+// China (China Pickup POs, the direct-to-customer sections) while those goods aren't loaded yet (No CRD, In production,
+// Ready, Booked), on styles not ending in -F; the goods are sold (never in a lot), so their orders aren't taken off the
+// stock again. Per style on the report with In WH and orders read: with orders at least those goods, that many orders
+// ship from China; with fewer, none (listed on Problems); on a -F style, none (counted). The orders left come off the
+// stock, then off the style's lots in date order (the engine's lots, as they were before orders: taken + available), the
+// rest oversold; the same walk with every order taken off the stock gives the totals before. Style codes and numbers only.
+function ordersCheck(S, R) {
+  const isD = v => typeof v === 'number' && Number.isFinite(v), sum = (a, f) => a.reduce((p, x) => p + (f(x) || 0), 0);
+  const OPEN = ['No CRD', 'In production', 'Ready', 'Booked'];
+  const LOTB = ['noCrd', 'inProd', 'ready', 'booked', 'loaded', 'water', 'port'];
+  const soldTag = a => a.ptype === 'China Pickup' || (a.flags || []).includes('pull-section');
+  const soldA = a => a.bucket === 'pullFromChina' || (LOTB.includes(a.bucket) && soldTag(a));
+  const endsInF = st => /-F$/i.test(String(st ?? '').trim());
+  const open = new Map(), byStage = {};
+  for (const a of R.allocs) if (soldA(a)) {
+    byStage[a.stage || '(none)'] = (byStage[a.stage || '(none)'] || 0) + a.units;
+    if (OPEN.includes(a.stage)) open.set(a.style, (open.get(a.style) || 0) + a.units);
+  }
+  const pre = l => l.taken + l.available;
+  // The stock and the style's lots after `off` orders taken off the stock (null: orders not known, nothing taken off).
+  const run = (s, inWh, off) => {
+    const china = s.lots.filter(l => l.inChina), sailed = s.lots.filter(l => !l.inChina);
+    if (off == null) return { now: 0, fromChina: sum(china, pre), arriving: sum(sailed, pre), oversold: 0, taken: s.lots.map(() => 0) };
+    const net = inWh - off;
+    let left = Math.max(0, -net);
+    const taken = s.lots.map(l => { const k = Math.min(Math.max(0, pre(l)), left); left -= k; return k; });
+    const after = (pick) => sum(s.lots.map((l, i) => [l, i]).filter(([l]) => pick(l)), ([l, i]) => pre(l) - taken[i]);
+    return { now: Math.max(0, net), fromChina: after(l => l.inChina), arriving: after(l => !l.inChina), oversold: left, taken };
+  };
+  const KEYS = ['now', 'fromChina', 'arriving', 'oversold'];
+  const B = Object.fromEntries(KEYS.map(k => [k, 0])), A = Object.fromEntries(KEYS.map(k => [k, 0]));
+  let ovB = 0, ovA = 0;
+  const L = { netted: [], below: [], fSkip: [], fOrders: [], differ: [], openDiffer: [], cured: [] };
+  for (const s of S.styles) {
+    const e = atsR.styles.get(s.style) || null, known = !!e && isD(e.inWh) && isD(e.orders);
+    const mine = open.get(s.style) || 0, f = endsInF(e ? e.styleRaw : s.styleRaw);
+    if (mine !== s.soldNotLoaded) L.openDiffer.push(`${s.style} (here ${n(mine)}, engine ${n(s.soldNotLoaded)})`);
+    let ship = 0;
+    if (known && mine > 0) {
+      if (f) { L.fSkip.push([s.style, mine]); if (e.orders > 0) L.fOrders.push([s.style, mine]); }
+      else if (e.orders >= mine) ship = mine;
+      else L.below.push([s.style, mine, e.orders, e.inWh]);
+    }
+    const b = run(s, known ? e.inWh : null, known ? e.orders : null), a = run(s, known ? e.inWh : null, known ? e.orders - ship : null);
+    for (const k of KEYS) { B[k] += b[k]; A[k] += a[k]; }
+    if (b.oversold > 0) ovB++;
+    if (a.oversold > 0) ovA++;
+    if (ship) {
+      L.netted.push([s.style, ship, `${s.style}: In WH ${n(e.inWh)}, orders ${n(e.orders)}, sold not loaded yet ${n(mine)} → available now ${n(b.now)} → ${n(a.now)}, from China ${n(b.fromChina)} → ${n(a.fromChina)}, arriving ${n(b.arriving)} → ${n(a.arriving)}, oversold ${n(b.oversold)} → ${n(a.oversold)}`]);
+      if (b.oversold > 0 && !a.oversold) L.cured.push(s.style);
+    }
+    const flagsWant = { 'orders-ship-china': ship > 0, 'orders-below-sold': L.below.some(x => x[0] === s.style), 'f-style-sold': known && f && mine > 0 };
+    const why = [s.ordersShipChina !== ship ? `ships from China ${n(s.ordersShipChina)}, here ${n(ship)}` : '',
+      known && (s.ordersOffStock !== e.orders - ship || s.stockNet !== e.inWh - (e.orders - ship)) ? `orders off the stock ${n(s.ordersOffStock)}, stock after orders ${n(s.stockNet)}` : '',
+      known && KEYS.some(k => (s[k] ?? 0) !== a[k]) ? `${KEYS.map(k => `${k} ${n(s[k] ?? 0)}`).join(' ')}; here ${KEYS.map(k => `${k} ${n(a[k])}`).join(' ')}` : '',
+      known && s.lots.some((l, i) => l.taken !== a.taken[i]) ? 'a lot taken differently' : '',
+      ...Object.entries(flagsWant).filter(([k, v]) => s.flags.includes(k) !== v).map(([k, v]) => `flag ${k} ${v ? 'missing' : 'not expected'}`)].filter(Boolean);
+    if (why.length) L.differ.push(`${s.style} (${why.join('; ')})`);
+  }
+  const T = S.totals, d = (x, y) => `${n(x)} → ${n(y)} (${y - x >= 0 ? '+' : ''}${n(y - x)})`;
+  const tot = o => o.now + o.fromChina + o.arriving;
+  const top = (list, k = 6) => list.slice().sort((x, y) => y[1] - x[1]).slice(0, k);
+  console.log('    customer orders that ship from China with goods sold there (Saul, Nov 1), worked out here from the files on their own:');
+  console.log(`      sold goods (China Pickup POs, direct-to-customer sections) by stage: ${Object.entries(byStage).sort((x, y) => y[1] - x[1]).map(([k, v]) => `${k} ${n(v)}`).join(' · ')}`);
+  console.log(`      not loaded yet (No CRD, In production, Ready, Booked): ${n(sum([...open.values()], v => v))} units on ${n(open.size)} styles · the engine's, style by style: ${L.openDiffer.length ? `DIFFERS on ${n(L.openDiffer.length)} (e.g. ${L.openDiffer.slice(0, 5).join(', ')})` : 'the same on every style'}`);
+  console.log(`      their orders ship from China (orders at least those goods): ${n(sum(L.netted, x => x[1]))} units on ${n(L.netted.length)} styles (engine ${n(T.ordersShipChina)} on ${n(S.counts.ordersShipChinaStyles)}); ${n(L.cured.length)} of them no longer oversold`);
+  for (const x of top(L.netted)) console.log(`        ${x[2]}`);
+  console.log(`      not netted, orders fewer than those goods (one Problems line each): ${n(L.below.length)} styles${L.below.length ? `: ${L.below.map(x => `${x[0]} (In WH ${n(x[3])}, orders ${n(x[2])}, sold not loaded yet ${n(x[1])})`).join(' · ')}` : ''}`);
+  console.log(`      styles ending in -F, never netted: ${n(L.fSkip.length)} styles with ${n(sum(L.fSkip, x => x[1]))} units sold not loaded yet (engine ${n(S.counts.fStyleSoldStyles)} styles, ${n(S.counts.fStyleSoldUnits)} units); with customer orders too (one summary line): ${n(L.fOrders.length)}${L.fOrders.length ? ` (${L.fOrders.slice(0, 6).map(x => x[0]).join(', ')})` : ''}`);
+  console.log(`      totals before → after: Available now ${d(B.now, A.now)} · From China ${d(B.fromChina, A.fromChina)} · Arriving ${d(B.arriving, A.arriving)} · Total ${d(tot(B), tot(A))} · Oversold ${n(B.oversold)} on ${n(ovB)} styles → ${n(A.oversold)} on ${n(ovA)} (${n(A.oversold - B.oversold)})`);
+  console.log(`      the engine's, style by style (orders that ship from China, stock after orders, each lot taken, flags): ${L.differ.length ? `DIFFERS on ${n(L.differ.length)} (e.g. ${L.differ.slice(0, 3).join(' | ')})` : 'the same on every style'}`);
+  const iss = code => S.issues.filter(i => i.code === code);
+  const belowIss = iss('orders-below-sold');
+  if (belowIss.length !== L.below.length || L.below.some(x => !belowIss.some(i => i.style === x[0]))) fails(`Available to sell: ${n(belowIss.length)} Problems lines for orders fewer than the sold goods not loaded yet, ${n(L.below.length)} worked out here`);
+  if (iss('f-style-orders').length !== (L.fOrders.length ? 1 : 0)) fails('Available to sell: the -F styles with customer orders and sold goods not loaded yet aren\'t one Problems line');
+  if (L.openDiffer.length) fails(`Available to sell: the sold goods not loaded yet differ from the engine's on ${n(L.openDiffer.length)} styles`);
+  if (L.differ.length) fails(`Available to sell: the orders that ship from China differ from the engine's on ${n(L.differ.length)} styles`);
+  if (KEYS.some(k => A[k] !== T[k]) || ovA !== S.counts.oversoldStyles || sum(L.netted, x => x[1]) !== T.ordersShipChina || L.netted.length !== S.counts.ordersShipChinaStyles ||
+    L.below.length !== S.counts.ordersBelowSoldStyles || L.fSkip.length !== S.counts.fStyleSoldStyles) fails("Available to sell: the totals after orders that ship from China aren't the ones worked out here");
+}
+
 // The selling engine's numbers, and their checks: every sum, Saul's rule and the ready date, lot by lot, worked out here
 // on their own. Style codes and PO numbers next to numbers only.
 function sellReport(S, R, noReport) {
@@ -646,7 +731,7 @@ function sellReport(S, R, noReport) {
     if (recBad.length || sell + T.matchedOurs + T.receivedDropped + T.inErpTransitTaken !== inc + it || it !== itParts) fails("Available to sell: the ERP's In Trans and our lots don't reconcile");
     if (atsR && it !== sumS([...atsR.styles.values()].filter(e => erpS.some(s => s.style === e.style)), 'inTrans')) fails("Available to sell: the ERP's lots aren't the report's In Trans for those styles");
     erpCrossChecks(S, R, erpS);
-    console.log(`    orders beyond stock no more than the units sold to ship from China (maybe the same orders; listed, open question): ${n(cnt.soldInOrdersStyles)} styles (${n(cnt.soldInOrdersOversold)} oversold), ${n(cnt.soldInOrdersUnits)} units`);
+    ordersCheck(S, R);
   }
   if (noReport) console.log('    (no report: the page shows Available now, Total available and Oversold as "no report yet"; From China and Arriving are before customer orders)');
 
@@ -691,7 +776,7 @@ function sellReport(S, R, noReport) {
 
   // The checks: sums, and Saul's rule worked out here, lot by lot.
   const bad = [], isD = v => typeof v === 'number' && Number.isFinite(v), sumS = k => st.reduce((p, s) => p + (s[k] || 0), 0);
-  for (const k of ['now', 'fromChina', 'arriving', 'arrivingErp', 'arrivingOurs', 'total', 'soldChina', 'oversold', 'ordersTaken']) if (sumS(k) !== T[k]) bad.push(`the styles add up to ${k} ${n(sumS(k))}, not ${n(T[k])}`);
+  for (const k of ['now', 'fromChina', 'arriving', 'arrivingErp', 'arrivingOurs', 'total', 'soldChina', 'oversold', 'ordersTaken', 'ordersShipChina']) if (sumS(k) !== T[k]) bad.push(`the styles add up to ${k} ${n(sumS(k))}, not ${n(T[k])}`);
   if (T.total !== T.now + T.fromChina + T.arriving) bad.push('Total available isn\'t now + from China + arriving');
   if (T.arriving !== T.arrivingErp + T.arrivingOurs) bad.push("Arriving isn't the ERP's In Trans + ours");
   for (const k of ['now', 'fromChina', 'arriving']) if (st.reduce((p, s) => p + ((s.cases || {})[k] || 0), 0) !== K[k]) bad.push(`the styles' cases add up to another ${k}`);
@@ -704,8 +789,11 @@ function sellReport(S, R, noReport) {
   for (const s of st) {
     if (sumU(s.lots, l => l.taken + l.available) !== s.fromChina + s.arriving + s.ordersTaken || s.fromChina !== sumU(s.lots.filter(l => l.inChina), l => l.available) ||
       s.arriving !== sumU(s.lots.filter(l => !l.inChina), l => l.available) || sumU(s.lots, l => l.taken) !== s.ordersTaken) styleBad.lots.push(s.style);
-    const known = isD(s.inWh) && isD(s.orders) && !s.flags.includes('stock-unknown');
-    if (known ? s.now !== Math.max(0, s.inWh - s.orders) || s.ordersTaken + s.oversold !== Math.max(0, s.orders - s.inWh) : s.ordersTaken || s.oversold || s.now) styleBad.stock.push(s.style);
+    // Stock after orders: In WH − the orders taken off the stock (the ERP's orders less those that ship from China, worked
+    // out again in ordersCheck); orders beyond it are taken off the lots or oversold.
+    const known = isD(s.inWh) && isD(s.orders) && !s.flags.includes('stock-unknown'), off = s.ordersOffStock;
+    if ((isD(s.orders) ? off !== s.orders - s.ordersShipChina : off !== null) || !(s.ordersShipChina >= 0) || (!known && s.ordersShipChina) ||
+      (known ? s.stockNet !== s.inWh - off || s.now !== Math.max(0, s.inWh - off) || s.ordersTaken + s.oversold !== Math.max(0, off - s.inWh) : s.ordersTaken || s.oversold || s.now)) styleBad.stock.push(s.style);
     let kept = false;   // customer orders come off the earliest lots first (no date last)
     for (const l of s.lots.slice().sort((a, b) => (lotDay(a) > lotDay(b)) - (lotDay(a) < lotDay(b)))) {
       if (kept && l.taken) { styleBad.order.push(s.style); break; }

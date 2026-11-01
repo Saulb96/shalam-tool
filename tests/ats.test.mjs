@@ -121,7 +121,9 @@ test("erp-ats-differs: the ERP's ATS from in WH against In WH − Total Customer
   assert.equal(res.ok, true, res.error);
   const d = res.issues.filter(i => i.code === 'erp-ats-differs');
   assert.deepEqual(d.map(i => i.style), ['AB100', 'AB102']);
-  assert.match(d[0].message, /"ATS from in WH" is 0, but In WH 0 − Total Customer Orders 300 = -300\. The tool uses -300\./);
+  assert.match(d[0].message, /"ATS from in WH" is 0, but In WH 0 − Total Customer Orders 300 = -300\. The tool goes by In WH and Total Customer Orders, not by the ERP's ATS: the style's Available now on Available to sell shows how\.$/);
+  // It never says which figure the tool uses (on a style with orders that ship from China, core/sell.js nets them).
+  assert.ok(!d.some(i => /The tool uses/.test(i.message)));
   assert.match(d[1].message, /rows 5, 6/);
   assert.equal(res.counts.erpAtsDiffers, 2);
 });

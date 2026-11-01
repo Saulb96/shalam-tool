@@ -36,6 +36,13 @@
 //   beyond the report's Import PO Backlog are still offered (offered twice; with no backlog, unplaced while any are), and
 //   nothing comes off China below that backlog.
 // - Customer orders come off stock first, then the lots in date order; what's left is oversold. Cases are whole cases.
+// - The ERP's Total Customer Orders include the orders for goods sold to ship from China (China Pickup POs and the
+//   direct-to-customer sections) while those goods aren't loaded yet (No CRD, In production, Ready, Booked), except on
+//   a style ending in -F (Saul, Nov 1; the real files agree: loaded goods and -F styles have none of their orders in
+//   it). Those goods are sold (never in a lot), so their orders aren't taken off the stock again. Per style on the ATS
+//   report with In WH and orders read: with orders at least those goods, that many orders ship from China (the rest
+//   come off the stock); with fewer, none do (the style is listed: which orders are for them can't be told); on a -F
+//   style, none do (counted, and one summary line when it has orders too).
 // Pure: no network, no DOM; today (a day number) is passed in. Loads in the page (window.InvSell, after core/common.js)
 // and in Node (module.exports).
 (function (root, factory) {
@@ -84,7 +91,11 @@
   const ERP_KEYS = ['erpInTrans', 'ourIncoming', 'matchedOurs', 'receivedDropped', 'inErpTransitTaken', 'landedNotReceived',
     'landedOurs', 'landedDue', 'landedLater', 'erpUnplaced', 'unplacedInChina', 'keptExtra', 'receivedCapped',
     'takenOnVessel', 'takenSamePo', 'takenOther', 'takenDueBy', 'offeredTwice'];
-  const TOTAL_KEYS = [...CASE_KEYS, 'arrivingErp', 'arrivingOurs', ...ERP_KEYS];
+  const TOTAL_KEYS = [...CASE_KEYS, 'arrivingErp', 'arrivingOurs', 'ordersShipChina', ...ERP_KEYS];
+  // A style ending in -F (as shown): its goods sold to ship from China never have their orders in the ERP's Total
+  // Customer Orders (Saul, Nov 1). The one place that says so.
+  const F_ENDING = /-F$/i;
+  const endsInF = styleShown => F_ENDING.test(S(styleShown));
   // Our sheets' stages for goods that have sailed or arrived (a sold line at another stage is still in China).
   const GONE_STAGES = ['On the water', 'At port', 'Landed', 'Shipped'];
   // Units of a lot the ERP's report already counts (not available here): matched to its In Trans, received, or in transit.
@@ -177,7 +188,11 @@
       landedLaterStyles: 0, keptExtraStyles: 0, keptExtraLots: 0, noReportDayStyles: 0, erpUnplacedStyles: 0, unplacedInChinaStyles: 0,
       backlogGuardStyles: 0, sameQtyMatchedLots: 0, receivedCappedStyles: 0, offeredTwiceStyles: 0,
       backlogUnknownStyles: 0, takenDueByStyles: 0, lessTakenStyles: 0,
-      soldInOrdersStyles: 0, soldInOrdersUnits: 0, soldInOrdersOversold: 0,
+      // Customer orders that ship from China with goods sold there (styles / units of those goods not loaded yet): the
+      // orders are at least those goods (netted); fewer (not netted, listed); a style ending in -F (never netted; with
+      // customer orders too).
+      ordersShipChinaStyles: 0, ordersShipChinaUnits: 0, ordersBelowSoldStyles: 0, ordersBelowSoldUnits: 0,
+      fStyleSoldStyles: 0, fStyleSoldUnits: 0, fStyleOrdersStyles: 0,
     };
 
     // ---------- lots, sold and unmatched units, from the allocations
@@ -186,7 +201,8 @@
     const knownStyles = new Set();    // every style on any Master Sheet Live or Container Tracking line
     // For placing the ERP's In Trans beyond our sailed goods: our Landed goods (not sold: { po, units, day, dayFrom }),
     // the PO bases Container Tracking shows sailed or landed, and sold units still in China before they're loaded (the
-    // report's Import PO Backlog has sold goods booked or ready, never those already loaded).
+    // report's Import PO Backlog has sold goods booked or ready, never those already loaded; its Total Customer Orders
+    // have their orders, on a style not ending in -F).
     const landedBy = new Map(), goneBasesBy = new Map(), soldInChinaBy = new Map();
     const add = (m, k, n) => m.set(k, (m.get(k) || 0) + n);
     const soldA = a => a.ptype === 'China Pickup' || (a.flags || []).includes('pull-section');
@@ -537,9 +553,23 @@
       // No date to sell it from: only what's left of a lot (a sailed lot the ERP counts needs none).
       for (const l of ls) if (l.availableDate == null && l.available > 0) { l.flags.push('no-date'); if (l.source === 'ours') counts.noDateLots++; }
       const known = !!(e && isDay(e.inWh) && isDay(e.orders));
-      let inWh = null, orders = null, stockNet = null, now = null, shortfall = 0;
+      // Goods sold to ship from China not loaded yet: their orders are in the ERP's Total Customer Orders (not on a style
+      // ending in -F), and they're served by those goods, so they don't come off the stock (Saul, Nov 1).
+      const soldNotLoaded = soldInChinaBy.get(style) || 0, fStyle = endsInF(styleRaw);
+      let inWh = null, orders = null, stockNet = null, now = null, shortfall = 0, ordersShipChina = 0;
       if (known) {
-        inWh = e.inWh; orders = e.orders; stockNet = inWh - orders;
+        inWh = e.inWh; orders = e.orders;
+        if (soldNotLoaded > 0 && fStyle) {
+          flags.push('f-style-sold'); counts.fStyleSoldStyles++; counts.fStyleSoldUnits += soldNotLoaded;
+          if (orders > 0) counts.fStyleOrdersStyles++;
+        } else if (soldNotLoaded > 0 && orders >= soldNotLoaded) {
+          ordersShipChina = soldNotLoaded; flags.push('orders-ship-china');
+          counts.ordersShipChinaStyles++; counts.ordersShipChinaUnits += soldNotLoaded;
+        } else if (soldNotLoaded > 0) {
+          // Fewer orders than those goods: which of them are for the goods can't be told, so none are (listed).
+          flags.push('orders-below-sold'); counts.ordersBelowSoldStyles++; counts.ordersBelowSoldUnits += soldNotLoaded;
+        }
+        stockNet = inWh - (orders - ordersShipChina);
         now = Math.max(0, stockNet); shortfall = Math.max(0, -stockNet);
         counts.stylesOnReport++;
       } else if (e) {
@@ -563,13 +593,6 @@
       }
       const oversold = left;
       const soldChina = soldBy.get(style) || 0, unmatched = unmatchedBy.get(style) || 0;
-      // Orders beyond stock no more than the units sold to ship from China: those orders may be the same goods (listed,
-      // never counted: an open question to Saul).
-      let soldInOrders = 0;
-      if (known && shortfall > 0 && soldChina > 0 && shortfall <= soldChina) {
-        soldInOrders = shortfall; flags.push('orders-may-include-sold');
-        counts.soldInOrdersStyles++; counts.soldInOrdersUnits += shortfall; if (oversold > 0) counts.soldInOrdersOversold++;
-      }
       const open = ls.filter(l => l.available > 0);
       if (!known && open.length) { flags.push('orders-unknown'); for (const l of open) l.flags.push('orders-unknown'); counts.ordersUnknownStyles++; counts.ordersUnknownUnits += open.reduce((s, l) => s + l.available, 0); }
       if (oversold > 0) { flags.push('oversold'); counts.oversoldStyles++; }
@@ -616,8 +639,12 @@
         category: (st && st.category) || (umCat && umCat.category) || (e && e.category) || '',
         factory: (st && st.factory) || '', factories: st ? st.factories.slice() : [],
         upcs, casePack, onReport: atsOk ? !!e : null,
-        inWh, orders, stockNet, now, fromChina, arriving, total: (now ?? 0) + fromChina + arriving,
-        soldChina, unmatched, oversold, ordersTaken, cases, noCasePackUnits, looseUnits, soldInOrders,
+        // orders: the ERP's Total Customer Orders as they are; ordersShipChina of them ship from China with goods sold
+        // there (not loaded yet: soldNotLoaded, never on a style ending in -F), so ordersOffStock come off the stock:
+        // stockNet = inWh − ordersOffStock.
+        inWh, orders, ordersShipChina, ordersOffStock: orders == null ? null : orders - ordersShipChina, stockNet, now,
+        fromChina, arriving, total: (now ?? 0) + fromChina + arriving,
+        soldChina, soldNotLoaded, endsInF: fStyle, unmatched, oversold, ordersTaken, cases, noCasePackUnits, looseUnits,
         // Where Arriving comes from ('erp': the report's In Trans; 'ours': our sailed lots), split after customer orders,
         // and how our own lots meet the ERP's In Trans (units, before orders): every one of ours (ourIncoming, the stage
         // engine's Incoming for the style) is in a lot, matched to the ERP's In Trans, received, or in its transit.
@@ -644,12 +671,6 @@
     // Every lot, ours and the ERP's In Trans, in date order (lotsInChina / lotsSailed count ours, erpLots the ERP's).
     lots.sort(lotOrder);
     counts.lots = lots.length;
-    // The cross-check notes on a style with orders beyond its stock, in words.
-    function checkNotes(s) {
-      const n = [];
-      if (s.soldInOrders > 0) n.push(`${unitsText(s.soldChina)} of this style ${s.soldChina === 1 ? 'is' : 'are'} sold to ship from China: if those orders are in the ERP's Total Customer Orders, they're taken off twice.`);
-      return n;
-    }
 
     // ---------- issues
     // Ready dates that disagree: one line per PO + style still in China, every source's date named.
@@ -685,9 +706,25 @@
         : `PO ${p.po}, style ${p.styleRaw}: ${unitsText(p.units)} ${[...p.statuses].join(', ').toLowerCase()} have no ETA, so there's no arrival date to sell them from.`);
     }
     for (const s of styles) if (s.oversold > 0) {
-      const notes = checkNotes(s);
-      issue('oversold', '', s.style, `Style ${s.styleRaw}: customer orders (${fmtN(s.orders)}) are ${unitsText(s.oversold)} more than the warehouse stock (${fmtN(s.inWh)})${s.lots.length ? ` and every open lot from China (${unitsText(s.ordersTaken)})` : ' with no open lot from China'}.${notes.length ? ` Check before turning a buyer away: ${notes.join(' ')}` : ' Nothing is available to sell.'}`,
+      // The orders taken off the stock: the ERP's, less those that ship from China with goods sold there.
+      const ord = s.ordersShipChina ? `${fmtN(s.orders)} on the ATS report less ${fmtN(s.ordersShipChina)} that ship from China with goods sold there: ${fmtN(s.ordersOffStock)}` : fmtN(s.orders);
+      issue('oversold', '', s.style, `Style ${s.styleRaw}: customer orders (${ord}) are ${unitsText(s.oversold)} more than the warehouse stock (${fmtN(s.inWh)})${s.lots.length ? ` and every open lot from China (${unitsText(s.ordersTaken)})` : ' with no open lot from China'}. Nothing is available to sell.`,
         { units: s.oversold });
+    }
+    // Customer orders fewer than the style's goods sold to ship from China not loaded yet: none of them are treated as
+    // those goods (which ones are can't be told), so they all come off the stock. One line per style.
+    for (const s of styles) if (s.flags.includes('orders-below-sold')) {
+      issue('orders-below-sold', '', s.style, `Style ${s.styleRaw}: its customer orders on the ATS report (${fmtN(s.orders)}) are fewer than its goods sold to ship from China that aren't loaded yet (${unitsText(s.soldNotLoaded)}), so none of the orders are treated as those goods: they all come off the warehouse stock, as for any other style. Check in the ERP which orders are for the sold goods.`,
+        { units: s.soldNotLoaded, orders: s.orders });
+    }
+    // Styles ending in -F with customer orders and goods sold to ship from China not loaded yet: the ERP's orders on a
+    // -F style are never for its sold goods, so they all come off the stock. One summary line.
+    {
+      const list = styles.filter(s => s.flags.includes('f-style-sold') && s.orders > 0);
+      if (list.length) {
+        issue('f-style-orders', '', '', `${fmtN(list.length)} style${list.length === 1 ? '' : 's'} ending in -F ${list.length === 1 ? 'has' : 'have'} customer orders on the ATS report and goods sold to ship from China that aren't loaded yet. On a -F style the ERP's customer orders don't include its sold goods, so all of the orders come off the warehouse stock. Check if any are for the sold goods: ${list.slice().sort((a, b) => b.soldNotLoaded - a.soldNotLoaded).slice(0, 5).map(s => `${s.styleRaw} (orders ${fmtN(s.orders)}, sold, not loaded yet ${fmtN(s.soldNotLoaded)})`).join(', ')}${list.length > 5 ? '…' : ''}.`,
+          { count: list.length, units: list.reduce((t, s) => t + s.soldNotLoaded, 0) });
+      }
     }
     // The ERP's In Trans quantities whose ETA can't be told (the ETA Date list doesn't line up with In Trans, or a date
     // can't be read): one line per style, naming the report's rows.
@@ -701,7 +738,7 @@
     if (counts.noInTransColumn) {
       issue('no-in-trans-column', '', '', `The ATS report has no "In Trans Qty" column, so Arriving comes from our shipping data (on the water, at port) for every style, and goods the ERP has already received or counts in transit can't be told apart.`);
     }
-    // Styles whose orders beyond stock may be covered by goods not counted here: one summary line each.
+    // Styles with the same thing to check: one summary line for each code.
     const summary = (code, unitsOf, text) => {
       const list = styles.filter(s => s.flags.includes(code));
       if (!list.length) return;
@@ -709,8 +746,6 @@
       issue(code, '', '', `${fmtN(list.length)} style${list.length === 1 ? '' : 's'} (${fmtN(ov)} of them oversold): ${text(u)} For example ${list.slice().sort((a, b) => unitsOf(b) - unitsOf(a)).slice(0, 5).map(s => `${s.styleRaw} ${fmtN(unitsOf(s))}`).join(', ')}${list.length > 5 ? '…' : ''}.`,
         { count: list.length, units: u });
     };
-    summary('orders-may-include-sold', s => s.soldInOrders,
-      u => `the customer orders beyond the warehouse stock (${unitsText(u)}) are no more than the style's goods sold to ship from China (China Pickup or straight to the customer). If the ERP's Total Customer Orders include those orders, they are taken off twice.`);
     // The ERP's In Trans that our data can't place (not sailed, landed or taken off China): one line per style. It stays
     // Arriving (the ERP's word); our goods in China are kept as far as the report's Import PO Backlog has them there.
     for (const s of styles) if (s.erpUnplaced > 0) {
@@ -769,6 +804,9 @@
         s.offeredTwice > 0 ? `${fmtN(s.offeredTwice)} In Trans on the ERP are still offered from China too` : '',
         s.takeable != null && s.inErpTransitTaken > s.takeable ? `${fmtN(s.inErpTransitTaken)} came off China, below the ERP's Import PO Backlog (${fmtN(s.takeable)} could)` : '',
         isDay(s.inWh) && s.receivedDropped > Math.max(0, s.inWh) ? `received ${fmtN(s.receivedDropped)} is more than In WH ${fmtN(s.inWh)}` : '',
+        // Stock after orders is In WH − the orders taken off it; those that ship from China are its sold goods not loaded yet.
+        s.stockNet != null && (s.stockNet !== s.inWh - s.ordersOffStock || s.ordersOffStock !== s.orders - s.ordersShipChina) ? "stock after orders isn't In WH − the orders taken off the stock" : '',
+        s.ordersShipChina && (s.ordersShipChina !== s.soldNotLoaded || s.endsInF || s.orders < s.ordersShipChina) ? "the orders that ship from China aren't its sold goods not loaded yet" : '',
         Math.abs(lotU - s.ourIncoming - (s.erpInTrans || 0)) > 1e-9 ? "the lots aren't Incoming + the ERP's In Trans" : '',
         Math.abs(lotU - s.lots.reduce((t, l) => t + replaced(l), 0) - s.fromChina - s.arriving - s.ordersTaken) > 1e-9 ? "the lots aren't from China + arriving + taken" : ''].filter(Boolean);
       if (why.length) offBy.push(`${s.styleRaw} (${why.join('; ')})`);
@@ -782,7 +820,7 @@
     for (const s of styles) {
       totals.now += s.now || 0; totals.fromChina += s.fromChina; totals.arriving += s.arriving; totals.soldChina += s.soldChina;
       totals.oversold += s.oversold; totals.ordersTaken += s.ordersTaken;
-      for (const k of ['arrivingErp', 'arrivingOurs', ...ERP_KEYS]) totals[k] += s[k] || 0;
+      for (const k of ['arrivingErp', 'arrivingOurs', 'ordersShipChina', ...ERP_KEYS]) totals[k] += s[k] || 0;
       for (const k of ['now', 'fromChina', 'arriving', 'soldChina']) { tCases[k] += s.cases[k]; tNoPack[k] += s.noCasePackUnits[k]; }
       for (const k of ['now', 'fromChina', 'arriving', 'total']) tLoose[k] += s.looseUnits[k];
     }
@@ -795,6 +833,6 @@
       reportDay: repDay, totals, styles, lots, issues, counts };
   }
 
-  return { buildSell, readyOf, pullOf, ruleWords, SOURCE, STATUS, IN_CHINA, SAILED, READY_ORDER, READY_LABEL, READY_FILE,
+  return { buildSell, readyOf, pullOf, ruleWords, endsInF, SOURCE, STATUS, IN_CHINA, SAILED, READY_ORDER, READY_LABEL, READY_FILE,
     RULES, TOTAL_KEYS, ERP_KEYS, TIERS, LANDED_DAYS, LANDED_LATE_DAYS, DAYS_BEFORE_ETD, DAYS_BEFORE_CRD, DAYS_AFTER_ORDER, DISAGREE_DAYS };
 });

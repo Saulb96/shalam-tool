@@ -1,8 +1,9 @@
 // The ERP's weekly ATS report ("Inventory Report - On Hand_In Transit_In Production <m-d-yyyy> ….xlsx", sheet "Report"):
 // per style, the units in the warehouse (In WH) and the customer orders against them (Total Customer Orders), summed
 // over the style's warehouse rows. Its "Grand Total" row is the check: the rows' In WH must add up to it. The tool works
-// out stock after orders itself (In WH − Total Customer Orders, Saul, Oct 29); the ERP's own "ATS from in WH" is only
-// compared with it. In Trans Qty (a list, one quantity per shipment) and ETA Date (a list lined up with it) are what
+// out stock after orders itself from In WH and Total Customer Orders (Saul, Oct 29; core/sell.js leaves out of them the
+// orders that ship from China with goods sold there, Saul, Nov 1); the ERP's own "ATS from in WH" is only compared with
+// In WH − Total Customer Orders, the ERP's figures as they are. In Trans Qty (a list, one quantity per shipment) and ETA Date (a list lined up with it) are what
 // core/sell.js counts as Arriving (Saul, Oct 30): each row keeps both part for part (inTransList, etaParts; an ETA that
 // can't be read stays in its place as null). An In Trans quantity that isn't a number (a comma only as a thousands
 // separator), could be one quantity or two ("720,816" with an ETA for each part), or is below zero, is listed. The
@@ -223,7 +224,9 @@
         `${fmtN(blankCells.length)} style row${blankCells.length > 1 ? 's have' : ' has'} a blank In WH or Total Customer Orders, so ${blankCells.length > 1 ? 'those styles\'' : 'that style\'s'} stock after orders isn't known (a blank is never read as 0): ${ex}${blankCells.length > 5 ? '…' : ''}.`);
     }
 
-    // Per style: physical stock below 0, and the ERP's ATS from in WH against In WH − Total Customer Orders.
+    // Per style: physical stock below 0, and the ERP's ATS from in WH against In WH − Total Customer Orders. The line
+    // doesn't give the tool's own figure: on a style with customer orders that ship from China (core/sell.js) it isn't
+    // In WH − Total Customer Orders, and this file can't tell.
     for (const s of styles.values()) {
       if (s.unknown) counts.unknownStyles++;
       if (s.warehouses.length > 1 || s.rows.length > 1) counts.multiWarehouseStyles++;
@@ -242,7 +245,7 @@
         const mine = s.inWh - s.orders, erp = s.erpAts;
         if (Math.abs(mine - erp) > 1e-9) {
           counts.erpAtsDiffers++;
-          issue('erp-ats-differs', s.style, s.rows[0].row, `Style ${s.styleRaw} (row${s.rows.length > 1 ? 's' : ''} ${rowsText}): the ERP's "ATS from in WH" is ${fmtN(erp)}, but In WH ${fmtN(s.inWh)} − Total Customer Orders ${fmtN(s.orders)} = ${fmtN(mine)}. The tool uses ${fmtN(mine)}.`);
+          issue('erp-ats-differs', s.style, s.rows[0].row, `Style ${s.styleRaw} (row${s.rows.length > 1 ? 's' : ''} ${rowsText}): the ERP's "ATS from in WH" is ${fmtN(erp)}, but In WH ${fmtN(s.inWh)} − Total Customer Orders ${fmtN(s.orders)} = ${fmtN(mine)}. The tool goes by In WH and Total Customer Orders, not by the ERP's ATS: the style's Available now on Available to sell shows how.`);
         }
       }
       delete s.erpAtsBad;
