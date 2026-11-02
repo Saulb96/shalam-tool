@@ -12,7 +12,7 @@ window.INV_CONFIG = {
     ct: '/sites/Importing/Shared Documents/Importing/Logistics/Container Tracking Sheet.xlsx',
     forwarder: '/sites/Reports/Shared Documents/Reports/Shipping Reports/Forwarder',
     drayage: '/sites/Reports/Shared Documents/Reports/Shipping Reports/Drayage',
-    ats: '/sites/Production/Shared Documents/Inventory/ATS',
+    ats: '/sites/Reports/Shared Documents/Reports/ATS',
   },
   // Container Tracking sections with no round: straight to the customer (Pull from China), not booked yet (Master Sheet stage), or ignored.
   sections: { pullFromChina: ['GT', 'Giant Tiger', 'TJX Mexico', 'TJX Aus', 'TJX UK', 'FOB Loaded'], planning: ['Unshipped', 'Planning - NB', 'Planning - other'], ignore: ['CT - Hidden Rows'] },
