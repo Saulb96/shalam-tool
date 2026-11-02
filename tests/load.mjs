@@ -1,4 +1,4 @@
-// Loads the page's browser files into Node for tests: the vendored spreadsheet library and the core parsers.
+// Loads the page's browser files into Node for tests: the vendored spreadsheet libraries and the core parsers.
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -14,8 +14,23 @@ export function loadXLSX() {
   return xlsx;
 }
 
+// ExcelJS, the sales sheet's writer (loaded only when a sheet is built in the page): its bundle is UMD, so in Node it
+// answers module.exports.
+export const loadExcelJS = () => require(join(ROOT, 'vendor/exceljs/exceljs.min.js'));
+
 export const core = name => require(join(ROOT, 'core', name + '.js'));
 export const root = (...p) => join(ROOT, ...p);
+
+// Every part of a .xlsx (a zip) by its path, as bytes: SheetJS's zip reader (XLSX.CFB), as the page uses it. The
+// reader's own marker entry (its name starts with \x01) isn't in the file.
+export function xlsxParts(bytes) {
+  const X = loadXLSX(), z = X.CFB.read(bytes, { type: 'array' }), out = new Map();
+  z.FileIndex.forEach((f, i) => {
+    const p = z.FullPaths[i].replace(/^Root Entry\//, '');
+    if (f.type === 2 && !p.startsWith('\x01') && f.content && f.content.length) out.set(p, new Uint8Array(f.content));
+  });
+  return out;
+}
 
 // A workbook built from { sheetName: rows (array of arrays) }, written to .xlsx bytes and read back the way the
 // page reads a downloaded file, so tests go through the real file format.

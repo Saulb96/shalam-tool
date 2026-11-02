@@ -35,6 +35,11 @@ a.chip.src:hover{background:#fff}
 .chip.err .dot{background:var(--red)}.chip.err em{color:var(--red)}.chip.err{background:rgba(251,225,220,.8)}
 .chip.off .dot{background:var(--off)}.chip.off em{color:var(--muted)}
 .chip.load .dot{background:transparent;border:2px solid rgba(27,111,174,.25);border-top-color:var(--accentink);animation:spin .8s linear infinite}
+/* the sales sheet's status: its name links to the file; Cancel, Save anyway or Save now after it */
+.chip.sales{max-width:420px}
+.chip.sales a{color:inherit;text-decoration:none}
+.chip.sales a:hover b{text-decoration:underline}
+.chip.sales button{flex:none;padding:0 4px;font-size:11.5px}
 
 /* banners */
 #banners:empty{display:none}
@@ -188,6 +193,14 @@ button.tile.go:hover{background:rgba(255,255,255,.7)}
 .grid td .sc{display:flex;align-items:center;min-width:0}
 .grid td .sc .sb,.grid td .sc .tag{flex:none}
 .grid td .sc .u{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-left:4px}
+/* Available to sell: a small photo before the style (Quote Tracker's thumbnails); the Style column a little wider for it. */
+#sellTable.pics td.fz.f-sty,#sellTable.pics th.fz.f-sty{width:240px;min-width:240px;max-width:240px}
+.grid td .pw{display:flex;align-items:center;gap:7px;min-width:0}
+.grid td .pw>.sw{flex:1;min-width:0;overflow:hidden}
+.pic{flex:none;display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:6px;background:rgba(95,108,125,.1)}
+img.pic{object-fit:contain;background:#fff}
+.pic.none{background:transparent;border:1px dashed rgba(95,108,125,.35);color:var(--off);font-size:8.5px;line-height:1.05;text-align:center;white-space:normal}
+.dlbox{display:inline-flex;align-items:center;gap:6px}
 /* One height for every windowed Inventory row, UPC lines (smaller text) included. */
 #invTable tbody tr.r td{line-height:18px}
 button.nb,button.sb{font:inherit;color:var(--accentink);background:none;border:0;padding:0 1px;border-radius:4px;cursor:pointer;font-variant-numeric:tabular-nums;white-space:nowrap}
@@ -247,5 +260,6 @@ button.tag.ov:hover{background:#f6cdc5}
 @media (max-width:760px){.wrap{padding:10px}.health{max-width:100%;white-space:normal}.chip.src{max-width:100%}
   .tiles,#sellTiles{grid-template-columns:repeat(2,minmax(0,1fr))}.fbar input[type=search]{width:100%}select{max-width:48%}
   .grid td.fz.f-sty,.grid th.fz.f-sty{width:150px;min-width:150px;max-width:150px}
+  #sellTable.pics td.fz.f-sty,#sellTable.pics th.fz.f-sty{width:190px;min-width:190px;max-width:190px}
   .panel{top:0;right:0;bottom:0;width:100vw;border-radius:0}}
 .grid td.pt{font-weight:400;font-style:italic;color:var(--muted)}

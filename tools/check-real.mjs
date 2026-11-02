@@ -20,6 +20,10 @@
 // Backlog Qty vs In China (LA POs only). Available to sell is also worked out without the report (as when it's missing),
 // with or without --ats. Its sums, Saul's pull-from date rule and the ready dates are checked lot by lot here, on their
 // own, not with the engine's code.
+// The sales sheet (core/salesSheet.js) on Available to sell with the report: styles on it, left off, by-date rows, no
+// case pack, its sums against Available to sell, and that no factory, customer, PO, container, section or ERP warehouse
+// name is a value in it. --sales-out <file.xlsx>: also writes it, without photos, to that file (never inside this repo:
+// the real numbers stay out of it).
 // --no-reports: the stages without the forwarder and drayage reports, as the page shows them when both are missing;
 // --no-forwarder / --no-drayage: without that one report only (as when it is too old, or fails to read).
 // The Container Tracking section lists come from config.js (run with a stand-in window), as the page passes them;
@@ -27,18 +31,18 @@
 // Exit code 1 when a file is missing or fails to parse (the ATS report too), counts don't add up, the balance is off,
 // Available to sell doesn't add up or breaks a rule, or the PO Book's rules changed. Differences from the ERP are
 // printed, never a failure.
-import { readFileSync, existsSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, statSync, realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { join, resolve, basename } from 'node:path';
-import { loadXLSX, core, root } from '../tests/load.mjs';
+import { join, resolve, basename, dirname, relative, isAbsolute, sep } from 'node:path';
+import { loadXLSX, loadExcelJS, core, root } from '../tests/load.mjs';
 
 const XOPT = { type: 'array', cellFormula: false, cellHTML: false, cellStyles: false };   // as app.js reads files
 const FILES = { msl: 'Master Sheet Live.xlsx', tracker: 'PO Status Tracker.xlsx', ct: 'Container Tracking Sheet.xlsx',
   forwarder: 'Forwarder.xlsx', drayage: 'Drayage.csv' };
-const USAGE = 'Usage: node tools/check-real.mjs <folder> [po-book index.html] [--lists <lists.json>] [--ats <ERP report.xlsx>] [--today yyyy-mm-dd] [--no-reports | --no-forwarder | --no-drayage] [--no-sections]';
+const USAGE = 'Usage: node tools/check-real.mjs <folder> [po-book index.html] [--lists <lists.json>] [--ats <ERP report.xlsx>] [--sales-out <file.xlsx>] [--today yyyy-mm-dd] [--no-reports | --no-forwarder | --no-drayage] [--no-sections]';
 
 // Options take their value after "=" or as the next argument (--ats <file>); the rest are the two paths.
-const VALUED = ['today', 'lists', 'ats'], FLAGS = ['no-reports', 'no-forwarder', 'no-drayage', 'no-sections', 'help'];
+const VALUED = ['today', 'lists', 'ats', 'sales-out'], FLAGS = ['no-reports', 'no-forwarder', 'no-drayage', 'no-sections', 'help'];
 const opt = {}, pos = [];
 for (let i = 2, a = process.argv; i < a.length; i++) {
   if (!a[i].startsWith('--')) { pos.push(a[i]); continue; }
@@ -64,6 +68,18 @@ const today = opt.today ? C.dayFromIso(opt.today) : C.todayNY(Date.now());
 if (today == null) { console.log(`--today ${opt.today} isn't a yyyy-mm-dd date.`); process.exit(2); }
 const listsPath = opt.lists ? resolve(opt.lists) : existsSync(join(folder, 'lists.json')) ? join(folder, 'lists.json') : null;
 const atsPath = opt.ats ? resolve(opt.ats) : null;
+// The sample sales sheet holds real numbers: never written inside this repo (it is public). The real folders are
+// compared, not the paths as typed, so a short (8.3) name, a junction, a link or a mapped drive into the repo is
+// refused too; the folder it goes in must already be there.
+const salesOut = opt['sales-out'] ? resolve(opt['sales-out']) : null;
+if (salesOut) {
+  const real = p => realpathSync.native(p), dir = dirname(salesOut);
+  if (!existsSync(dir) || !statSync(dir).isDirectory()) { console.log(`--sales-out: the folder ${dir} isn't there; make it first.`); process.exit(2); }
+  const target = existsSync(salesOut) ? real(salesOut) : join(real(dir), basename(salesOut));
+  const rel = relative(real(root()), target);
+  if (rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith('..' + sep))) { console.log(`--sales-out ${salesOut} is inside this repo (${target}); write the sample somewhere else (it holds real numbers).`); process.exit(2); }
+  if (!/\.xlsx$/i.test(salesOut)) { console.log(`--sales-out needs a .xlsx file name, not ${basename(salesOut)}.`); process.exit(2); }
+}
 
 let failures = 0;
 const fails = msg => { failures++; console.log(`  FAILED: ${msg}`); };
@@ -414,6 +430,7 @@ if (R) {
 
 // ---------------- the ATS report, read as the page reads it (core/ats.js)
 let atsR = null, atsDayUsed = null;   // the report, and its day (file name, else saved) as the page takes it
+let sellWithAts = null;               // Available to sell with the report, for the sales sheet
 if (atsPath) {
   head(`ATS report (core/ats.js, ${basename(atsPath)})`);
   if (!existsSync(atsPath)) fails(`${atsPath} isn't there`);
@@ -469,7 +486,68 @@ else {
     } catch (e) { fails(`the selling engine stopped: ${e.message}`); continue; }
     if (!S || !S.ok) { fails(`the selling engine gave no numbers (${(S && (S.notLoaded || []).join(', ')) || 'no answer'})`); continue; }
     sellReport(S, R, !run[1]);
+    if (run[1]) sellWithAts = S;
   }
+}
+
+// ---------------- the sales sheet (core/salesSheet.js): what a salesperson may see, from Available to sell with the report
+head('The sales sheet (core/salesSheet.js)');
+if (!sellWithAts) {
+  console.log(`  not worked out: it needs Available to sell with the ATS report${atsPath ? " (the report or the selling engine didn't load, above)" : ' (--ats)'}`);
+  if (salesOut) fails('the sample sales sheet was not written: there is no sheet without the ATS report');
+} else await salesReport(sellWithAts, R);
+
+// The sheet's counts and sums against Available to sell, the fields each row holds, and no name that stays inside as a
+// value in it; with --sales-out, the file written without photos and read back. Numbers only.
+async function salesReport(S, R) {
+  const SS = core('salesSheet');
+  let sheet;
+  try { sheet = SS.salesRows(S, { today }); } catch (e) { fails(`the sales sheet stopped: ${e.message}`); return; }
+  if (!sheet.ok) { fails(`no sales sheet: ${sheet.reason}`); return; }
+  const k = sheet.counts, rows = sheet.rows, sum = (a, f) => a.reduce((p, x) => p + (f(x) || 0), 0);
+  console.log(`  styles on the sheet ${n(k.styles)} · left off (nothing available) ${n(k.leftOff)} · by-date rows ${n(k.byDateRows)} · no case pack ${n(k.noCasePack)} · mixed case pack ${n(k.mixedCasePack)}`);
+  sumLine('styles in Available to sell', S.styles.length, [['on the sheet', k.styles], ['left off', k.leftOff]]);
+  for (const [f, label] of [['now', 'Available now'], ['fromChina', 'Available from China'], ['arriving', 'Arriving'], ['total', 'Total available']]) {
+    const a = sum(rows, r => r[f]), b = S.totals[f];
+    console.log(`  ${label.padEnd(22)} ${n(a).padStart(12)} units on the sheet · ${n(b).padStart(12)} in Available to sell   same: ${a === b ? 'yes' : 'NO'}`);
+    if (a !== b) fails(`the sales sheet's ${label} (${n(a)}) isn't Available to sell's (${n(b)})`);
+  }
+  const byWhere = {};
+  for (const r of sheet.byDate) byWhere[r.where] = (byWhere[r.where] || 0) + r.units;
+  const schedOk = sum(rows, r => r.total) === sum(sheet.byDate, r => r.units);
+  console.log(`  by date: ${Object.entries(byWhere).map(([w, u]) => `${w} ${n(u)}`).join(' · ')} = ${n(sum(sheet.byDate, r => r.units))} units, the sheet's total: ${schedOk ? 'yes' : 'NO'}` +
+    ` · no date yet ${n(sheet.byDate.filter(r => r.when == null).length)} rows · estimates ${n(sheet.byDate.filter(r => r.estimate).length)} rows`);
+  if (!schedOk) fails("the sales sheet's schedule doesn't add up to its total");
+  const cases = f => rows.filter(r => r[f] != null).length;
+  console.log(`  rows with cases: now ${n(cases('nowCases'))} · from China ${n(cases('fromChinaCases'))} · arriving ${n(cases('arrivingCases'))} · total ${n(cases('totalCases'))} (blank, never guessed, where the case pack is unknown or mixed)`);
+  console.log(`  first date from China: now ${n(rows.filter(r => r.firstFromChina.now).length)} · about (an estimate) ${n(rows.filter(r => r.firstFromChina.estimate).length)} · a date ${n(rows.filter(r => r.firstFromChina.date != null && !r.firstFromChina.now && !r.firstFromChina.estimate).length)}`);
+  // Only the fields the sheet may hold, on every row.
+  const KEYS = 'style,upc,desc,casePack,now,nowCases,fromChina,fromChinaCases,firstFromChina,arriving,arrivingCases,firstArrival,total,totalCases,photoKey';
+  const odd = rows.filter(r => Object.keys(r).join() !== KEYS).length + sheet.byDate.filter(r => Object.keys(r).join() !== 'style,desc,when,estimate,where,units,cases').length;
+  console.log(`  every row holds only the sheet's fields: ${odd ? 'NO' : 'yes'}`);
+  if (odd) fails(`${n(odd)} rows of the sales sheet hold other fields`);
+  // No name that stays inside is a whole value in it (factories, customers, POs, containers, sections, the ERP's warehouses).
+  const inside = new Map();
+  const put = (kind, v) => { const t = C.S(v).toLowerCase(); if (t.length > 1 && !inside.has(t)) inside.set(t, kind); };
+  for (const a of R.allocs) { put('factory', a.factory); put('customer', a.customer); put('PO', a.po); put('PO', a.poShown); put('section', a.section); for (const x of [].concat(a.containers || [])) put('container', x); }
+  for (const l of S.lots) { put('factory', l.factory); put('customer', l.customer); put('PO', l.po); put('ERP warehouse', l.warehouse); }
+  if (atsR) for (const e of atsR.styles.values()) for (const w of e.warehouses || []) put('ERP warehouse', w);
+  const texts = [...rows.flatMap(r => [r.style, r.upc, r.desc, ...r.upc.split(', ')]), ...sheet.byDate.flatMap(r => [r.style, r.desc, r.where])].map(v => C.S(v).toLowerCase());
+  const hits = {};
+  for (const t of texts) if (inside.has(t)) hits[inside.get(t)] = (hits[inside.get(t)] || 0) + 1;
+  console.log(`  no factory, customer, PO, container, section or ERP warehouse name is a value in it (${n(texts.length)} text values against ${n(inside.size)} names): ${Object.keys(hits).length ? 'NO' : 'yes'}`);
+  if (Object.keys(hits).length) fails(`the sales sheet holds names that stay inside: ${Object.entries(hits).map(([kd, c]) => `${kd} ${c}`).join(', ')}`);
+  if (!salesOut) { console.log('  (no --sales-out: no sample file written)'); return; }
+  // The sample, without photos, read back as Excel reads it: both tabs, every row, no picture, made by Shalam Tool.
+  const t0 = performance.now();
+  const bytes = await SS.workbookBytes(SS.buildWorkbook(loadExcelJS(), sheet, null));
+  writeFileSync(salesOut, bytes);
+  const back = readBook(new Uint8Array(readFileSync(salesOut)), {});
+  const ws = back.Sheets[SS.TABS.sell], wd = back.Sheets[SS.TABS.byDate];
+  const nRows = ws && ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']).e.r + 1 : 0, nDates = wd && wd['!ref'] ? XLSX.utils.decode_range(wd['!ref']).e.r + 1 : 0;
+  const whole = back.SheetNames.join('|') === `${SS.TABS.sell}|${SS.TABS.byDate}` && nRows === rows.length + 2 && nDates === sheet.byDate.length + 1;
+  console.log(`  sample written without photos: ${salesOut} · ${n(bytes.length)} bytes in ${secs(t0)} · read back: tabs ${back.SheetNames.join(', ')}, ${n(nRows - 2)} style rows, ${n(nDates - 1)} by-date rows: ${whole ? 'yes' : 'NO'}`);
+  if (!whole) fails('the sample sales sheet did not read back whole');
 }
 
 // The checks the reconciliation can't make (a unit counted twice, or dropped, still adds up), worked out here from the

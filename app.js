@@ -1,8 +1,10 @@
 // Shalam Tool: sign-in, reading every source from SharePoint, the source chips, the failure rules, the error email,
-// what can be sold (Available to sell: stock after customer orders, and goods from China with one date each), where
-// the goods are (Where it is and Pull from China tabs, the side panel) and the Problems tab. Parsing, the stage rules
-// and the selling rules live in core/*.js; this file fetches, calls them and draws.
-// The page is read-only: the one request it makes that isn't a GET is the error email (POST /me/sendMail).
+// what can be sold (Available to sell: stock after customer orders, and goods from China with one date each, with a
+// photo per style), where the goods are (Where it is and Pull from China tabs, the side panel), the Problems tab, and
+// the sales sheet (core/salesSheet.js: saved into Shalam Sales tool after a clean load, and the Download button).
+// Parsing, the stage rules and the selling rules live in core/*.js; this file fetches, calls them and draws.
+// The page only reads, except the error email and saving the sales sheet into the one library in config.js (the request
+// guard below refuses anything else before it leaves the page).
 (function () {
   'use strict';
 
@@ -139,6 +141,8 @@
     'no-report-day': "The ATS report's date isn't known (nothing called received or landed)",
     // what one of the ATS report's In Trans shipments is to our sheets
     'erp-ours-sailed': 'Ours on the water or at port (counted here, once)', 'erp-off-china': 'Left China per the ATS report: taken off our lots still in China',
+    // the sales sheet (its photos, and saving it into Shalam Sales tool)
+    'no-photo': 'No photo in Quote Images', 'photo-error': "Photos couldn't be read", 'not-saved': 'Sales sheet not saved',
   };
   // The same code from another file, where its words differ (the ATS report's rows aren't product lines).
   const SOURCE_LABELS = { 'ATS report': { 'no-style': 'Row with no style' } };
@@ -274,7 +278,8 @@
       return new Promise(() => {});
     }
   }
-  // Every token is checked before it is used: one that allows changes, or can't read SharePoint, stops the page (.stop).
+  // Every token is checked before it is used: one that allows other changes than saving the sales sheet, or can't read
+  // SharePoint, stops the page (.stop).
   // A cached token may predate a change in Entra, so a bad one is renewed once before stopping.
   async function token(force) {
     let r = await rawToken(force), bad = scopeProblem(r);
@@ -283,10 +288,15 @@
     return r.accessToken;
   }
 
-  // Shalam Tool must be read-only. Mail.Send (the error email) is the one permission allowed that isn't a read.
+  // Shalam Tool only reads, except the error email and saving the sales sheet into the one library in config.js. Two
+  // permissions are allowed that aren't a read: Mail.Send (the error email) and exactly Lists.SelectedOperations.Selected
+  // (saving the sales sheet: it can write only to the libraries opened to Shalam Tool one by one, and turns saving on).
+  // The sign-in never asks for it (asking for a permission not consented yet breaks sign-in for everyone); once it's
+  // consented in Entra, Graph tokens carry it anyway.
   // The permissions come from the token's scp claim; Microsoft calls Graph tokens opaque, so if one can't be read,
   // from the list the sign-in service returned with it (MSAL's scopes). The same rules apply to either.
   const OIDC = /^(openid|profile|email|offline_access)$/i;
+  const SALES_SCOPE = /^Lists\.SelectedOperations\.Selected$/i;
   // A plain read: one part of its name is Read or ReadBasic (User.Read, Sites.Read.All, Mail.ReadBasic).
   const isRead = x => x.split('.').some(p => /^Read(Basic)?$/i.test(p));
   function scopeProblem(res) {
@@ -296,23 +306,109 @@
       scp = JSON.parse(atob(p.replace(/-/g, '+').replace(/_/g, '/'))).scp;
     } catch (e) { /* not readable: the sign-in service's list below */ }
     if (typeof scp !== 'string' && res && Array.isArray(res.scopes) && res.scopes.length) scp = res.scopes.join(' ');
-    if (typeof scp !== 'string') return "Shalam Tool couldn't read which permissions its sign-in has, so it can't make sure it is read-only and doesn't load anything. Click Sign in again; if this keeps happening, tell Saul.";
+    if (typeof scp !== 'string') return "Shalam Tool couldn't read which permissions its sign-in has, so it can't make sure it only reads and doesn't load anything. Click Sign in again; if this keeps happening, tell Saul.";
     const list = scp.split(/\s+/).filter(Boolean);
     // Anything with Write, Manage or FullControl in it, and anything else that isn't a plain read: Sites.Selected and
-    // the *.SelectedOperations.Selected permissions name no Write but can carry write access.
-    const writes = list.filter(x => !/^Mail\.Send$/i.test(x) && (/Write|Manage|FullControl/i.test(x) || !(isRead(x) || OIDC.test(x))));
-    if (writes.length) return `Shalam Tool must be read-only, but its sign-in still allows changes to SharePoint (${writes.join(', ')}). In Entra, remove that permission from the Shalam Tool app and grant consent again.`;
+    // the other *.SelectedOperations.Selected permissions name no Write but can carry write access.
+    const writes = list.filter(x => !/^Mail\.Send$/i.test(x) && !SALES_SCOPE.test(x) && (/Write|Manage|FullControl/i.test(x) || !(isRead(x) || OIDC.test(x))));
+    if (writes.length) return `Shalam Tool may only read (apart from the error email and saving the sales sheet), but its sign-in still allows changes to SharePoint (${writes.join(', ')}). In Entra, remove that permission from the Shalam Tool app and grant consent again.`;
     if (!list.some(x => /^Sites\.Read\.All$/i.test(x))) return `Shalam Tool's sign-in is missing the Sites.Read.All permission (it has: ${list.join(', ') || 'none'}), so it can't read SharePoint. In Entra, add Sites.Read.All to the Shalam Tool app and grant consent again.`;
     mailScopeMissing = !list.some(x => /^Mail\.Send$/i.test(x));
+    salesScopeMissing = !list.some(x => SALES_SCOPE.test(x));
     return '';
+  }
+
+  // ---------- what may leave the page ----------
+  // Every request is checked here before it is sent, by g() (with the sign-in token) and fetchRetry() (without):
+  // - any GET;
+  // - POST /me/sendMail (the error email);
+  // - POST /$batch when every request in it is a GET with no body (checked in the body about to be sent);
+  // - POST exactly /drives/<the sales library>/root:/<salesFile>:/createUploadSession, the library being the one
+  //   config.js's salesLibrary resolves to (salesDrive below), the file name exactly config.js's salesFile;
+  // - a PUT with no sign-in token, only to the upload address that session returned, on *.sharepoint.com.
+  // Anything else is refused before it leaves the page. Only salesDrive() and uploadSession() set what the last two allow.
+  const allowed = { salesDrive: '', upload: '' };
+  const salesFileName = () => String(CFG.salesFile || '').trim();
+  const sessionPath = () => (allowed.salesDrive && salesFileName() ? `/drives/${allowed.salesDrive}/root:/${encPath(salesFileName())}:/createUploadSession` : '');
+  const onSharePoint = u => { try { const x = new URL(u); return x.protocol === 'https:' && /^[a-z0-9-]+(\.[a-z0-9-]+)*\.sharepoint\.com$/i.test(x.hostname); } catch (e) { return false; } };
+  // Why a request may not be sent ('' when it may). graph: through g(), which adds the sign-in token.
+  function refusal(method, url, opt, graph) {
+    const m = String(method || 'GET').toUpperCase(), u = String(url || '');
+    const no = what => `Shalam Tool only reads (apart from the error email and saving the sales sheet), so it refused ${what}.`;
+    if (m === 'GET') return '';
+    const path = u.startsWith(GRAPH + '/') ? u.slice(GRAPH.length) : u;
+    if (graph && m === 'POST') {
+      if (path === '/me/sendMail') return '';
+      if (path === '/$batch') {
+        let body = null;
+        try { body = typeof (opt && opt.body) === 'string' ? JSON.parse(opt.body) : null; } catch (e) { body = null; }
+        const reqs = body && Array.isArray(body.requests) ? body.requests : null;
+        if (reqs && reqs.length && reqs.every(x => x && typeof x === 'object' && String(x.method || '').toUpperCase() === 'GET' && x.body == null)) return '';
+        return no("a batch with a request in it that isn't a GET");
+      }
+      if (sessionPath() && path === sessionPath()) return '';
+      return no(`a POST to ${path.split('?')[0]}`);
+    }
+    if (!graph && m === 'PUT') {
+      const auth = opt && opt.headers && Object.keys(opt.headers).some(k => /^authorization$/i.test(k));
+      if (allowed.upload && u === allowed.upload && onSharePoint(u) && !auth) return '';
+      return no("a PUT that isn't to the sales sheet's upload address");
+    }
+    return no(`a ${m} request`);
+  }
+  // The sales sheet's library (config.js salesLibrary, a /sites/<site>/<library>), found the way a source's library is
+  // (by its address, else its name): the one library the page may save into. Answers its drive id, or '' when
+  // salesLibrary is blank (saving is off). A library the account can't open isn't listed on its site: that is the same
+  // as no right to save to it (.cantSee: said, not red; the site itself not found stays red).
+  async function salesDrive(signal) {
+    allowed.salesDrive = '';
+    const text = String(CFG.salesLibrary || '').trim();
+    if (!text) return '';
+    const loc = readLocation(text);
+    if (!loc || loc.kind !== 'path' || pathParts(loc).length !== 3) throw problem("can't read the location", `salesLibrary in config.js ("${text}") isn't a /sites/<site>/<library>.`);
+    try {
+      allowed.salesDrive = await pathDrive(loc, { name: 'the sales sheet' }, signal);
+    } catch (e) {
+      if (e && e.noLibrary) throw problem('no access', `Your account can't see ${pathParts(loc)[2]} on /sites/${pathParts(loc)[1]} (or salesLibrary in config.js names it wrongly), so the sales sheet isn't saved from here.`, { cantSee: true });
+      throw e;
+    }
+    return allowed.salesDrive;
+  }
+  // A new upload session for the sales sheet in that library, replacing the file: answers its upload address, the one
+  // place a PUT may then go (with no sign-in token: the address carries its own key).
+  async function uploadSession(signal) {
+    allowed.upload = '';
+    const path = sessionPath();
+    if (!path) throw new Error("The sales sheet's library or file name isn't known, so it can't be saved.");
+    const j = await gj(path, { method: 'POST', signal, body: JSON.stringify({ item: { '@microsoft.graph.conflictBehavior': 'replace' } }) });
+    const u = j && j.uploadUrl;
+    if (!onSharePoint(u)) throw new Error("SharePoint didn't give an upload address on SharePoint for the sales sheet, so it wasn't saved.");
+    allowed.upload = u;
+    return u;
+  }
+  // ExcelJS (vendor/exceljs) writes the sales sheet: loaded the first time a sheet is built, not at the start.
+  let excelLoading = null;
+  function loadExcelJS() {
+    if (window.ExcelJS) return Promise.resolve(window.ExcelJS);
+    if (!excelLoading) {
+      excelLoading = new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = 'vendor/exceljs/exceljs.min.js';
+        s.onload = () => (window.ExcelJS ? resolve(window.ExcelJS) : reject(new Error("The Excel library loaded but didn't start.")));
+        s.onerror = () => reject(new Error("The Excel library (vendor/exceljs) didn't load. Check the connection and try again."));
+        document.head.appendChild(s);
+      }).catch(e => { excelLoading = null; throw e; });
+    }
+    return excelLoading;
   }
 
   // ---------- Graph ----------
   // 401: new token once. 429/503: wait for Retry-After, up to 3 times. Errors carry .status.
-  // Read-only: a GET, or the one POST that sends the error email. Anything else is refused before it leaves the page.
+  // Every request goes past the guard above first: anything it refuses never leaves the page.
   async function g(url, opt = {}, tries = { auth: 0, busy: 0 }) {
     const method = String(opt.method || 'GET').toUpperCase();
-    if (method !== 'GET' && !(method === 'POST' && url === '/me/sendMail')) throw new Error(`Shalam Tool is read-only, so it refused a ${method} request.`);
+    const refused = refusal(method, url, opt, true);
+    if (refused) throw new Error(refused);
     const t = await token(tries.auth > 0);
     const headers = { Authorization: 'Bearer ' + t, ...(typeof opt.body === 'string' ? { 'Content-Type': 'application/json' } : {}), ...(opt.headers || {}) };
     const r = await fetch(/^https?:/.test(url) ? url : GRAPH + url, { ...opt, headers });
@@ -332,8 +428,11 @@
     }
     return r;
   }
-  // A plain fetch (download links carry their own key) that waits out 429/503 like g(), up to 3 times.
+  // A plain fetch (download links and the upload address carry their own key) that waits out 429/503 like g(), up to 3
+  // times. The guard above checks it first.
   async function fetchRetry(url, opt) {
+    const refused = refusal(opt && opt.method, url, opt, false);
+    if (refused) throw new Error(refused);
     for (let busy = 0; ; busy++) {
       const r = await fetch(url, opt);
       if ((r.status !== 429 && r.status !== 503) || busy >= 3) return r;
@@ -413,6 +512,7 @@
   }
   const pathParts = loc => loc.path.split('/').filter(Boolean);
   // The library a /sites/<site>/<library>/<path> is in: the site, then the library matched by the end of its webUrl.
+  // A library the signed-in account can't open isn't among the site's libraries at all (.noLibrary).
   async function pathDrive(loc, src, signal) {
     const parts = pathParts(loc), site = parts[1], lib = parts[2];
     let sid;
@@ -423,7 +523,7 @@
     }
     const drives = await gAll(`/sites/${sid}/drives?$select=id,name,webUrl`, signal);
     const d = drives.find(x => tail(x.webUrl).toLowerCase() === lib.toLowerCase()) || drives.find(x => String(x.name || '').toLowerCase() === lib.toLowerCase());
-    if (!d) throw problem('not found', `No library called "${lib}" on /sites/${site}. Its libraries: ${drives.map(x => tail(x.webUrl)).join(', ') || 'none'}.`);
+    if (!d) throw problem('not found', `No library called "${lib}" on /sites/${site}. Its libraries: ${drives.map(x => tail(x.webUrl)).join(', ') || 'none'}.`, { noLibrary: true });
     return d.id;
   }
   async function pathItem(driveId, loc, signal) {
@@ -537,9 +637,10 @@
   let loading = null, timer = null, due = false, again = false, lastLoaded = null, fatal = '', tab = 'sell';
   let fatalAuth = false;   // the fatal message asks to sign in again
   let cycleDone = false;   // a load cycle has ended (finished, cancelled or failed)
-  let scopeFatal = '';     // the sign-in isn't read-only, or can't read SharePoint: nothing loads until it's fixed
+  let scopeFatal = '';     // the sign-in allows more than reading (and saving the sales sheet), or can't read SharePoint: nothing loads until it's fixed
   let copyCheck = null;   // null: not known · true: same rules as the PO Book · false: the PO Book's rules changed
   let mailScopeMissing = false;
+  let salesScopeMissing = true;   // the sign-in has no Lists.SelectedOperations.Selected (the Entra step isn't done): saving is off
   const mailMemo = new Map();   // source|day -> what happened to its email, in this page session
   // Parsed results, kept for the stage and selling numbers.
   const data = { po: null, ct: null, forwarder: null, drayage: null, upc: null, ats: null };
@@ -547,7 +648,7 @@
   // Once the page has stopped over its sign-in permissions, a reader finishing late shows nothing.
   function showLoading(k) { if (scopeFatal) return; st[k] = { ...(st[k] || fresh(k)), state: 'load' }; renderSources(); }
   function commit(k, s) { if (scopeFatal) return; st[k] = s; renderSources(); }
-  // Errors that end the whole cycle rather than one source: Cancel, the sign-in, or a token that isn't read-only.
+  // Errors that end the whole cycle rather than one source: Cancel, the sign-in, or a token that allows other changes.
   const cycleError = e => isAbort(e) || !!(e && (e.auth || e.stop));
   async function attempt(s, fn) {
     try { return await fn(); }
@@ -983,6 +1084,13 @@
     "doesn't add up": "Open the report and check its rows against its Grand Total row (it may have been cut short or edited); save a fresh copy from the ERP into the folder.",
   };
   function nextStep(src, s, user) {
+    // The sales sheet: by what stopped it (s.why), since its own label always says "not saved".
+    if (src.k === 'sales') {
+      if (s.why === "can't read the location") return 'Fix salesLibrary in config.js.';
+      if (s.why === 'not found') return 'Check salesLibrary in config.js: its site and library must still be there under those names.';
+      if (s.why === 'photos') return 'Check Quote Images and its thumb folder are still where photos in config.js says (moved or renamed?), or fix photos in config.js. Until then Save anyway on the Sales sheet status saves it without photos.';
+      return "Open Shalam Tool: the Sales sheet status says what failed. It tries again after the next clean load (every 5 minutes while the page is open), or click Save now on it.";
+    }
     if (s.label === 'link refused') return `Check ${user} can open the file. If they can, the read-only sign-in can't use sharing links: replace the link in config.js with the file's /sites/<site>/<library>/<path> location.`;
     // The lists' names are in the page itself, not in config.js.
     if (src.kind === 'list' && s.label === 'no access') return `Give ${user} access to the Production site.`;
@@ -1000,6 +1108,7 @@
         : 'Stock and customer orders on Available to sell come from this report: until it\'s fixed, Available now says "not loaded" and customer orders aren\'t taken off the goods from China.';
     }
     if (src.k === 'upc') return "Styles can't be matched to their UPCs until it's fixed.";
+    if (src.k === 'sales') return `The salesperson's ${s.file || 'sales sheet'} in Shalam Sales tool keeps its last good copy until it saves again.`;
     return '';
   }
   function mailBody(src, s, to) {
@@ -1062,33 +1171,37 @@
   // The email step isn't stopped by Cancel (stopping between the mark and the send would mean no email today), so
   // Cancel is hidden while it runs; the send has a time limit instead, so a stalled request can't hold the page.
   async function emailProblems(today) {
-    const to = String(CFG.errorEmailTo || '').trim();
-    const name = to ? recipientName(to) : '';
-    const day = window.InvCommon.isoDay(today);
     for (const src of SOURCES) {
       const s = st[src.k];
       if (!s || !s.mailProblem || (s.state !== 'err' && s.state !== 'warn')) continue;
-      if (!to) { s.mail = { state: 'none', text: 'No error email address is set in config.js, so nobody is emailed about this.' }; continue; }
-      const memo = src.k + '|' + day;
-      if (mailMemo.has(memo)) { s.mail = mailMemo.get(memo); continue; }
-      let mail;
-      if (!claimMail(day, src.k)) {
-        mail = { state: 'already', text: `${name} was already emailed about ${src.name} today.` };
-      } else {
-        setBusy(`Emailing ${name} about ${src.name}… (finishes in a moment)`, true);
-        try {
-          await g('/me/sendMail', { method: 'POST', signal: timed(null, 30000), body: JSON.stringify(mailBody(src, s, to)) });
-          mail = { state: 'sent', text: `${name} has been emailed about this.` };
-          toast(`${name} has been emailed about ${src.name}.`, 6000);
-        } catch (e) {
-          if (cycleError(e)) { store.del(`mailed:${day}:${src.k}`); mailedNow.delete(`mailed:${day}:${src.k}`); throw e; }
-          mail = { state: 'failed', text: `Emailing ${name} failed: ${mailFailText(e)} Tell ${name} about the problem above.` };
-          // A later visit can try again; this page session doesn't (the memo below), so a failing mailbox isn't retried every 5 minutes.
-          store.del(`mailed:${day}:${src.k}`);
-        }
-      }
-      mailMemo.set(memo, mail); s.mail = mail;
+      await emailOne(src, s, today);
     }
+  }
+  // One source's email (the sales sheet's too, when saving it fails), by the rules above.
+  async function emailOne(src, s, today) {
+    const to = String(CFG.errorEmailTo || '').trim();
+    const name = to ? recipientName(to) : '';
+    const day = window.InvCommon.isoDay(today);
+    if (!to) { s.mail = { state: 'none', text: 'No error email address is set in config.js, so nobody is emailed about this.' }; return; }
+    const memo = src.k + '|' + day;
+    if (mailMemo.has(memo)) { s.mail = mailMemo.get(memo); return; }
+    let mail;
+    if (!claimMail(day, src.k)) {
+      mail = { state: 'already', text: `${name} was already emailed about ${src.name} today.` };
+    } else {
+      setBusy(`Emailing ${name} about ${src.name}… (finishes in a moment)`, true);
+      try {
+        await g('/me/sendMail', { method: 'POST', signal: timed(null, 30000), body: JSON.stringify(mailBody(src, s, to)) });
+        mail = { state: 'sent', text: `${name} has been emailed about this.` };
+        toast(`${name} has been emailed about ${src.name}.`, 6000);
+      } catch (e) {
+        if (cycleError(e)) { store.del(`mailed:${day}:${src.k}`); mailedNow.delete(`mailed:${day}:${src.k}`); throw e; }
+        mail = { state: 'failed', text: `Emailing ${name} failed: ${mailFailText(e)} Tell ${name} about the problem above.` };
+        // A later visit can try again; this page session doesn't (the memo below), so a failing mailbox isn't retried every 5 minutes.
+        store.del(`mailed:${day}:${src.k}`);
+      }
+    }
+    mailMemo.set(memo, mail); s.mail = mail;
   }
 
   // ---------- the load cycle ----------
@@ -1106,7 +1219,8 @@
     return read;
   }
 
-  // The sign-in isn't read-only, or can't read SharePoint: nothing is shown as read, and nothing more is requested.
+  // The sign-in allows other changes (than saving the sales sheet), or can't read SharePoint: nothing is shown as read,
+  // and nothing more is requested.
   function stopAll() {
     fatal = scopeFatal; fatalAuth = true;
     st = {};
@@ -1115,6 +1229,8 @@
     stages = null; stageErr = ''; idx = null;
     sell = null; sellErr = ''; sx = null;
     lastLoaded = null;
+    if (salesCtl) salesCtl.abort();
+    setSales({ state: 'off', label: 'not read', short: 'see the red banner', message: 'Not saved: Shalam Tool stopped because of its sign-in permissions (see the red banner).' }, true);
   }
 
   async function loadAll(force) {
@@ -1126,6 +1242,7 @@
     const before = { ...st };
     const today = window.InvCommon.todayNY(Date.now());
     fatal = ''; fatalAuth = false;
+    photoCycle++; photoErr = ''; photoErrStatus = 0;   // styles with no photo, and a photo store that couldn't be read, are looked at again
     setBusy('Connecting to SharePoint…');
     try {
       // Master Sheet Live, the tracker and Container Tracking first; UPC_MASTER last.
@@ -1168,6 +1285,8 @@
       if (scopeFatal) { stages = null; stageErr = ''; idx = null; sell = null; sellErr = ''; sx = null; } else buildStages(today);
       try { markNew(); } catch (e) { console.error(e); }
       renderAll();
+      // The sales sheet: saved when this load was clean (or says why not); its photos looked up for Problems.
+      if (!scopeFatal) salesAfterLoad(today);
       if (again) { again = false; loadAll(true); }
     }
   }
@@ -1197,7 +1316,8 @@
     const s = st[src.k] || fresh(src.k);
     const label = s.state === 'ok' && !s.stale ? '' : statusWord(s);
     const mailBad = s.mail && s.mail.state === 'failed';
-    const line2 = [s.savedAt ? 'saved ' + fmtShort(s.savedAt) : '', s.savedBy, readCounted(s)].filter(Boolean).join(' · ') || s.short || '';
+    // No person's name on the chip itself (Saul, Nov 2): who saved it is in its tooltip and on Problems.
+    const line2 = [s.savedAt ? 'saved ' + fmtShort(s.savedAt) : '', readCounted(s)].filter(Boolean).join(' · ') || s.short || '';
     const tip = [src.name, s.file,
       s.savedAt ? 'Saved ' + fmtLong(s.savedAt) + (s.savedBy ? ' by ' + s.savedBy : '') : '',
       readCounted(s), s.state === 'ok' ? '' : s.message, s.stale ? `Not refreshed: this is what was read ${fmtShort(new Date(s.stale).toISOString())}.` : '',
@@ -1209,7 +1329,18 @@
   }
   function renderChips() {
     const el = $('chips');
-    el.innerHTML = `<div class="grp" title="Read together, as the PO Book reads them: if one fails, the stage numbers stop."><span class="gl">PO Book</span>${SOURCES.filter(x => x.group).map(chipHtml).join('')}</div>${SOURCES.filter(x => !x.group).map(chipHtml).join('')}`;
+    el.innerHTML = `<div class="grp" title="Read together, as the PO Book reads them: if one fails, the stage numbers stop."><span class="gl">PO Book</span>${SOURCES.filter(x => x.group).map(chipHtml).join('')}</div>${SOURCES.filter(x => !x.group).map(chipHtml).join('')}${salesChipHtml()}`;
+  }
+  // The sales sheet's status, after the sources: saved, up to date, checking or saving (with Cancel), not saved (why,
+  // with Save anyway or Save now), or off. Never a person's name.
+  function salesChipHtml() {
+    const s = sales, mailBad = s.mail && s.mail.state === 'failed';
+    const btn = s.busy ? '<button type="button" class="ghost" data-sales="cancel" title="Stop saving: the file in Shalam Sales tool stays as it was">Cancel</button>'
+      : s.can ? `<button type="button" class="ghost" data-sales="save">${s.can === 'anyway' ? 'Save anyway' : 'Save now'}</button>` : '';
+    const tip = [SALES.name, s.file, s.message, s.mail ? s.mail.text : '', s.webUrl ? 'Click its name to open it on SharePoint.' : ''].filter(Boolean).join('\n');
+    const name = s.webUrl ? `<a href="${esc(s.webUrl)}" target="_blank" rel="noopener"><b>${esc(SALES.name)}</b></a>` : `<b>${esc(SALES.name)}</b>`;
+    return `<span class="chip src sales ${s.state}" id="chip-sales" data-state="${s.state}" title="${esc(tip)}"><span class="dot"></span><span class="ct"><span class="l1">${name}` +
+      `${s.label ? `<em>${esc(s.label)}</em>` : ''}${mailBad ? '<em>· email failed</em>' : ''}</span>${s.short ? `<small>${esc(s.short)}</small>` : ''}</span>${btn}</span>`;
   }
 
   function cardHtml(src) {
@@ -1346,6 +1477,13 @@
         `${s.headers ? `<div class="hd">Headers seen: ${esc(s.headers)}</div>` : ''}` +
         `${s.mail ? `<div class="ml ${s.mail.state === 'failed' ? 'bad' : ''}">${esc(s.mail.text)}</div>` : ''}</td></tr>`;
     }
+    // The sales sheet: the file in Shalam Sales tool, when and by whom it was last saved, styles and photos in it.
+    const s = sales;
+    const file = s.file ? (s.webUrl ? `<a href="${esc(s.webUrl)}" target="_blank" rel="noopener">${esc(s.file)}</a>` : esc(s.file)) : '';
+    h += `<tr id="srow-sales"><td class="nw fz"><b>${esc(SALES.name)}</b></td><td class="nw">${file}</td><td class="nw">${esc(fmtLong(s.savedAt))}</td>` +
+      `<td class="nw">${esc(s.savedBy)}</td><td class="num">${fmtN(s.styles)}</td><td class="num">${fmtN(s.pics)}</td>` +
+      `<td class="nw"><span class="pill ${s.state}">${esc(s.label || (s.state === 'ok' ? 'ok' : ''))}</span></td><td class="msg">${esc(s.message)}` +
+      `${s.mail ? `<div class="ml ${s.mail.state === 'failed' ? 'bad' : ''}">${esc(s.mail.text)}</div>` : ''}</td></tr>`;
     $('srcTable').innerHTML = h + '</tbody>';
   }
 
@@ -1355,7 +1493,7 @@
   // every parser's, by source (the ATS report's under "ATS report").
   const stageIssues = () => (stages && stages.ok ? [...(stages.issues || []).map(i => normIssue('Incoming', i)), ...pageIssues] : []);
   const sellIssues = () => (sell && sell.ok ? [...(sell.issues || []).map(i => normIssue(SELL_SRC, { ...i, source: SELL_SRC })), ...sellPageIssues] : []);
-  const allIssues = () => [...stageIssues(), ...sellIssues(), ...SOURCES.flatMap(x => (st[x.k] && st[x.k].state !== 'load' ? st[x.k].issues : []))];
+  const allIssues = () => [...stageIssues(), ...sellIssues(), ...salesIssues(), ...SOURCES.flatMap(x => (st[x.k] && st[x.k].state !== 'load' ? st[x.k].issues : []))];
 
   // A problem marked checked is kept in this browser only, under inv:checked:<source>:<code>:<po>:<style>:<row>, with
   // its message: it comes back when the message changes. With storage blocked the mark lasts for this page session.
@@ -1430,7 +1568,7 @@
       if (!groups.has(i.source)) groups.set(i.source, []);
       groups.get(i.source).push({ i, ck, nw: newSet.has(issHash(i)) });
     }
-    const order = ['Incoming', SELL_SRC, 'ATS report', ...SOURCES.map(x => x.name)];
+    const order = ['Incoming', SELL_SRC, SALES.name, 'ATS report', ...SOURCES.map(x => x.name)];
     const names = [...groups.keys()].sort((a, b) => ((order.indexOf(a) + 1) || 99) - ((order.indexOf(b) + 1) || 99) || a.localeCompare(b));
     let h = '<thead><tr><th class="fz">What</th><th>Sheet</th><th class="num">Row / item</th><th>PO</th><th>Style</th><th>Message</th></tr></thead><tbody>';
     let matched = 0;
@@ -1463,7 +1601,7 @@
     $('pqCheckedWrap').hidden = !nChecked && !showChecked;
     $('nChecked').textContent = fmtN(nChecked);
     $('cProb').textContent = fmtN(open);
-    document.querySelector('#tabs .tab.iss').classList.toggle('bad', SOURCES.some(x => st[x.k] && st[x.k].state === 'err') || !!stageErr || !!sellErr || balanceBad() || sellBalanceBad());
+    document.querySelector('#tabs .tab.iss').classList.toggle('bad', SOURCES.some(x => st[x.k] && st[x.k].state === 'err') || !!stageErr || !!sellErr || balanceBad() || sellBalanceBad() || sales.state === 'err');
   }
   function renderProblems() { renderSrcTable(); renderBalance(); renderIssues(); }
 
@@ -1499,7 +1637,7 @@
     else if (t === 'pull') $('tab-pull').insertBefore(fbar, $('pullPane'));
     fbar.hidden = t === 'problems';
     $('fStage').hidden = $('fType').hidden = t === 'sell';
-    $('fAvailWrap').hidden = t !== 'sell';
+    $('fAvailWrap').hidden = $('salesDl').hidden = t !== 'sell';
     $('fq').placeholder = t === 'sell' ? 'Search style, UPC, description…' : 'Search style, UPC, description, PO…';
     $('fq').setAttribute('aria-label', t === 'sell' ? 'Search style, UPC or description' : 'Search style, UPC, description or PO');
     $('btnClearF').hidden = !filtersOn();
@@ -1735,7 +1873,8 @@
       // Measured on a main row (a UPC line under a style is drawn to the same height by app.css, but a style row is the reference).
       const tr = body().querySelector('tr.r:not(.upc)') || body().querySelector('tr.r');
       const rh = tr ? tr.getBoundingClientRect().height : 0;
-      if (rh > 0 && Math.abs(rh - v.rowH) > 0.5 && (depth || 0) < 2) { v.rowH = rh; draw(true, (depth || 0) + 1); }
+      if (rh > 0 && Math.abs(rh - v.rowH) > 0.5 && (depth || 0) < 2) { v.rowH = rh; draw(true, (depth || 0) + 1); return; }
+      if (o.drawn) o.drawn(v.rows.slice(a, b));   // the rows now in view (Available to sell looks up their photos)
     }
     pane.addEventListener('scroll', () => {
       v.top = pane.scrollTop;
@@ -2301,7 +2440,8 @@
     const upcLine = r.upcs.length ? r.upcs[0] + (r.upcs.length > 1 ? ` +${r.upcs.length - 1} more` : '') : '';
     const tip = [r.styleRaw, r.upcs.length ? 'UPC ' + r.upcs.join(', ') : '', r.category, r.factories.length ? 'Factory ' + r.factories.join(', ') : '',
       'Click for its stock and every lot, with their dates'].filter(Boolean).join('\n');
-    let h = `<tr class="r" data-i="${i}"><td class="fz f-sty" title="${esc(tip)}"><div class="sc"><button type="button" class="sb" data-b="all">${esc(r.styleRaw)}</button>${tags.join('')}</div><span class="u">${esc(upcLine) || '&nbsp;'}</span></td>` +
+    const styleHtml = `<div class="sc"><button type="button" class="sb" data-b="all">${esc(r.styleRaw)}</button>${tags.join('')}</div><span class="u">${esc(upcLine) || '&nbsp;'}</span>`;
+    let h = `<tr class="r" data-i="${i}"><td class="fz f-sty" title="${esc(tip)}">${photoOn() ? `<div class="pw">${photoHtml(r)}<div class="sw">${styleHtml}</div></div>` : styleHtml}</td>` +
       `<td class="desc" title="${esc(r.desc)}">${esc(r.desc)}</td>` +
       `<td class="num"${s.casePack === 'mixed' ? ' title="Its goods come in different case packs"' : ''}>${typeof s.casePack === 'number' ? fmtN(s.casePack) : s.casePack === 'mixed' ? 'mixed' : ''}</td>`;
     const inWh = numOr(s.inWh), orders = numOr(s.orders);
@@ -2428,8 +2568,10 @@
     renderSellBanner();
     const rows = sx ? sellRows() : [];
     renderSellTiles(sx ? sellAgg(rows) : null, L);
+    $('sellTable').classList.toggle('pics', photoOn());
     vtSell.set(rows, toTop);
     setInfo();
+    renderDl();
   }
 
   // ---------- its side panel: a style's lots in date order, then its stock ----------
@@ -2812,6 +2954,501 @@
     el.innerHTML = `<b>Units don't add up:</b> ${esc(lines.join('. '))}. This is a bug in Shalam Tool, not a problem in the files: tell Saul.${extra}`;
   }
 
+  // ---------- photos: Quote Tracker's thumbnails, <photos>/thumb/<KEY>.jpg (config.js photos) ----------
+  // Looked up by key with the signed-in person's own read access, 20 to a Graph $batch; a 404 is "no photo", not an
+  // error. The pictures come through each photo's download link (no sign-in token, the way files are downloaded) and are
+  // kept for the page visit as Blobs with object URLs; a download link expires, so it is never kept.
+  const PHOTO_BATCH = 20, PHOTO_PARALLEL = 2, PHOTO_DL = 6, PHOTO_PX = 160;
+  // photo key -> { has (true; false: no photo; null: couldn't be read, why says why), size, blob, url (its object URL),
+  // small (the file's copy: longest side 160 px), bad (the picture wouldn't open), cycle (the load it was looked up in),
+  // busy (lookups running for it) }
+  const photos = new Map();
+  let photoCycle = 0, photoErr = '', photoErrStatus = 0;   // photoErr: the photo store itself couldn't be read in this load cycle (photoErrStatus: SharePoint's answer, if any)
+  const photoOn = () => !!String(CFG.photos || '').trim() && !!window.InvSalesSheet;
+  function photoFailed(e) { console.error(e); photoErr = describe(e).message; photoErrStatus = (e && e.status) || 0; }
+  const photoKeyOf = r => window.InvSalesSheet.photoKey(r.styleRaw || r.key);
+  const photoEntry = k => photos.get(k) || photos.set(k, { has: undefined, busy: 0 }).get(k);
+  // A photo's new state; one gone or replaced (another size) drops the picture kept for it.
+  function photoSet(k, x) {
+    const p = photoEntry(k);
+    if (x.has === false || (x.has === true && p.blob && x.size !== p.size)) {
+      if (p.url) URL.revokeObjectURL(p.url);
+      p.blob = p.url = p.small = null; p.bad = false;
+    }
+    Object.assign(p, x, { cycle: photoCycle });
+    if (x.has !== null) p.why = '';
+  }
+  // Runs fn on every item, n at a time.
+  async function each(list, n, fn) {
+    let i = 0;
+    await Promise.all(Array.from({ length: Math.min(n, list.length) }, async () => { while (i < list.length) await fn(list[i++]); }));
+  }
+
+  // The photo store (config.js photos, a /sites/<site>/<library>/<folder>): its library, found the way a source's is, and
+  // its thumb folder checked, once per visit (a wrong location would otherwise read as "no photo" for every style).
+  let photoPlaceP = null;
+  function photoPlace(signal) {
+    if (!photoPlaceP) {
+      photoPlaceP = (async () => {
+        const text = String(CFG.photos || '').trim(), loc = readLocation(text);
+        if (!loc || loc.kind !== 'path' || pathParts(loc).length < 4) throw problem("can't read the location", `photos in config.js ("${text}") isn't a /sites/<site>/<library>/<folder>.`);
+        const driveId = await pathDrive(loc, { name: 'the photos' }, signal), folder = pathParts(loc).slice(3).join('/');
+        try { await gj(`/drives/${driveId}/root:/${encPath(folder)}/thumb?$select=id,folder`, { signal }); }
+        catch (e) {
+          if (e.status === 404) throw problem('not found', `There's no thumb folder in ${folder} on /sites/${pathParts(loc)[1]} (photos in config.js), so no photo can be found.`);
+          throw e;
+        }
+        return { driveId, folder };
+      })().catch(e => { photoPlaceP = null; throw e; });
+    }
+    return photoPlaceP;
+  }
+
+  // Looks up the photos of keys: which have one (and its size) and, with bytes, their pictures. fresh: a style with no
+  // photo, or one that couldn't be read, is looked at again once per load cycle (otherwise once a visit). view: the rows
+  // in view, which leave a photo being looked up already to that lookup. progress(n, m): pictures in hand of m found.
+  async function lookupPhotos(keys, o = {}) {
+    const all = [...new Set(keys.filter(Boolean))];
+    const need = all.filter(k => {
+      const p = photos.get(k);
+      if (o.view && p && p.busy) return false;
+      if (!p || p.has === undefined) return true;
+      if (p.has === true) return !!o.bytes && !p.blob;
+      return !!o.fresh && p.cycle !== photoCycle;
+    });
+    const tell = () => {
+      if (!o.progress) return;
+      const found = all.filter(k => (photos.get(k) || {}).has === true);
+      o.progress(found.filter(k => photos.get(k).blob).length, found.length);
+    };
+    tell();
+    if (!need.length) return;
+    const place = await photoPlace(o.signal);
+    for (const k of need) photoEntry(k).busy++;
+    try {
+      const chunks = [];
+      for (let i = 0; i < need.length; i += PHOTO_BATCH) chunks.push(need.slice(i, i + PHOTO_BATCH));
+      await each(chunks, PHOTO_PARALLEL, async part => {
+        const links = await photoBatch(place, part, o.signal);
+        tell();
+        if (o.bytes) await each(links, PHOTO_DL, async ([k, url]) => { await photoBytes(k, url, o.signal); tell(); });
+      });
+    } finally {
+      for (const k of need) { const p = photos.get(k); if (p) p.busy = Math.max(0, p.busy - 1); }
+    }
+  }
+  // One $batch of up to 20 lookups; answers [key, download link] for the photos found. A 429 or 503 inside it waits for
+  // its Retry-After and is asked again, up to 3 times (as g() does for a whole request); any other answer but 200 or 404
+  // is an error for that photo, and so is the whole batch failing.
+  async function photoBatch(place, keys, signal) {
+    const found = [];
+    let left = keys;
+    for (let busy = 0; left.length; busy++) {
+      const reqs = left.map((k, i) => ({ id: String(i + 1), method: 'GET', url: `/drives/${place.driveId}/root:/${encPath(place.folder)}/thumb/${encodeURIComponent(k)}.jpg?select=id,size,@microsoft.graph.downloadUrl` }));
+      let j;
+      try { j = await gj('/$batch', { method: 'POST', signal, body: JSON.stringify({ requests: reqs }) }); }
+      catch (e) { if (cycleError(e)) throw e; for (const k of left) photoSet(k, { has: null, why: describe(e).message }); return found; }
+      const again = [], seen = new Set();
+      let wait = 0;
+      for (const r of (j && Array.isArray(j.responses) ? j.responses : [])) {
+        const k = left[+r.id - 1];
+        if (!k || seen.has(k)) continue;
+        seen.add(k);
+        const body = r.body && typeof r.body === 'object' ? r.body : {}, link = body['@microsoft.graph.downloadUrl'];
+        if ((r.status === 429 || r.status === 503) && busy < 3) {
+          const ra = parseInt((r.headers && (r.headers['Retry-After'] || r.headers['retry-after'])) || '', 10);
+          wait = Math.max(wait, ra > 0 ? ra : 2 ** (busy + 1)); again.push(k);
+        } else if (r.status === 404) photoSet(k, { has: false });
+        else if (r.status === 200 && link) { photoSet(k, { has: true, size: numOr(body.size) }); found.push([k, link]); }
+        else photoSet(k, { has: null, why: r.status === 200 ? 'SharePoint gave no download link for it' : `SharePoint answered ${r.status}${body.error && body.error.message ? ': ' + body.error.message : ''}` });
+      }
+      for (const k of left) if (!seen.has(k)) photoSet(k, { has: null, why: "SharePoint's answer to the batch left it out" });
+      left = again;
+      if (left.length) await sleep(Math.min(60, wait) * 1000, signal);
+    }
+    return found;
+  }
+  // A photo's picture, through its download link: kept as a Blob with an object URL for the page visit.
+  async function photoBytes(k, link, signal) {
+    try {
+      const r = await fetchRetry(link, { signal });
+      if (!r.ok) { photoSet(k, { has: null, why: `its download failed (${r.status})` }); return; }
+      let blob = await r.blob();
+      if (!blob.size) { photoSet(k, { has: null, why: 'its file is empty (0 bytes)' }); return; }
+      if (!/^image\//.test(blob.type)) blob = new Blob([blob], { type: 'image/jpeg' });
+      const p = photoEntry(k);
+      if (p.url) URL.revokeObjectURL(p.url);
+      p.blob = blob; p.url = URL.createObjectURL(blob); p.small = null; p.bad = false;
+    } catch (e) { if (cycleError(e)) throw e; photoSet(k, { has: null, why: describe(e).message }); }
+  }
+  // The file's copy of a photo: its longest side 160 px, a JPEG at quality 0.8, so ~800 photos stay well under 10 MB.
+  async function smallPhoto(blob) {
+    const bm = await createImageBitmap(blob);
+    try {
+      const sc = Math.min(1, PHOTO_PX / Math.max(bm.width, bm.height, 1));
+      const w = Math.max(1, Math.round(bm.width * sc)), h = Math.max(1, Math.round(bm.height * sc));
+      const cv = document.createElement('canvas');
+      cv.width = w; cv.height = h;
+      const cx = cv.getContext('2d');
+      cx.fillStyle = '#fff'; cx.fillRect(0, 0, w, h);
+      cx.imageSmoothingQuality = 'high';
+      cx.drawImage(bm, 0, 0, w, h);
+      const out = await new Promise(res => cv.toBlob(res, 'image/jpeg', 0.8));
+      if (!out || !out.size) throw new Error("the picture couldn't be made smaller");
+      return { data: new Uint8Array(await out.arrayBuffer()), width: w, height: h, extension: 'jpeg' };
+    } finally { if (bm.close) bm.close(); }
+  }
+
+  // On Available to sell: the photo at the start of a row; a blank box until it's in, a quiet mark when there's none.
+  function photoHtml(r) {
+    const p = photos.get(photoKeyOf(r));
+    if (p && p.url) return `<img class="pic" src="${esc(p.url)}" alt="">`;
+    if (p && p.has === false) return '<span class="pic none" title="No photo in Quote Images">no photo</span>';
+    if (p && p.has === null) return `<span class="pic none" title="${esc(`The photo couldn't be read: ${p.why || 'not known why'}`)}">?</span>`;
+    return '<span class="pic" aria-hidden="true"></span>';
+  }
+  // The rows just drawn (its tab shown): their photos looked up, then the rows drawn again with them.
+  let photoViewBusy = false;
+  function wantPhotos(rows) {
+    if (!photoOn() || tab !== 'sell' || scopeFatal || photoErr || photoViewBusy) return;
+    const keys = rows.map(photoKeyOf).filter(k => { const p = photos.get(k); return !!k && (!p || ((p.has === undefined || (p.has === true && !p.blob)) && !p.busy)); });
+    if (!keys.length) return;
+    photoViewBusy = true;
+    lookupPhotos(keys, { bytes: true, view: true })
+      .catch(e => { if (e && e.stop) stopNow(); else if (!isAbort(e)) { photoFailed(e); renderIssues(); } })
+      .finally(() => { photoViewBusy = false; photosRedraw(); });
+  }
+  // After a lookup of the sales sheet's photos: rows drawn while it ran left their photos to it (above), so they are
+  // drawn again, which asks for the pictures they still need.
+  function photosRedraw() { if (vtSell && tab === 'sell') vtSell.redraw(); }
+  // A token that allows other changes, met outside a load (by a photo lookup or the save): the page stops as a load would.
+  function stopNow() { if (loading || !scopeFatal) return; stopAll(); cycleDone = true; schedule(); renderAll(); }
+
+  // ---------- the sales sheet (core/salesSheet.js): saved into Shalam Sales tool, and the Download button ----------
+  // What a salesperson may see of Available to sell, one Excel file with a photo per style (Saul, Nov 2). After a clean
+  // load (every source read without red, the ATS report no more than 8 days old) it is saved into the one library in
+  // config.js (salesLibrary), the only place the page writes, unless the file there already holds the same sheet.
+  const SALES = { k: 'sales', name: 'Sales sheet', kind: 'sales' };
+  const CHUNK = 10 * 320 * 1024;               // an upload session takes the file in parts, multiples of 320 KiB
+  const SALES_MAX = 60 * 1024 * 1024;          // far beyond a real sheet (well under 10 MB): something went wrong
+  const XLSX_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  const fmtSaved = iso => fmtShort(iso).replace(',', '');
+  // Its status, drawn in the sources row and on Problems: state ok (saved, or up to date) · load (checking, saving) · warn
+  // (not saved) · err (saving failed: emailed) · off (not set, saving off). Shaped like a source's, for the email.
+  let sales = { state: 'off', label: 'waiting', short: 'after the sources load', message: 'The sales sheet is worked out once the sources have loaded.',
+    file: '', webUrl: '', savedAt: '', savedBy: '', styles: 0, pics: 0, can: '', busy: false, mailProblem: '', why: '', mail: null, status: 0, headers: '' };
+  // how: 'chip' redraws the chip only (progress); true draws nothing (the caller draws everything).
+  function setSales(x, how) {
+    sales = { ...sales, can: '', busy: false, mailProblem: '', why: '', mail: null, status: 0, ...x };
+    if (how === true) return;
+    renderChips();
+    if (how !== 'chip') { renderSrcTable(); renderIssues(); renderDl(); }
+  }
+  const savedFields = m => ({ file: m.name || salesFileName(), webUrl: m.webUrl || '', savedAt: m.lastModifiedDateTime || '', savedBy: who(m.lastModifiedBy) });
+
+  // The sheet as Available to sell stands (or why there's none), worked out once for each.
+  let sheetMemo = { sell: undefined, stages: undefined, sheet: null };
+  function salesSheetNow() {
+    // core/salesSheet.js missing: boot() stops the page and says so; until then, no sheet.
+    if (!window.InvSalesSheet) return { ok: false, reason: "Part of the page (core/salesSheet.js) didn't load, so there's no sales sheet.", rows: [], byDate: [], counts: {} };
+    if (sheetMemo.sell !== sell || sheetMemo.stages !== stages || !sheetMemo.sheet) {
+      let sheet;
+      try { sheet = window.InvSalesSheet.salesRows(sell && !sellErr ? sell : { ok: false, notLoaded: (stages && stages.notLoaded) || [] }, { today: sellToday() }); }
+      catch (e) { console.error(e); sheet = { ok: false, reason: `The sales sheet couldn't be worked out (${(e && e.message) || e}): a bug in Shalam Tool, tell Saul.`, rows: [], byDate: [], counts: {} }; }
+      // The page's own checks too (core/salesSheet.js sees only the selling engine's): the stage numbers or the rows of
+      // Available to sell don't add up, the red banner says its numbers can't be trusted, so there's no sheet either.
+      const bug = !sheet.ok ? '' : balanceBad() ? 'The stage numbers' : sellBalanceBad() ? 'Available to sell' : '';
+      if (bug) sheet = { ok: false, reason: `${bug} ${bug === 'The stage numbers' ? "don't" : "doesn't"} add up (a bug in Shalam Tool), so there's no sales sheet until it's fixed.`, asOf: sheet.asOf, reportDay: sheet.reportDay, rows: [], byDate: [], counts: {} };
+      sheetMemo = { sell, stages, sheet };
+    }
+    return sheetMemo.sheet;
+  }
+  // On Problems, under "Sales sheet": one line for the styles on it with no photo (once all of them were looked up), one
+  // for photos that couldn't be read, and saving's own failure.
+  let photosChecked = null;   // the sheet whose photos were all looked up in this load cycle
+  function salesIssues() {
+    const out = [], sheet = salesSheetNow();
+    const add = (code, message) => out.push(normIssue(SALES.name, { code, message }));
+    const names = list => `${list.slice(0, 40).map(r => r.style).join(', ')}${list.length > 40 ? `, and ${fmtN(list.length - 40)} more` : ''}`;
+    if (photoOn() && sheet.ok) {
+      if (photoErr) add('photo-error', `The photos couldn't be read from Quote Images, so the sales sheet isn't saved with them: ${photoErr}`);
+      else if (photosChecked === sheet) {
+        const none = sheet.rows.filter(r => (photos.get(r.photoKey) || {}).has === false);
+        const bad = sheet.rows.filter(r => { const p = photos.get(r.photoKey); return !!p && (p.has === null || p.bad); });
+        if (none.length) add('no-photo', `${plural(none.length, 'style')} on the sales sheet ${none.length === 1 ? 'has' : 'have'} no photo in Quote Images: ${names(none)}.`);
+        if (bad.length) {
+          const why = [...new Set(bad.map(r => photos.get(r.photoKey).why || "the picture wouldn't open"))].slice(0, 3).join('; ');
+          add('photo-error', `${plural(bad.length, 'style')} on the sales sheet ${bad.length === 1 ? 'has a photo' : 'have photos'} in Quote Images that couldn't be read (${why}), so the sheet goes without: ${names(bad)}.`);
+        }
+      }
+    }
+    if (sales.state === 'err') add('not-saved', sales.message);
+    return out;
+  }
+
+  // Why this load can't save the sheet by itself ('' when it can): a source red, not read this time or not set, or the
+  // ATS report amber (more than 8 days old). The photo store unreadable stops it too (salesCheck). Save anyway saves it
+  // all the same.
+  function notClean() {
+    for (const x of SOURCES) {
+      const s = st[x.k];
+      if (!s || s.state === 'load') return `${x.name} wasn't read yet`;
+      if (s.state === 'err' || s.blocked) return `${x.name} didn't load`;
+      if (s.stale || /^not read/.test(s.label || '')) return `${x.name} wasn't read this time`;
+      if (s.state === 'off') return s.label === 'not set' ? `${x.name}'s location is blank in config.js` : `${x.name} wasn't read (${s.label || 'waiting'})`;
+    }
+    const a = st.ats;
+    if (a.state !== 'ok') return a.label === 'date in the future' ? "the ATS report's file name is dated after today" : `the ATS report is ${a.label}`;
+    return '';
+  }
+
+  // Once at a time: a load finishing while it runs has it run again after (Save anyway / Save now waits its turn).
+  let salesRun = null, salesAgain = false, salesCtl = null;
+  function runSales(force) {
+    if (salesRun) { if (!force) salesAgain = true; return; }
+    salesRun = salesCheck(!!force).catch(e => console.error(e)).finally(() => {
+      salesRun = null;
+      if (salesAgain && !scopeFatal) { salesAgain = false; runSales(false); }
+    });
+  }
+  const salesAfterLoad = () => runSales(false);
+  // The sheet after a load, or on Save anyway / Save now (force): its photos looked up (for Problems and the file), then
+  // saved when it may be, or the status says why not. The sheet and whether its load was clean are taken together, at
+  // the start: a load that finishes while the photos are looked up has its own turn after this one, with its own sheet.
+  async function salesCheck(force) {
+    const sheet = salesSheetNow(), dirty = notClean(), lib = String(CFG.salesLibrary || '').trim();
+    const ctl = new AbortController(), signal = ctl.signal;
+    salesCtl = ctl;
+    const keep = 'The file in Shalam Sales tool keeps its last good copy.';
+    const off = !lib ? { state: 'off', label: 'not set', short: 'salesLibrary is blank in config.js', message: 'Saving the sales sheet is off: salesLibrary in config.js is blank. The Sales sheet button on Available to sell still downloads it.' }
+      : salesScopeMissing ? { state: 'off', label: 'saving off', short: "the Entra step isn't done", message: "Shalam Tool isn't allowed to save yet: the Entra step isn't done. The Sales sheet button on Available to sell still downloads it." }
+        : null;
+    if (off) setSales(off);
+    try {
+      if (sheet.ok && photoOn()) {
+        if (!off) setSales({ state: 'load', label: 'checking…', short: 'its photos', busy: true }, 'chip');
+        try {
+          await lookupPhotos(sheet.rows.map(r => r.photoKey), { fresh: true, signal });
+          photosChecked = sheet;
+        } catch (e) { if (cycleError(e)) throw e; photoFailed(e); }
+        finally { photosRedraw(); }
+        renderIssues();
+      }
+      if (off) return;
+      if (!sheet.ok) { setSales({ state: 'warn', label: 'not saved', short: sheet.reason, message: `Not saved: ${sheet.reason} ${keep}` }); return; }
+      if (dirty && !force) { setSales({ state: 'warn', label: 'not saved', short: dirty, message: `Not saved: ${dirty}. ${keep}`, can: 'anyway' }); return; }
+      // The photo store couldn't be read (moved, renamed, or photos in config.js wrong): not saved, so the file keeps its
+      // photos. Red and emailed as a red source is, since saving stops until it's fixed; said, not red, when the account
+      // just can't open it (401/403). Save anyway saves the sheet without photos.
+      if (photoErr && !force) {
+        const why = `the photos couldn't be read from Quote Images (${photoErr})`;
+        if (photoErrStatus === 401 || photoErrStatus === 403) { setSales({ state: 'warn', label: 'not saved', short: why, message: `Not saved: ${why}. ${keep}`, can: 'anyway' }); return; }
+        salesRed({ short: why, message: `Not saved: ${why}. ${keep}`, can: 'anyway', mailProblem: "photos can't be read", why: 'photos' });
+        return;
+      }
+      await saveSheet(sheet, signal);
+    } catch (e) { salesFailed(e, keep); }
+    finally { if (salesCtl === ctl) salesCtl = null; }
+  }
+
+  // This browser's mark of its last save, or of the last file it found already up to date: the file's eTag, and the
+  // fingerprint of what it holds.
+  const salesMark = () => { try { const j = JSON.parse(store.get('sales') || 'null'); return j && typeof j === 'object' ? j : null; } catch (e) { return null; } };
+  // A fingerprint of what the file holds: its dates, rows and schedule, and which styles have a photo (with its size, so
+  // a replaced photo is saved again). It is written into the file too (its keywords), so whoever looks at the file
+  // later can tell what it holds.
+  const salesKeys = sheet => (photoOn() && !photoErr ? sheet.rows.map(r => r.photoKey) : []);
+  async function sheetPrint(sheet, keys) {
+    const pics = keys.filter(k => (photos.get(k) || {}).has === true).map(k => [k, photos.get(k).size ?? null]);
+    const text = JSON.stringify({ asOf: sheet.asOf, reportDay: sheet.reportDay, rows: sheet.rows, byDate: sheet.byDate, photos: pics });
+    return window.crypto && crypto.subtle ? sha256Hex(text) : hash(text);
+  }
+  // The file in the library, with its download link (used at once, never kept), or null when it isn't there yet.
+  async function salesFileMeta(drive, signal) {
+    try { return await gj(`/drives/${drive}/root:/${encPath(salesFileName())}`, { signal }); }
+    catch (e) { if (e.status === 404) return null; throw e; }
+  }
+  // What a file in the library holds, read from it: the fingerprint written in it ('' when it has none, or can't be
+  // read) and its photos.
+  async function fileHolds(meta, signal) {
+    try {
+      const bytes = new Uint8Array(await download(meta, signal));
+      const props = XLSX.read(bytes, { type: 'array', bookProps: true }).Props || {};
+      const pics = XLSX.CFB.read(bytes, { type: 'array' }).FullPaths.filter(p => /\/xl\/media\/[^/]+$/.test(p)).length;
+      return { fp: String(props.Keywords || '').trim(), pics };
+    } catch (e) { if (cycleError(e)) throw e; console.error(e); return { fp: '', pics: 0 }; }
+  }
+  async function saveSheet(sheet, signal) {
+    const file = salesFileName(), where = `${String(CFG.salesLibrary).trim()}|${file}`;
+    // busy: Cancel on the chip, until the file in the library is replaced.
+    const say = (label, short, busy = true) => setSales({ state: 'load', label, short, busy }, 'chip');
+    say('checking…', 'the file in Shalam Sales tool');
+    const drive = await salesDrive(signal);
+    if (!drive) throw problem("can't read the location", 'salesLibrary in config.js is blank.');
+    // Nothing changed: the file in the library already holds this sheet (the same data and photos), whoever saved it.
+    // The file this browser saved (or found up to date) last is known by its eTag; any other, saved from another browser
+    // or changed by SharePoint since, is read once for the fingerprint written in it.
+    const fp = await sheetPrint(sheet, salesKeys(sheet)), meta = await salesFileMeta(drive, signal);
+    if (meta && meta.eTag) {
+      const kept = salesMark(), mine = !!kept && kept.where === where && kept.eTag === meta.eTag;
+      let holds = mine ? { fp: kept.fp, pics: kept.pics || 0 } : null;
+      if (!mine && meta['@microsoft.graph.downloadUrl']) { say('checking…', 'what the file in Shalam Sales tool holds'); holds = await fileHolds(meta, signal); }
+      if (holds && holds.fp === fp) {
+        if (!mine) store.set('sales', JSON.stringify({ where, eTag: meta.eTag, fp, at: meta.lastModifiedDateTime || '', pics: holds.pics }));
+        setSales({ ...savedFields(meta), state: 'ok', label: 'up to date', short: `saved ${fmtSaved(meta.lastModifiedDateTime)}`, styles: sheet.rows.length, pics: holds.pics,
+          message: `Up to date: nothing in it has changed since it was saved ${fmtLong(meta.lastModifiedDateTime)}.` });
+        return;
+      }
+    }
+    say('saving…', 'making the file');
+    const made = await buildSalesFile(sheet, signal, msg => say('saving…', msg));
+    const bad = salesFileWrong(made.bytes, sheet);
+    if (bad) throw problem("can't make the file", `The sales sheet wasn't saved: ${bad}.`);
+    // Into the library, replacing the file: in parts through an upload session, with no sign-in token on its address.
+    const up = await uploadSession(signal), total = made.bytes.length;
+    let item = null;
+    for (let at = 0; at < total; at += CHUNK) {
+      const end = Math.min(total, at + CHUNK);
+      say('saving…', `uploading ${Math.floor(at / total * 100)}%`);
+      const r = await fetchRetry(up, { method: 'PUT', signal: timed(signal, 300000), headers: { 'Content-Range': `bytes ${at}-${end - 1}/${total}` }, body: made.bytes.slice(at, end) });
+      let j = null;
+      try { j = await r.json(); } catch (e) { j = null; }
+      if (!r.ok) {
+        const msg = j && j.error && (j.error.message || j.error.code);
+        throw Object.assign(new Error(`SharePoint answered ${r.status} to part of the upload${msg ? ': ' + msg : ''}.`), { status: r.status });
+      }
+      if (end < total) {
+        const next = j && Array.isArray(j.nextExpectedRanges) ? String(j.nextExpectedRanges[0] || '') : '';
+        if (next && !next.startsWith(`${end}-`)) throw problem('not saved whole', `SharePoint expected the upload to go on from byte ${next}, not ${fmtN(end)}, so it was stopped.`);
+      } else item = j;
+    }
+    // The last answer is the file itself, under the name sent. From here the file in the library is replaced: no Cancel
+    // (it would say the library kept its last copy), and the checks run to the end on their own time limit.
+    if (!item || !item.id || String(item.name || '').toLowerCase() !== file.toLowerCase()) {
+      throw problem('not saved whole', `SharePoint's answer to the last part ${item && item.id ? `is ${item.name || 'a file with no name'}` : "isn't the file"}, not ${file}, so the sheet may not have been saved whole.`);
+    }
+    say('saving…', 'checking it arrived whole', false);
+    const saved = await gj(`/drives/${drive}/items/${encodeURIComponent(item.id)}`, { signal: timed(null, 60000) });
+    if (!saved || !saved.eTag) throw problem('not saved whole', `SharePoint didn't say what it holds as ${file} after the upload, so the sheet may not have been saved whole.`);
+    // Its size must be the bytes sent, in the last answer and in SharePoint's own. SharePoint can write its own
+    // properties into an Office file as it stores it, which changes the size: then the file is read back, and must open
+    // with both tabs and every style in order.
+    if (item.size !== total || saved.size !== total) {
+      const was = `SharePoint says ${file} is ${fmtN(saved.size !== total ? saved.size : item.size)} bytes, not the ${fmtN(total)} sent`;
+      let back;
+      try { back = new Uint8Array(await download(saved, timed(null, 120000))); }
+      catch (e) { if (e && (e.auth || e.stop)) throw e; throw problem('not saved whole', `${was}, and it couldn't be read back to check it (${describe(e).message}), so the sheet may not have been saved whole.`); }
+      const wrong = salesFileWrong(back, sheet);
+      if (wrong) throw problem('not saved whole', `${was}, and the copy read back from it is wrong (${wrong}), so the sheet may not have been saved whole.`);
+    }
+    store.set('sales', JSON.stringify({ where, eTag: saved.eTag, fp: made.print, at: saved.lastModifiedDateTime || '', pics: made.photos }));
+    const mb = `${(total / 1048576).toFixed(1)} MB`;
+    setSales({ ...savedFields(saved), state: 'ok', label: `saved ${fmtSaved(saved.lastModifiedDateTime)}`, short: `${plural(sheet.rows.length, 'style')}, ${plural(made.photos, 'photo')}`,
+      styles: sheet.rows.length, pics: made.photos, message: `Saved ${fmtLong(saved.lastModifiedDateTime)}: ${plural(sheet.rows.length, 'style')}, ${plural(made.photos, 'photo')}, ${mb}.` });
+  }
+  // An empty or half-built file is never uploaded (and one read back after the upload must be whole): a sensible size,
+  // and it opens with both tabs and every style, in order. Answers what's wrong with it ('' when nothing is).
+  function salesFileWrong(bytes, sheet) {
+    const SS = window.InvSalesSheet;
+    if (!sheet.rows.length) return 'it has no rows';
+    if (!bytes || bytes.length < 2048) return `the file came out at ${fmtN(bytes ? bytes.length : 0)} bytes, too small to hold the sheet`;
+    if (bytes.length > SALES_MAX) return `the file came out at ${(bytes.length / 1048576).toFixed(1)} MB, far more than it should (well under 10 MB)`;
+    let wb;
+    try { wb = XLSX.read(bytes, { type: 'array', sheets: [SS.TABS.sell] }); }
+    catch (e) { return `it didn't open after it was written (${e.message})`; }
+    if (!(wb.SheetNames || []).includes(SS.TABS.byDate)) return `it has no "${SS.TABS.byDate}" tab`;
+    const ws = wb.Sheets[SS.TABS.sell], ref = ws && ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']) : null;
+    if (!ref || ref.e.r + 1 !== sheet.rows.length + 2) return `it holds ${ref ? fmtN(ref.e.r - 1) : 'no'} style rows, not ${fmtN(sheet.rows.length)}`;
+    const col = SS.COLS.findIndex(c => c.k === 'style'), styleAt = i => { const c = ws[XLSX.utils.encode_cell({ r: i + 2, c: col })]; return c && c.v != null ? String(c.v) : ''; };
+    const at = sheet.rows.findIndex((r, i) => styleAt(i) !== r.style);
+    if (at >= 0) return `its row ${fmtN(at + 3)} holds ${styleAt(at) || 'no style'}, not ${sheet.rows[at].style}`;
+    return '';
+  }
+  // The file: the photos (downloaded where need be, made small), the workbook (ExcelJS, loaded the first time) with the
+  // fingerprint of what it holds, its bytes. A photo store that can't be read leaves the photos out (Problems says why).
+  // say(text): where it's got to.
+  async function buildSalesFile(sheet, signal, say) {
+    const SS = window.InvSalesSheet;
+    say('loading the Excel library');
+    const ExcelJS = await loadExcelJS();
+    const pics = new Map();
+    if (photoOn()) {
+      const keys = sheet.rows.map(r => r.photoKey);
+      try { await lookupPhotos(keys, { bytes: true, signal, progress: (n, m) => say(`photos ${fmtN(n)} of ${fmtN(m)}`) }); }
+      catch (e) { if (cycleError(e)) throw e; photoFailed(e); }
+      finally { photosRedraw(); }
+      const have = keys.filter(k => { const p = photos.get(k); return !!p && p.has === true && !!p.blob; });
+      for (let i = 0; i < have.length; i++) {
+        if (signal && signal.aborted) throw abortErr();
+        const p = photos.get(have[i]);
+        if (!p.small && !p.bad) { try { p.small = await smallPhoto(p.blob); } catch (e) { console.error(e); p.bad = true; p.why = "the picture wouldn't open"; } }
+        if (p.small) pics.set(have[i], p.small);
+        if (i % 25 === 24) { say(`fitting photos ${fmtN(i + 1)} of ${fmtN(have.length)}`); await yieldUi(); }
+      }
+    }
+    if (signal && signal.aborted) throw abortErr();
+    say('writing the file'); await yieldUi();
+    const print = await sheetPrint(sheet, salesKeys(sheet));
+    const bytes = await SS.workbookBytes(SS.buildWorkbook(ExcelJS, sheet, pics, { print }));
+    if (signal && signal.aborted) throw abortErr();
+    return { bytes, photos: pics.size, print };
+  }
+  // Saving failed. Cancel, a sign-in to renew, or no right to save (401/403, or the library not even visible to the
+  // account): said, not red. Anything else: red, on Problems, and the error email as for a red source.
+  function salesFailed(e, keep) {
+    if (e && e.stop) { stopNow(); return; }
+    if (isAbort(e)) { setSales({ state: 'warn', label: 'not saved', short: 'cancelled', message: `Not saved: it was cancelled. ${keep}`, can: notClean() || photoErr ? 'anyway' : 'now' }); return; }
+    if (e && e.auth) { setSales({ state: 'warn', label: 'not saved', short: 'the sign-in needs renewing', message: `Not saved: your sign-in needs renewing (${String(e.errorCode || e.message || e).slice(0, 80)}). Click Refresh, or Sign in again. ${keep}` }); return; }
+    const status = (e && e.status) || 0;
+    if (status === 401 || status === 403) {
+      setSales({ state: 'warn', label: 'not saved', short: "your account can't save to it", status,
+        message: `Your account can't save to Shalam Sales tool, or the library hasn't been opened to Shalam Tool yet (SharePoint answered ${status}). ${keep}` });
+      return;
+    }
+    if (e && e.cantSee) { setSales({ state: 'warn', label: 'not saved', short: "your account can't see it", message: `${e.message} ${keep}` }); return; }
+    console.error(e);
+    const msg = e && e.name === 'TimeoutError' ? 'SharePoint took too long to answer the upload.' : describe(e).message;
+    salesRed({ short: msg, message: `Saving the sales sheet failed: ${msg} ${keep}`, mailProblem: 'not saved', why: describe(e).label, status, can: 'now' });
+  }
+  // Saving stopped, red: on its status and on Problems, and the error email as for a red source (why: what fixes it, for
+  // the email).
+  function salesRed(x) {
+    setSales({ state: 'err', label: 'not saved', file: sales.file || salesFileName(), ...x });
+    emailOne(SALES, sales, window.InvCommon.todayNY(Date.now())).catch(e2 => console.error(e2)).finally(() => { renderChips(); renderSrcTable(); });
+  }
+
+  // ---------- the Download button (Available to sell): the same file, for anyone signed in ----------
+  let dl = null;   // { ctl, msg } while it's being made
+  function renderDl() {
+    const btn = $('btnSalesDl');
+    if (!btn) return;
+    const sheet = salesSheetNow();
+    btn.disabled = !!dl || !sheet.ok;
+    $('salesDl').title = dl ? '' : sheet.ok ? `Download ${salesFileName() || 'the sales sheet'}: Available to sell for a salesperson, one photo per style; no factory, customer, PO or person in it` : sheet.reason;
+    $('salesDlMsg').textContent = dl ? dl.msg : '';
+    $('btnSalesDlX').hidden = !dl;
+  }
+  async function downloadSales() {
+    const sheet = salesSheetNow();
+    if (dl || !sheet.ok) return;
+    const ctl = new AbortController();
+    dl = { ctl, msg: 'starting' };
+    renderDl();
+    try {
+      const made = await buildSalesFile(sheet, ctl.signal, msg => { if (dl) { dl.msg = msg; renderDl(); } });
+      const url = URL.createObjectURL(new Blob([made.bytes], { type: XLSX_TYPE }));
+      const a = document.createElement('a');
+      a.href = url; a.download = salesFileName() || 'Available to sell.xlsx';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      toast(`Sales sheet downloaded: ${plural(sheet.rows.length, 'style')}, ${plural(made.photos, 'photo')}.`, 5000);
+    } catch (e) {
+      if (isAbort(e)) toast('Sales sheet download cancelled.');
+      else if (e && e.stop) stopNow();
+      else { console.error(e); toast(`The sales sheet couldn't be made: ${describe(e).message}`, 8000); }
+    } finally { dl = null; renderDl(); renderIssues(); }
+  }
+
   // ---------- drawing the stage views ----------
   function renderStageViews(toTop) {
     if (!vtInv) return;
@@ -2835,7 +3472,7 @@
       empty: () => emptyText(fOn() ? 'Nothing matches these filters.' : 'No styles with goods in China, on the way or sold from China.') });
     vtPull = vtable('pullPane', 'pullTable', { rowH: 40, cols: () => PULL_COLS.length, head: () => sortHead(PULL_COLS, sortPull), row: pullRowHtml,
       empty: () => emptyText(fOn() ? 'No open line matches these filters.' : 'No open lines on Master Sheet Live.') });
-    vtSell = vtable('sellPane', 'sellTable', { rowH: 40, cols: () => SELL_COLS.length, head: () => sortHead(SELL_COLS, sortSell), row: sellRowHtml,
+    vtSell = vtable('sellPane', 'sellTable', { rowH: 40, cols: () => SELL_COLS.length, head: () => sortHead(SELL_COLS, sortSell), row: sellRowHtml, drawn: wantPhotos,
       empty: () => esc(sellLead() ? sellLead().short : F.avail || fOnSell() ? 'No style matches these filters.' : 'No styles on the ATS report or with goods coming.') });
     // The side panel draws either the lines behind a stage number or a style's lots (Available to sell).
     vtPanel = vtable('panelPane', 'panelTable', { cols: () => curPanelCols().length, head: () => sortHead(curPanelCols(), sortPanel),
@@ -2945,6 +3582,15 @@
     $('btnRefresh').onclick = () => loadAll(true);
     $('btnCancelBusy').onclick = $('btnCancelLoad').onclick = () => { if (loading) loading.abort(); };
     $('banners').addEventListener('click', e => { if (e.target.closest('[data-act="signin"]')) reSignIn(); });
+    // The sales sheet: Cancel while it saves, Save anyway / Save now when it didn't; the Download button and its Cancel.
+    $('chips').addEventListener('click', e => {
+      const b = e.target.closest('button[data-sales]');
+      if (!b) return;
+      e.preventDefault();
+      if (b.dataset.sales === 'cancel') { if (salesCtl) salesCtl.abort(); } else runSales(true);
+    });
+    $('btnSalesDl').onclick = downloadSales;
+    $('btnSalesDlX').onclick = () => { if (dl) dl.ctl.abort(); };
     $('tabs').addEventListener('click', e => { const b = e.target.closest('.tab'); if (b) showTab(b.dataset.tab); });
     let qt = null;
     $('pq').addEventListener('input', e => { clearTimeout(qt); qt = setTimeout(() => { pq = e.target.value.trim(); renderIssues(); }, 150); });
@@ -2980,7 +3626,7 @@
     startBg();
     const parts = [['InvCommon', 'core/common.js'], ['PoBookCore', 'core/pobook.js'], ['InvUpc', 'core/upc.js'], ['InvCT', 'core/ct.js'],
       ['InvShipping', 'core/shipping.js'], ['InvStages', 'core/stages.js'], ['InvAts', 'core/ats.js'], ['InvSell', 'core/sell.js'],
-      ['XLSX', 'vendor/xlsx-js-style/xlsx.bundle.js']];
+      ['InvSalesSheet', 'core/salesSheet.js'], ['XLSX', 'vendor/xlsx-js-style/xlsx.bundle.js']];
     const missing = parts.filter(([name]) => !window[name]).map(p => p[1]);
     if (missing.length) { showSignin(`Part of the page didn't load (${missing.join(', ')}). Reload the page; if it keeps happening, tell Saul.`, true); return; }
     initAuth();

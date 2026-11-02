@@ -19,7 +19,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, mkdtempSync, rmSync
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep, extname } from 'node:path';
-import { loadXLSX, core, root, xlsxBytes } from '../load.mjs';
+import { loadXLSX, loadExcelJS, xlsxParts, core, root, xlsxBytes } from '../load.mjs';
 
 const EDGE = process.env.EDGE_PATH || 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 const REPO = resolve(root());
@@ -40,11 +40,20 @@ const CT_V2 = '/sites/TestSite/Shared Documents/Logistics/Test Container Sheet v
 const CT_PATH = '/drives/drv-src/root:/Logistics/Test Container Sheet.xlsx';   // how Container Tracking is read: by its path in its library
 // Container Tracking sections with no round, with invented names (the real ones are in config.js).
 const TEST_SECTIONS = { pullFromChina: ['Customer Direct'], planning: ['Planning A'], ignore: ['Hidden Rows Test'] };
+// The sales sheet: an invented library on the invented reports site, and an invented photo store (photos stay off unless
+// a scenario turns them on with cfg). The upload address the stand-in gives is on *.sharepoint.com, as the page requires;
+// the fake fetch sends it to the download host on 127.0.0.1.
+const SALES_LIB = '/sites/TestReports/Sales Test Library', SALES_FILE = 'Sales Test.xlsx', SALES_DRV = 'drv-sales';
+const SESSION_PATH = `/drives/${SALES_DRV}/root:/${SALES_FILE}:/createUploadSession`;
+const PHOTO_LOC = '/sites/TestSite/Shared Documents/Photo Store';
+const UP_HOST = 'https://contoso-test.sharepoint.com';
 const TEST_CONFIG = { tenantId: '00000000-0000-4000-8000-000000000000', clientId: '11111111-1111-4111-8111-111111111111',
-  sources: LOC, sections: TEST_SECTIONS, errorEmailTo: MAIL_TO, errorEmailName: 'Saul' };
+  sources: LOC, sections: TEST_SECTIONS, salesLibrary: SALES_LIB, salesFile: SALES_FILE, photos: '', errorEmailTo: MAIL_TO, errorEmailName: 'Saul' };
 const ACCOUNT = { name: 'Test User', username: 'test.user@example.com', homeAccountId: 'test-home', localAccountId: 'test-local', tenantId: TEST_CONFIG.tenantId };
 // As a real Graph token lists them: the sign-in scopes (email, openid, profile) come along with the three asked for.
 const READ_SCP = 'email Mail.Send openid profile Sites.Read.All User.Read';
+// Once the saving permission is consented in Entra, tokens carry it too (the sign-in never asks for it).
+const SAVE_SCP = READ_SCP + ' Lists.SelectedOperations.Selected';
 const SITE_ID = 'site-prod', SRC = 'drv-src', REP = 'drv-rep';
 const XOPT = { type: 'array', cellFormula: false, cellHTML: false, cellStyles: false };   // as app.js reads files
 const KEYS = ['msl', 'tracker', 'pobook', 'ct', 'forwarder', 'drayage', 'ats', 'upc'];
@@ -53,7 +62,7 @@ const NAMES = { msl: 'Master Sheet Live', tracker: 'PO Status Tracker', pobook: 
 
 const X = loadXLSX();
 const C = core('common'), PB = core('pobook'), CT = core('ct'), SH = core('shipping'), UPC = core('upc'), ST = core('stages');
-const ATS = core('ats'), SELL = core('sell');
+const ATS = core('ats'), SELL = core('sell'), SS = core('salesSheet');
 const TODAY = C.todayNY(Date.now());   // the page works its dates out from the same clock
 const iso = days => new Date(Date.now() - days * 864e5).toISOString();
 const fmtN = v => (typeof v === 'number' ? v.toLocaleString('en-US') : String(v));
@@ -466,8 +475,14 @@ let world = null;     // the SharePoint state of the scenario being run
 function newWorld(fx, o = {}) {
   return { fx, o: { mslFile: 'msl.xlsx', trkFile: 'tracker.xlsx', ctFile: 'ct.xlsx', fwdFile: 'fwd.xlsx', drayFile: 'dray.csv', drayOldFile: 'dray.csv',
     fwdAge: 0, tracker: 200, poBook: 'same', mail: 202, ats: { empty: true }, slowCt: false, sources: {}, real: false, ...o },
-    calls: [], downloads: [], pageGets: [], unanswered: [], pending: new Set(), aborted: [], poBookGets: 0 };
+    calls: [], downloads: [], pageGets: [], unanswered: [], pending: new Set(), aborted: [], poBookGets: 0,
+    // Graph answers held back (o.slow: { path: ms }) and not given yet.
+    slowNow: 0,
+    // The sales library: its file once saved, the upload sessions made, every PUT the upload host got, and photo lookups.
+    sales: { file: null, version: 0, made: 0, sessions: {}, bodies: [], urls: [], puts: [], preflights: 0, aborted: 0 }, photoLookups: [] };
 }
+// The world's photos: o.photos(key) names the invented JPEG for a style's photo key, or null (no photo).
+const photoFile = (w, key) => (typeof w.o.photos === 'function' ? w.o.photos(key) : null);
 // The ATS folder's reports, named as the ERP names them, with the day the report was made: "Inventory Report - On
 // Hand_In Transit_In Production 10-28-2026 12-58 PM.xlsx" (o.age days ago; `older` days before that for the older one),
 // or with no date in the name (o.noDate), when the page takes the day the file was saved.
@@ -477,7 +492,7 @@ function atsName(o, older = 0) {
   return `Inventory Report - On Hand_In Transit_In Production ${dt.getUTCMonth() + 1}-${dt.getUTCDate()}-${dt.getUTCFullYear()} 12-58 PM.xlsx`;
 }
 // The config.js the page gets: the invented locations, with the scenario's changes.
-const configFor = w => ({ ...TEST_CONFIG, sources: { ...LOC, ...((w && w.o.sources) || {}) }, ...(w && w.o.real ? { sections: realSections() } : {}) });
+const configFor = w => ({ ...TEST_CONFIG, sources: { ...LOC, ...((w && w.o.sources) || {}) }, ...((w && w.o.cfg) || {}), ...(w && w.o.real ? { sections: realSections() } : {}) });
 
 const J = (status, json) => ({ status, json });
 const notFound = () => J(404, { error: { code: 'itemNotFound', message: 'The resource could not be found.' } });
@@ -497,19 +512,43 @@ const SITES = { Production: SITE_ID, TestSite: 'site-test', TestReports: 'site-r
 const DRIVES = {
   'site-test': [{ id: 'drv-assets', name: 'Site Assets', webUrl: `${TEST_WEB}/sites/TestSite/SiteAssets` },
     { id: SRC, name: 'Documents', webUrl: `${TEST_WEB}/sites/TestSite/Shared%20Documents` }],
-  'site-rep': [{ id: REP, name: 'Documents', webUrl: `${TEST_WEB}/sites/TestReports/Shared%20Documents` }],
+  'site-rep': [{ id: REP, name: 'Documents', webUrl: `${TEST_WEB}/sites/TestReports/Shared%20Documents` },
+    { id: SALES_DRV, name: 'Sales Test Library', webUrl: `${TEST_WEB}/sites/TestReports/Sales%20Test%20Library` }],
 };
+// The sales sheet as the library holds it (a driveItem), once saved, with its download link (the bytes it holds).
+const salesItem = f => ({ id: f.id, name: f.name, size: f.size, eTag: f.eTag, lastModifiedDateTime: f.at, lastModifiedBy: by,
+  webUrl: webUrl(f.id), file: {}, parentReference: { driveId: SALES_DRV }, '@microsoft.graph.downloadUrl': `${DL}/sales/${f.id}` });
+// SharePoint writing its own properties into an Office file as it stores it: the same workbook, another size.
+function spResized(bytes) {
+  const z = X.CFB.read(new Uint8Array(bytes), { type: 'array' });
+  X.CFB.utils.cfb_add(z, 'docProps/custom.xml', Buffer.from('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" ' +
+    'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="2" name="ContentTypeId"><vt:lpwstr>0x0101</vt:lpwstr></property></Properties>'));
+  return Buffer.from(X.CFB.write(z, { fileType: 'zip', type: 'buffer' }));
+}
 const SHARES = { [LOC.msl]: ['itm-msl', 'Master Sheet Live.xlsx'], [LOC.tracker]: ['itm-trk', 'PO Status Tracker.xlsx'] };
 const isResolve = x => /^\/shares\/|^\/sites\/[^/]+:\/sites\/(?!Production$)|\/drives$|\/root:\//.test(x.path);
 // Finding a location afresh: a sharing link, a site or its libraries (a path inside a known library is not one).
 const isLookup = x => /^\/shares\/|^\/sites\/[^/]+:\/sites\/(?!Production$)|\/drives$/.test(x.path);
 
-function graph(w, method, path, q) {
+function graph(w, method, path, q, body) {
   const o = w.o;
   if (method === 'GET') {
     let m;
+    // The sales sheet in its library (the invented one): there once saved.
+    if (path === `/drives/${SALES_DRV}/root:/${SALES_FILE}`) return w.sales.file ? J(200, salesItem(w.sales.file)) : notFound();
+    if (w.sales.file && path === `/drives/${SALES_DRV}/items/${w.sales.file.id}`) return J(200, salesItem(w.sales.file));
+    // The photo store: its thumb folder, and a photo by key (o.photos names the invented JPEG; none: 404). "Moved Photos"
+    // has no thumb folder (the photo store moved away).
+    if (path === `/drives/${SRC}/root:/Photo Store/thumb`) return J(200, folderMeta('itm-thumb', 'thumb'));
+    if (path === `/drives/${SRC}/root:/Moved Photos/thumb`) return notFound();
+    if ((m = /^\/drives\/drv-src\/root:\/Photo Store\/thumb\/([^/]+)\.jpg$/.exec(path))) {
+      w.photoLookups.push(m[1]);
+      const f = photoFile(w, m[1]);
+      return f ? J(200, { id: 'pic-' + m[1], size: w.fx.bytes.get(f).length, '@microsoft.graph.downloadUrl': `${DL}/fx/${f}` }) : notFound();
+    }
     if ((m = /^\/sites\/met1sol\.sharepoint\.com:\/sites\/([^/]+)$/.exec(path))) return SITES[m[1]] ? J(200, { id: SITES[m[1]] }) : notFound();
-    if ((m = /^\/sites\/([^/]+)\/drives$/.exec(path)) && DRIVES[m[1]]) return J(200, { value: DRIVES[m[1]] });
+    // o.salesHidden: the account can't open the sales library, so its site doesn't list it.
+    if ((m = /^\/sites\/([^/]+)\/drives$/.exec(path)) && DRIVES[m[1]]) return J(200, { value: DRIVES[m[1]].filter(d => !(o.salesHidden && d.id === SALES_DRV)) });
     if ((m = /^\/shares\/u!([\w-]+)\/driveItem$/.exec(path))) {
       const hit = SHARES[Buffer.from(m[1], 'base64url').toString('utf8')];
       if (!hit) return notFound();
@@ -568,8 +607,28 @@ function graph(w, method, path, q) {
   if (method === 'POST' && path === '/me/sendMail') {
     return o.mail === 202 ? { status: 202 } : J(o.mail, { error: { code: 'ErrorAccessDenied', message: 'Access is denied. Check credentials and try again.' } });
   }
+  // A JSON batch: each request in it answered as on its own (Graph's shape: id, status, headers, body).
+  if (method === 'POST' && path === '/$batch') {
+    const reqs = body && Array.isArray(body.requests) ? body.requests : [];
+    return J(200, { responses: reqs.map(r => {
+      const [p, qs = ''] = String(r.url || '').split('?');
+      let dp = p;
+      try { dp = decodeURIComponent(p); } catch (e) { /* kept as sent */ }
+      const x = graph(w, String(r.method || '').toUpperCase(), dp, new URLSearchParams(qs), r.body);
+      return { id: r.id, status: x.status, headers: { 'Content-Type': 'application/json' }, body: x.json || null };
+    }) });
+  }
+  // The sales sheet's upload session (o.salesSession: the status refusing it, as when the library isn't opened to the app).
+  if (method === 'POST' && path === SESSION_PATH) {
+    w.sales.bodies.push(body);
+    if (o.salesSession) return J(o.salesSession, { error: { code: 'accessDenied', message: 'Access denied.' } });
+    const id = 'sess' + (++w.sales.made), url = `${UP_HOST}/_up/${id}?tempauth=invented-${id}`;
+    w.sales.sessions[id] = { got: 0, parts: [], total: null };
+    w.sales.urls.push(url);
+    return J(200, { uploadUrl: url, expirationDateTime: new Date(Date.now() + 864e5).toISOString(), nextExpectedRanges: ['0-'] });
+  }
   w.unanswered.push(`${method} ${path}`);
-  return method === 'GET' ? notFound() : J(405, { error: { code: 'notAllowed', message: 'The stand-in answers reads and the email only.' } });
+  return method === 'GET' ? notFound() : J(405, { error: { code: 'notAllowed', message: 'The stand-in answers reads, the email, batches of reads and the sales sheet\'s upload session only.' } });
 }
 
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.png': 'image/png', '.json': 'application/json', '.svg': 'image/svg+xml' };
@@ -589,10 +648,14 @@ function pageServer() {
         try { body = text ? JSON.parse(text) : null; } catch (e) { body = text; }
         const gpath = path.slice('/__graph'.length), q = new URLSearchParams(rawQ);
         const w = world;
-        const r = w ? graph(w, req.method, gpath, q) : notFound();
+        const r = w ? graph(w, req.method, gpath, q, body) : notFound();
         if (w) w.calls.push({ method: req.method, path: gpath, query: rawQ, auth: req.headers.authorization || '', prefer: req.headers.prefer || '', body, status: r.status });
-        res.writeHead(r.status, r.json ? { 'Content-Type': 'application/json' } : {});
-        res.end(r.json ? JSON.stringify(r.json) : undefined);
+        const send = () => { res.writeHead(r.status, r.json ? { 'Content-Type': 'application/json' } : {}); res.end(r.json ? JSON.stringify(r.json) : undefined); };
+        // o.slow: this path's answer held back that many ms (SharePoint slow), so a check can act while it runs.
+        const ms = (w && w.o.slow && w.o.slow[gpath]) || 0;
+        if (!ms) { send(); return; }
+        w.slowNow++;
+        setTimeout(() => { w.slowNow--; send(); }, ms);
       });
       return;
     }
@@ -619,10 +682,58 @@ function pageServer() {
   });
 }
 
+// An upload session's address (/up/<session>): the parts of the sales sheet, each PUT with its Content-Range, in order,
+// with no Authorization header; 202 with the next range until the last part, then 201 with the file (the library holds
+// it from then on: sent, the bytes the page sent; bytes, what the library holds). o.salesSlowPut: the first part is
+// answered after 25 s (Cancel can stop it); o.salesResized: the library holds it with SharePoint's own properties
+// written in (another size, still whole); o.salesBadSize: the library holds it cut short (half of it).
+function uploadPart(req, res, w) {
+  const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'PUT', 'Access-Control-Allow-Headers': 'Content-Range', 'Access-Control-Max-Age': '600' };
+  if (req.method === 'OPTIONS') { w.sales.preflights++; res.writeHead(204, cors); res.end(); return; }
+  const [p, qs = ''] = req.url.split('?'), id = p.slice('/up/'.length), chunks = [];
+  req.on('data', x => chunks.push(x));
+  req.on('end', () => {
+    const buf = Buffer.concat(chunks), range = String(req.headers['content-range'] || ''), s = w.sales.sessions[id];
+    const put = { id, method: req.method, range, auth: !!req.headers.authorization, len: buf.length, tempauth: new URLSearchParams(qs).get('tempauth') || '' };
+    w.sales.puts.push(put);
+    const send = (status, json) => { res.writeHead(status, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify(json)); };
+    const m = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(range);
+    if (req.method !== 'PUT' || !s || !m || put.auth) return send(400, { error: { code: 'invalidRequest', message: 'Not a part of an upload session.' } });
+    const a = +m[1], b = +m[2], total = +m[3];
+    if (a !== s.got || b - a + 1 !== buf.length || (s.total != null && s.total !== total)) return send(416, { error: { code: 'invalidRange', message: 'The range does not follow on.' } });
+    const answer = () => {
+      s.total = total; s.parts.push(buf); s.got = b + 1;
+      if (s.got < total) return send(202, { expirationDateTime: new Date(Date.now() + 864e5).toISOString(), nextExpectedRanges: [`${s.got}-`] });
+      const sent = Buffer.concat(s.parts);
+      const bytes = w.o.salesResized ? spResized(sent) : w.o.salesBadSize ? sent.subarray(0, Math.floor(sent.length / 2)) : sent;
+      w.sales.file = { id: 'itm-sales', name: SALES_FILE, size: bytes.length, bytes, sent, eTag: `"{5A1E5000-0000-4000-8000-00000000000${++w.sales.version}},1"`, at: new Date().toISOString() };
+      send(201, salesItem(w.sales.file));
+    };
+    if (w.o.salesSlowPut && !s.parts.length) {
+      w.pending.add('put');
+      const timer = setTimeout(() => { w.pending.delete('put'); answer(); }, 25000);
+      res.on('close', () => { if (w.pending.delete('put')) { clearTimeout(timer); w.sales.aborted++; } });
+      return;
+    }
+    answer();
+  });
+}
+
 // Pre-signed download links: no sign-in needed, cross-origin with CORS open, and no Authorization header expected.
 function downloadServer() {
   return createServer((req, res) => {
+    if (world && req.url.startsWith('/up/')) { uploadPart(req, res, world); return; }
     const cors = { 'Access-Control-Allow-Origin': '*' };
+    // The sales sheet the library holds, through its download link (logged as "sales file").
+    if (world && req.url.startsWith('/sales/')) {
+      const w = world, f = w.sales.file;
+      w.downloads.push({ name: 'sales file', method: req.method, auth: !!req.headers.authorization });
+      if (req.method === 'OPTIONS') { res.writeHead(204, cors); res.end(); return; }
+      if (!f || req.method !== 'GET' || req.url.split('?')[0] !== `/sales/${f.id}`) { res.writeHead(404, cors); res.end(); return; }
+      res.writeHead(200, { ...cors, 'Content-Type': 'application/octet-stream', 'Content-Length': f.bytes.length });
+      res.end(f.bytes);
+      return;
+    }
     const name = decodeURIComponent(req.url.split('?')[0]).replace(/^\/fx\//, '');
     const w = world;
     if (w) w.downloads.push({ name, method: req.method, auth: !!req.headers.authorization });
@@ -644,20 +755,24 @@ function downloadServer() {
 
 // opts.scp: the permissions the fake sign-in's tokens carry (the page reads them from the token, as from a real one);
 // MSAL's result lists them too, as the sign-in service's reply does. opts.opaque: tokens the page can't decode.
-// opts.noStorage: browser storage blocked, as in some locked-down browsers.
+// opts.noStorage: browser storage blocked, as in some locked-down browsers. opts.tab: the tab the page last showed (it
+// opens on it). opts.breakSum: a bug made on purpose, so the page's own sums disagree with an engine's: 'sell' adds a
+// unit to the selling engine's Available now total, 'stages' puts the stage engine's balance off by 7 units.
 function initScript(pageOrigin, opts = {}) {
   return `(() => {
   if (window.__headless) return;
   const H = window.__headless = { blocked: [], requests: [], msal: [], msalSetTried: 0, config: null, tokens: 0, forced: 0, scp: ${JSON.stringify(opts.scp || READ_SCP)}, opaque: ${!!opts.opaque} };
-  const GRAPH = ${JSON.stringify(GRAPH)}, PAGE = ${JSON.stringify(pageOrigin)}, DL = ${JSON.stringify(DL)};
+  const GRAPH = ${JSON.stringify(GRAPH)}, PAGE = ${JSON.stringify(pageOrigin)}, DL = ${JSON.stringify(DL)}, UP = ${JSON.stringify(UP_HOST + '/_up/')};
   const realFetch = window.fetch.bind(window);
-  // Graph goes to the local stand-in; the page and the download host pass; anything else is refused and recorded.
-  // Every call is logged with its method and the address the page asked for.
+  // Graph goes to the local stand-in; the upload address (invented, on *.sharepoint.com) to the download host's /up/; the
+  // page and the download host pass; anything else is refused and recorded. Every call is logged with its method and
+  // the address the page asked for.
   window.fetch = function (input, init) {
     const url = typeof input === 'string' ? input : (input && input.url) || String(input);
     const method = String((init && init.method) || (input && typeof input === 'object' && input.method) || 'GET').toUpperCase();
-    H.requests.push({ method, url });
+    H.requests.push({ method, url, auth: !!(init && init.headers && Object.keys(init.headers).some(k => /^authorization$/i.test(k))) });
     if (url === GRAPH || url.startsWith(GRAPH + '/')) return realFetch(PAGE + '/__graph' + url.slice(GRAPH.length), init);
+    if (url.startsWith(UP)) return realFetch(DL + '/up/' + url.slice(UP.length), init);
     let o = '';
     try { o = new URL(url, location.href).origin; } catch (e) { /* not a URL */ }
     if (o === PAGE || o === DL) return realFetch(input, init);
@@ -676,6 +791,34 @@ function initScript(pageOrigin, opts = {}) {
   H.longWaiting = () => long.size;
   H.fireLong = () => { const due = [...long.values()]; long.clear(); for (const t of due) t.fn(...t.args); return due.length; };
   ${opts.noStorage ? `Object.defineProperty(window, 'localStorage', { configurable: true, get() { throw new DOMException('Storage is blocked.', 'SecurityError'); } });` : ''}
+  ${opts.tab ? `try { localStorage.setItem('inv:tab2', ${JSON.stringify(opts.tab)}); } catch (e) { /* about:blank */ }` : ''}
+  ${opts.breakSum ? `(() => {
+    const kind = ${JSON.stringify(opts.breakSum)}, name = kind === 'stages' ? 'InvStages' : 'InvSell', fn = kind === 'stages' ? 'build' : 'buildSell';
+    let api;
+    Object.defineProperty(window, name, { configurable: true, get: () => api, set: x => {
+      api = x && { ...x, [fn]: (...a) => {
+        const r = x[fn](...a);
+        if (r && r.ok !== false && kind === 'stages' && r.balance) r.balance = { ...r.balance, diff: 7 };
+        if (r && r.ok !== false && kind === 'sell' && r.totals) r.totals = { ...r.totals, now: r.totals.now + 1 };
+        return r;
+      } };
+    } });
+  })();` : ''}
+  // A file the page hands over to save (the Download button): kept here, never saved to disk. H.savedFile(i) answers its
+  // bytes as base64.
+  H.saved = []; H.blobs = new Map();
+  const realUrl = URL.createObjectURL.bind(URL);
+  URL.createObjectURL = function (b) { const u = realUrl(b); if (b && /spreadsheetml/.test(b.type || '')) H.blobs.set(u, b); return u; };
+  HTMLAnchorElement.prototype.click = (click => function () {
+    if (this.hasAttribute('download')) { H.saved.push({ name: this.getAttribute('download'), href: this.href, blob: H.blobs.get(this.href) || null }); return; }
+    return click.call(this);
+  })(HTMLAnchorElement.prototype.click);
+  H.savedFile = async i => {
+    const x = H.saved[i], b = x && x.blob ? new Uint8Array(await x.blob.arrayBuffer()) : new Uint8Array(0);
+    let s = '';
+    for (let j = 0; j < b.length; j += 0x8000) s += String.fromCharCode.apply(null, b.subarray(j, j + 0x8000));
+    return btoa(s);
+  };
   const b64u = o => btoa(JSON.stringify(o)).replace(/=+$/, '').replace(/\\+/g, '-').replace(/\\//g, '_');
   const account = ${JSON.stringify(ACCOUNT)};
   class InteractionRequiredAuthError extends Error { constructor(m) { super(m); this.name = 'InteractionRequiredAuthError'; } }
@@ -885,10 +1028,19 @@ const pair = (card, label) => { const p = card && card.pairs.find(x => x[0] === 
 const rc = e => `${fmtN(e.read)} read / ${fmtN(e.counted)} counted`;
 const mailText = c => (c && c.body && c.body.message) || {};
 const mailKey = (today, k) => `inv:mailed:${C.isoDay(today)}:${k}`;
-// The read-only rule, three ways: as the page asked (the fake fetch), as Edge sent it, and as the stand-in got it.
-const okPage = r => r.method === 'GET' || (r.method === 'POST' && r.url === GRAPH + '/me/sendMail');
-const okNet = origin => r => r.method === 'GET' || (r.method === 'POST' && r.url === `${origin}/__graph/me/sendMail`);
-const okCall = x => x.method === 'GET' || (x.method === 'POST' && x.path === '/me/sendMail');
+// The read-only rule, three ways: as the page asked (the fake fetch), as Edge sent it, and as the stand-in got it. Allowed:
+// any GET; the email POST; a POST /$batch whose requests are all GETs with no body; the sales sheet's upload session in
+// its library (exactly SESSION_PATH); PUTs to an upload address, never with a sign-in token (and the browser's CORS
+// preflight for them). Every PUT is also checked against the addresses the sessions gave (putsOk).
+const SESSION_ENC = SESSION_PATH.split('/').map(encodeURIComponent).join('/').replace(/%3A/g, ':');
+const okPage = r => r.method === 'GET' || (r.method === 'POST' && [GRAPH + '/me/sendMail', GRAPH + '/$batch', GRAPH + SESSION_ENC].includes(r.url)) ||
+  (r.method === 'PUT' && r.url.startsWith(UP_HOST + '/_up/') && !r.auth);
+const okNet = origin => r => r.method === 'GET' || (r.method === 'POST' && [`${origin}/__graph/me/sendMail`, `${origin}/__graph/$batch`, `${origin}/__graph${SESSION_ENC}`].includes(r.url)) ||
+  ((r.method === 'PUT' || r.method === 'OPTIONS') && r.url.startsWith(`${DL}/up/`));
+const batchOfGets = b => !!b && Array.isArray(b.requests) && b.requests.length > 0 && b.requests.length <= 20 && b.requests.every(x => x && x.method === 'GET' && x.body == null);
+const okCall = x => x.method === 'GET' || (x.method === 'POST' && (x.path === '/me/sendMail' || x.path === SESSION_PATH || (x.path === '/$batch' && batchOfGets(x.body))));
+// Every PUT the upload host got: to an address a session gave, as a PUT, with no Authorization header.
+const putsOk = w => w.sales.puts.every(p => p.method === 'PUT' && !p.auth && !!w.sales.sessions[p.id] && w.sales.urls.some(u => u.includes(`/_up/${p.id}?tempauth=${p.tempauth}`)));
 
 function greenExcept(c, s, except) {
   for (const k of ['msl', 'tracker', 'pobook', 'ct', 'forwarder', 'drayage', 'upc'].filter(k => !except.includes(k))) {
@@ -1048,6 +1200,111 @@ function sellRowsDiffer(p, S, today, stock) {
   return bad;
 }
 
+// ---- the sales sheet: its status (the chip, its row on Problems), the Download button, the photos on Available to
+// sell's rows and the lines under "Sales sheet" on Problems, in one call.
+const SA = `(() => {
+  const q = s => document.querySelector(s), txt = el => (el ? el.textContent.replace(/\\s+/g, ' ').trim() : '');
+  const ch = q('#chip-sales'), row = q('#srow-sales'), dl = q('#salesDl'), H = window.__headless || {};
+  const iss = [];
+  let g = '';
+  for (const tr of document.querySelectorAll('#issTable tbody tr')) {
+    if (tr.classList.contains('gh')) { g = txt(tr); continue; }
+    if (g.startsWith('Sales sheet') && tr.querySelector('td.msg')) iss.push({ code: tr.querySelector('td').title || '', msg: txt(tr.querySelector('td.msg')) });
+  }
+  return {
+    chip: ch ? { state: ch.dataset.state, text: txt(ch), title: ch.getAttribute('title') || '', em: txt(ch.querySelector('em')), small: txt(ch.querySelector('small')),
+      buttons: [...ch.querySelectorAll('button')].map(txt), link: (ch.querySelector('a') || {}).href || '' } : null,
+    row: txt(row), rowPill: txt(row && row.querySelector('.pill')),
+    dl: { shown: !!dl && !dl.hidden && !dl.closest('[hidden]'), disabled: q('#btnSalesDl').disabled, title: dl ? dl.title : '', msg: txt(q('#salesDlMsg')), cancel: !q('#btnSalesDlX').hidden },
+    picsClass: q('#sellTable').classList.contains('pics'),
+    pics: [...document.querySelectorAll('#sellTable tbody tr.r')].map(tr => { const p = tr.querySelector('.pic');
+      return { style: txt(tr.querySelector('button.sb')), img: !!p && p.tagName === 'IMG' && /^blob:/.test(p.src) && p.naturalWidth > 0, none: !!p && p.classList.contains('none'), text: txt(p), upc: txt(tr.querySelector('td .u')) }; }),
+    issGroup: [...document.querySelectorAll('#issTable tr.gh')].map(txt).find(t => t.startsWith('Sales sheet')) || '', iss,
+    probBad: q('#tabs .tab.iss').classList.contains('bad'), saved: (H.saved || []).map(x => ({ name: x.name, has: !!x.blob })), toast: txt(q('#toast')),
+  };
+})()`;
+const sa = t => t.eval(SA);
+// Every row in view shows its photo (decoded), or "no photo" when SELL_PICS has none for it.
+const PICS_DRAWN = `[...document.querySelectorAll('#sellTable tbody tr.r')].every(tr => { const b = tr.querySelector('button.sb'), p = tr.querySelector('.pic');
+  return !!b && !!p && (['SL-101', 'SL-102', 'SL-105', 'SL-107', 'SL-110'].includes(b.textContent) ? p.tagName === 'IMG' && p.naturalWidth > 0 : p.classList.contains('none')); })`;
+const chipIs = state => `(() => { const c = document.getElementById('chip-sales'); return !!c && c.dataset.state === ${JSON.stringify(state)}; })()`;
+// The invented photos: noise (so a photo stays a realistic size once the page makes it small), square, wide, tall, other.
+function makePhotos() {
+  const out = [];
+  for (const [w, h, seed] of [[360, 360, 11], [360, 240, 23], [240, 360, 37], [360, 300, 41]]) {
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    const x = c.getContext('2d'), img = x.createImageData(w, h);
+    let s = seed;
+    for (let i = 0; i < img.data.length; i += 4) { s = (Math.imul(s, 1103515245) + 12345) >>> 0; img.data[i] = s >>> 24; img.data[i + 1] = (s >>> 16) & 255; img.data[i + 2] = (s >>> 8) & 255; img.data[i + 3] = 255; }
+    x.putImageData(img, 0, 0);
+    out.push(c.toDataURL('image/jpeg', 0.92).split(',')[1]);
+  }
+  return out;
+}
+// Photos for the selling set: five styles have one (square, wide, tall), the rest none (404).
+const SELL_PICS = { 'SL-101': 'photo-1.jpg', 'SL-102': 'photo-2.jpg', 'SL-105': 'photo-3.jpg', 'SL-107': 'photo-4.jpg', 'SL-110': 'photo-1.jpg' };
+const PICS = { cfg: { photos: PHOTO_LOC }, photos: k => SELL_PICS[k] || null };
+// Names, numbers and words in the invented files that must never be in the sales sheet (factory, customer, PO,
+// container, round, section, person, file, place, the ERP's warehouses, brand, and what Available to sell says inside).
+const MARKS_SELL = ['Factory S', 'Customer', 'Brand S', 'Test Saver', 'Test User', 'test.user', 'example', 'Saul', 'GGGU1111111', 'FFFU5555555', 'EEEU3333333',
+  'Round 3', 'Planning A', 'Hidden Rows', 'China Pickup', 'Cosmetics', 'Master Sheet', 'PO Status', 'Container Tracking', 'Inventory Report', 'sharepoint', 'contoso',
+  'Photo Store', 'oversold', 'Oversold', 'In WH', 'warehouse', '>LA<', '>NJ<', 'Sold', 'flag'];
+const MARKS_PO = Array.from({ length: 13 }, (_, i) => String(900500 + i));
+// An Excel file the page made, opened here as Excel would read it (ExcelJS) and as a zip: its tabs, rows, pictures,
+// and any marker found in its text (every XML part; the PO numbers in the cell text and values).
+async function openSheet(bytes, marks) {
+  const EX = loadExcelJS(), wb = new EX.Workbook();
+  await wb.xlsx.load(Buffer.from(bytes));
+  const ws = wb.getWorksheet(SS.TABS.sell), wd = wb.getWorksheet(SS.TABS.byDate), parts = xlsxParts(new Uint8Array(bytes));
+  const xml = [...parts].filter(([p]) => /\.(xml|rels)$/i.test(p)).map(([p, b]) => [p, Buffer.from(b).toString('utf8')]);
+  const found = [];
+  for (const [p, text] of xml) {
+    for (const m of marks) if (text.includes(m)) found.push(`${m} in ${p}`);
+    if (/^xl\/(sharedStrings|worksheets\/)/.test(p)) for (const m of MARKS_PO) if (text.includes(m)) found.push(`${m} in ${p}`);
+  }
+  const styles = [];
+  if (ws) ws.eachRow((r, n) => { if (n > 2) styles.push(String(r.getCell(2).value)); });
+  const coreXml = (xml.find(([p]) => p === 'docProps/core.xml') || [])[1] || '';
+  return { tabs: wb.worksheets.map(x => x.name), rows: ws ? ws.rowCount : 0, dateRows: wd ? wd.rowCount : 0, images: ws ? ws.getImages().length : 0,
+    media: [...parts.keys()].filter(p => /^xl\/media\//.test(p)).length, styles, found, creator: (/<dc:creator>([^<]*)</.exec(coreXml) || [])[1] || '',
+    keywords: (/<cp:keywords>([^<]*)</.exec(coreXml) || [])[1] || '', title: ws ? String(ws.getCell('A1').value) : '', sub: ws ? String(ws.getCell('D1').value) : '' };
+}
+// The sheet's rows as the page should make them: the selling engine here, then core/salesSheet.js.
+const sheetFor = (fx, today, f) => { const { S } = sellFor(fx, today, f); return S && S.ok ? SS.salesRows(S, { today }) : null; };
+// What every saving scenario checks once the sheet is saved: one session (replacing the file), every part in order with
+// no token, the file whole in the library and as the page's sheet, the page's mark of it, and the chip.
+async function savedChecks(c, t, w, want, o = {}) {
+  const sess = w.calls.filter(x => x.method === 'POST' && x.path === SESSION_PATH);
+  c('upload sessions, each replacing the file (conflictBehavior "replace")', sess.length === (o.sessions || 1) && w.sales.bodies.every(b => b && b.item && b.item['@microsoft.graph.conflictBehavior'] === 'replace'),
+    `${sess.length} sessions: ${JSON.stringify(w.sales.bodies)}`);
+  const f = w.sales.file, puts = w.sales.puts.filter(p => p.id === 'sess' + w.sales.made);
+  const ranges = puts.map(p => /^bytes (\d+)-(\d+)\/(\d+)$/.exec(p.range)).filter(Boolean);
+  const contiguous = ranges.length === puts.length && ranges.length > 0 && ranges.every((m, i) => +m[1] === (i ? +ranges[i - 1][2] + 1 : 0)) && +ranges[ranges.length - 1][2] + 1 === +ranges[0][3];
+  c(`every part PUT in order with its Content-Range and no Authorization header (${puts.length} part${puts.length === 1 ? '' : 's'})`, contiguous && puts.every(p => !p.auth) && (!o.parts || puts.length >= o.parts),
+    puts.map(p => `${p.range} ${p.len}${p.auth ? ' TOKEN' : ''}`).join('; '));
+  if (o.parts) c('every part but the last is 10 × 320 KiB', puts.slice(0, -1).every(p => p.len === 10 * 320 * 1024), puts.map(p => p.len).join(', '));
+  const asked = (await t.snap()).requests.filter(x => x.method === 'PUT');
+  c('the page sent its PUTs only to the address the session gave, without a token', asked.length >= puts.length && asked.every(x => w.sales.urls.includes(x.url) && !x.auth), asked.map(x => x.url).join('; '));
+  c('the whole file arrived (bytes received = the size in the Content-Range)', !!f && ranges.length > 0 && f.sent.length === +ranges[0][3], f ? `${f.sent.length} bytes` : 'no file');
+  const got = f ? await openSheet(f.sent, MARKS_SELL) : null;
+  if (got) {
+    c(`the saved file opens: tabs "${SS.TABS.sell}" and "${SS.TABS.byDate}", the title, ${want.rows.length} style rows, ${want.byDate.length} schedule rows`,
+      got.tabs.join('|') === `${SS.TABS.sell}|${SS.TABS.byDate}` && got.title === SS.TITLE && got.rows === want.rows.length + 2 && got.dateRows === want.byDate.length + 1 &&
+      got.styles.join() === want.rows.map(r => r.style).join(), JSON.stringify({ tabs: got.tabs, title: got.title, rows: got.rows, dateRows: got.dateRows }));
+    c(`it has the photos: ${fmtN(o.pics)} pictures, one per style with a photo`, got.images === o.pics && got.media === o.pics, `${got.images} images, ${got.media} media files`);
+    c('none of the names, numbers or words that stay inside are in any part of it; made by "Shalam Tool", never a person', !got.found.length && got.creator === 'Shalam Tool', got.found.slice(0, 8).join('; ') || got.creator);
+  }
+  c('the item was read back after the upload to confirm it', w.calls.some(x => x.method === 'GET' && x.path === `/drives/${SALES_DRV}/items/itm-sales`));
+  const s = await t.snap(), mark = s.store && JSON.parse(s.store['inv:sales'] || 'null');
+  c("this browser keeps the file's eTag and the sheet's fingerprint, the one written in the file (its keywords)", !!mark && !!f && mark.eTag === f.eTag && /^[0-9a-f]{64}$/.test(mark.fp || '') &&
+    mark.where === `${SALES_LIB}|${SALES_FILE}` && !!got && got.keywords === mark.fp, `${JSON.stringify(mark)} · keywords ${got && got.keywords}`);
+  const p = await sa(t);
+  c('the chip: "Sales sheet saved m/d h:mm AM", styles and photos, no name', p.chip.state === 'ok' && /^saved \d{1,2}\/\d{1,2} \d{1,2}:\d{2} [AP]M$/.test(p.chip.em) &&
+    p.chip.small === `${fmtN(want.rows.length)} style${want.rows.length === 1 ? '' : 's'}, ${fmtN(o.pics)} photo${o.pics === 1 ? '' : 's'}` && !/Test (User|Saver)/.test(p.chip.text + p.chip.title), JSON.stringify(p.chip));
+  return { got, p };
+}
+
 const SCENARIOS = [
   {
     name: 'ok', title: 'everything fine', world: {},
@@ -1060,7 +1317,15 @@ const SCENARIOS = [
       for (const k of ['msl', 'tracker', 'pobook', 'ct', 'forwarder', 'drayage', 'upc']) {
         c(`${NAMES[k]} chip shows "${rc(e[k])}"`, s.chips[k] && s.chips[k].text.includes(rc(e[k])), s.chips[k] && s.chips[k].text);
       }
-      c('chips show who saved the file', s.chips.ct.text.includes('Test Saver'), s.chips.ct.text);
+      // No person's name on a chip (Saul, Nov 2); its tooltip still says who saved the file.
+      c("no chip names who saved its file; the tooltip does", KEYS.every(k => !s.chips[k].text.includes('Test Saver')) && s.chips.ct.title.includes('by Test Saver'),
+        `${s.chips.ct.text} | ${s.chips.ct.title}`);
+      const sc0 = await t.eval(SA);
+      c("the sales sheet's status is in the sources row: grey \"saving off\", the Entra step not done (no saving permission in the token), no name on it",
+        !!sc0.chip && sc0.chip.state === 'off' && sc0.chip.em === 'saving off' && sc0.chip.title.includes("Shalam Tool isn't allowed to save yet: the Entra step isn't done") &&
+        !/Test (User|Saver)/.test(sc0.chip.text + sc0.chip.title) && !sc0.chip.buttons.length, JSON.stringify(sc0.chip));
+      c('photos are off (photos blank in the test config.js): no photo box, no photo lookup', !sc0.picsClass && !w.photoLookups.length && !w.calls.some(x => x.path === '/$batch'), `${w.photoLookups.length} lookups`);
+      c('nothing asked of the sales library', !w.calls.some(x => x.path.includes(SALES_DRV)), w.calls.filter(x => x.path.includes(SALES_DRV)).map(x => x.path).join('; '));
       c('Container Tracking chip links to the file', s.chips.ct.href === webUrl('itm-ct'), s.chips.ct.href);
       const shares = w.calls.filter(x => x.path.startsWith('/shares/'));
       c('both sharing links resolved through /shares/u!…/driveItem, without the redeem header',
@@ -1104,7 +1369,7 @@ const SCENARIOS = [
       c('Pull from China tab draws', s.tabs.pull && !s.tabs.sell && !s.tabs.inv && !s.tabs.problems, JSON.stringify(s.tabs));
       await t.click('#tabs .tab[data-tab="problems"]');
       s = await t.snap();
-      c('Problems tab: sources table with 8 rows', s.tabs.problems && s.srcRows === 8, `${s.srcRows} rows`);
+      c("Problems tab: sources table with 8 rows and the sales sheet's", s.tabs.problems && s.srcRows === 9 && /^Sales sheet/.test((await t.eval(SA)).row), `${s.srcRows} rows`);
       c(`Problems tab: every issue listed (${e.totalIssues})`, s.issueRows === e.totalIssues, `${s.issueRows} rows`);
       const groups = ['tracker', 'msl', 'pobook', 'ct', 'forwarder', 'drayage', 'upc', 'incoming', 'sell', 'ats'].filter(k => e[k].issues > 0).length;
       c(`Problems tab: issues grouped by source (${groups} groups, Incoming and Available to sell included) with counts in plain words, not codes`,
@@ -1482,7 +1747,7 @@ const SCENARIOS = [
     init: { scp: 'User.Read Sites.Read.All Sites.ReadWrite.All Files.ReadWrite.All Mail.Send' }, noGraph: true,
     async run({ t, w, c }) {
       const s = await t.snap();
-      stopChecks(c, s, w, ['Shalam Tool must be read-only, but its sign-in still allows changes to SharePoint (Sites.ReadWrite.All, Files.ReadWrite.All). In Entra, remove that permission from the Shalam Tool app and grant consent again.']);
+      stopChecks(c, s, w, ['Shalam Tool may only read (apart from the error email and saving the sales sheet), but its sign-in still allows changes to SharePoint (Sites.ReadWrite.All, Files.ReadWrite.All). In Entra, remove that permission from the Shalam Tool app and grant consent again.']);
       c('a fresh token was asked for once before stopping (a cached one may predate the fix)', s.forced >= 1, `${s.tokens} tokens, ${s.forced} forced`);
       c('no 5-minute refresh waiting', (await t.eval('window.__headless.longWaiting()')) === 0);
       t.shots.push(await t.shot('readonly'));
@@ -2406,6 +2671,323 @@ const SCENARIOS = [
       await t.click('#tabs .tab[data-tab="sell"]'); await sleep(100);
     },
   },
+  // ---------------------------------------------------------------- the sales sheet (Saul, Nov 2)
+  {
+    name: 'sales-save', title: 'the sales sheet: saved after a clean load (photos, one upload session, parts with no token), then "up to date" (in another browser too, and after SharePoint changes its eTag), then saved again when the file holds something else',
+    world: { ...SELLW, ats: SELL_ATS, ...PICS }, init: { scp: SAVE_SCP }, photos: true, saves: true,
+    async run({ t, w, c, today, newTab }) {
+      const want = sheetFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS }), pics = want ? want.rows.filter(r => SELL_PICS[r.photoKey]).length : 0;
+      c('the sheet worked out here from the same files has rows, and some of its styles have photos', !!want && want.rows.length > 5 && pics >= 3, JSON.stringify(want && want.counts));
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved', 30000);
+      await savedChecks(c, t, w, want, { pics });
+      await t.waitFor(PICS_DRAWN, 'the photos on the rows', 20000);
+      let p = await sa(t);
+      const withPic = p.pics.filter(x => x.img).map(x => x.style).sort(), wantPic = p.pics.map(x => x.style).filter(k => SELL_PICS[k]).sort();
+      c(`Available to sell: a photo at the start of each row with one (${wantPic.length}), a "no photo" mark on the others`,
+        p.picsClass && p.pics.length > 5 && withPic.join() === wantPic.join() && p.pics.every(x => x.img || (x.none && x.text === 'no photo')), JSON.stringify(p.pics.map(x => `${x.style}:${x.img ? 'img' : x.text}`)));
+      c('the row keeps its UPC line under the style', p.pics.some(x => /^\d{12}/.test(x.upc)), JSON.stringify(p.pics.map(x => x.upc)));
+      const none = want.rows.filter(r => !SELL_PICS[r.photoKey]).map(r => r.style), line = p.iss.find(x => x.code === 'no-photo');
+      c(`Problems: one line under "Sales sheet": "${none.length} styles on the sales sheet have no photo in Quote Images", naming them`,
+        p.iss.length === 1 && !!line && line.msg === `${none.length} styles on the sales sheet have no photo in Quote Images: ${none.join(', ')}.` && /^Sales sheet · 1 issue/.test(p.issGroup), JSON.stringify(p.iss));
+      const batches = w.calls.filter(x => x.path === '/$batch');
+      c('photos looked up by key in the thumb folder, in batches of GETs (20 at most)', batches.length > 0 && batches.every(x => batchOfGets(x.body) &&
+        x.body.requests.every(r => /^\/drives\/drv-src\/root:\/Photo%20Store\/thumb\/[A-Z0-9_-]+\.jpg\?select=id,size,@microsoft\.graph\.downloadUrl$/.test(r.url))), batches.map(x => x.body.requests.map(r => r.url).join(' ')).join(' | ').slice(0, 300));
+      c('each picture downloaded through its link, without a token', w.downloads.some(d => /^photo-/.test(d.name)) && w.downloads.every(d => !d.auth));
+      c('the Problems tab is not red over the sales sheet', !p.probBad);
+      t.shots.push(await t.shot('sales-save'));
+      // The next load: nothing in it changed and the library still has the file this browser saved.
+      let from = w.calls.length, puts = w.sales.puts.length;
+      const r = await runRefresh(t, w);
+      await t.waitFor(chipIs('ok'), 'the sales sheet check', 30000);
+      p = await sa(t);
+      const calls = w.calls.slice(from);
+      const reads = () => w.downloads.filter(d => d.name === 'sales file').length;
+      c('the 5-minute refresh: nothing changed, so "up to date": the file\'s eTag read, the file itself not, no new session, no PUT', r.fired === 1 && p.chip.em === 'up to date' &&
+        /^saved \d{1,2}\/\d{1,2} \d{1,2}:\d{2} [AP]M$/.test(p.chip.small) && calls.some(x => x.method === 'GET' && x.path === `/drives/${SALES_DRV}/root:/${SALES_FILE}`) &&
+        !calls.some(x => x.path === SESSION_PATH) && w.sales.puts.length === puts && !reads(), `${JSON.stringify(p.chip)} · ${reads()} reads · ${calls.filter(x => x.path.includes(SALES_DRV)).map(x => `${x.method} ${x.path}`).join('; ')}`);
+      // Another browser (its own storage, so no mark of this save) loads the same files: the file already holds its
+      // sheet, so it doesn't upload it again.
+      const t2 = await newTab();
+      try {
+        const p2 = await sa(t2), s2 = await t2.snap(), mark2 = s2.store && JSON.parse(s2.store['inv:sales'] || 'null');
+        c('another browser: "up to date" from the fingerprint in the file (read once through its link), no upload; it keeps the eTag', p2.chip.state === 'ok' && p2.chip.em === 'up to date' &&
+          w.sales.made === 1 && reads() === 1 && !!mark2 && mark2.eTag === w.sales.file.eTag && /^[0-9a-f]{64}$/.test(mark2.fp || '') && !t2.exceptions.length,
+          `${JSON.stringify(p2.chip)} · ${w.sales.made} sessions · ${reads()} reads · ${JSON.stringify(mark2)} · ${t2.exceptions.join(' | ')}`);
+      } finally { await t2.close(); }
+      // SharePoint gives the file another eTag (it rewrote it, or the other browser saved the same sheet): read once,
+      // still up to date; the next load knows the new eTag and doesn't read it again.
+      w.sales.file.eTag = '"{5A1E5000-0000-4000-8000-0000000000FF},7"';
+      await runRefresh(t, w);
+      await t.waitFor(chipIs('ok'), 'the sales sheet check', 30000);
+      p = await sa(t);
+      let mark = JSON.parse((await t.snap()).store['inv:sales'] || 'null');
+      c('the file\'s eTag changed, its content not: read once, "up to date", no upload; this browser keeps the new eTag', p.chip.em === 'up to date' && w.sales.made === 1 && reads() === 2 &&
+        !!mark && mark.eTag === '"{5A1E5000-0000-4000-8000-0000000000FF},7"', `${p.chip.em} · ${w.sales.made} sessions · ${reads()} reads · ${JSON.stringify(mark)}`);
+      await runRefresh(t, w);
+      await t.waitFor(chipIs('ok'), 'the sales sheet check', 30000);
+      p = await sa(t);
+      c('the load after: "up to date" by the eTag alone, the file not read again', p.chip.em === 'up to date' && w.sales.made === 1 && reads() === 2, `${p.chip.em} · ${reads()} reads`);
+      // Someone saved another file over it (no fingerprint of this sheet in it): saved again.
+      w.sales.file.bytes = w.fx.bytes.get('ats-sell.xlsx'); w.sales.file.size = w.sales.file.bytes.length;
+      w.sales.file.eTag = '"{5A1E5000-0000-4000-8000-0000000000EE},8"';
+      await runRefresh(t, w);
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved again', 30000);
+      p = await sa(t);
+      mark = JSON.parse((await t.snap()).store['inv:sales'] || 'null');
+      c('a file in the library that holds something else (another eTag, not this sheet\'s fingerprint) is saved again', w.sales.made === 2 && reads() === 3 && /^saved /.test(p.chip.em) &&
+        w.sales.file.eTag !== '"{5A1E5000-0000-4000-8000-0000000000EE},8"' && !!mark && mark.eTag === w.sales.file.eTag, `${w.sales.made} sessions · ${reads()} reads · ${p.chip.em}`);
+    },
+  },
+  {
+    name: 'sales-resized', title: 'SharePoint stores the sales sheet with its own properties written in (another size): read back and checked, saved; no Cancel once the file is replaced',
+    world: { ...SELLW, ats: SELL_ATS, ...PICS, salesResized: true, slow: { [`/drives/${SALES_DRV}/items/itm-sales`]: 4000 } }, init: { scp: SAVE_SCP }, photos: true, saves: true, wait: 'sales',
+    async run({ t, w, c, today }) {
+      const want = sheetFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS }), pics = want.rows.filter(r => SELL_PICS[r.photoKey]).length;
+      // The upload is done and the library holds the file; SharePoint is slow to answer the check after it.
+      const end = Date.now() + 45000;
+      while (!(w.sales.file && w.slowNow > 0) && Date.now() < end) await sleep(50);
+      let p = await sa(t);
+      c('while the file is checked after the upload: "saving…, checking it arrived whole", no Cancel (the file is already replaced)', !!w.sales.file && w.slowNow > 0 &&
+        p.chip.state === 'load' && p.chip.em === 'saving…' && p.chip.small === 'checking it arrived whole' && !p.chip.buttons.length, JSON.stringify(p.chip));
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved', 30000);
+      const f = w.sales.file;
+      c('the library holds it at another size than was sent (SharePoint\'s properties in it)', f.size !== f.sent.length, `${f.size} held, ${f.sent.length} sent`);
+      c('the page read it back once through its link to check it', w.downloads.filter(d => d.name === 'sales file').length === 1, JSON.stringify(w.downloads.filter(d => d.name === 'sales file')));
+      await savedChecks(c, t, w, want, { pics });
+      p = await sa(t);
+      c('saved, green: not red, no email, nothing on Problems', !p.probBad && !sendMails(w.calls).length && !p.iss.some(x => x.code === 'not-saved'), JSON.stringify(p.iss));
+      // The next load: up to date by the eTag this browser kept, without reading the file again.
+      await runRefresh(t, w);
+      await t.waitFor(chipIs('ok'), 'the sales sheet check', 30000);
+      p = await sa(t);
+      c('the next load: "up to date", no upload, the file not read again', p.chip.em === 'up to date' && w.sales.made === 1 && w.downloads.filter(d => d.name === 'sales file').length === 1, `${p.chip.em} · ${w.sales.made}`);
+    },
+  },
+  {
+    name: 'sales-race', title: 'a load finishes while the one before it still looks up the photos: each load saves (or not) its own sheet, by its own sources',
+    world: { ...SELLW, ats: { age: 10, file: 'ats-sell.xlsx' }, ...PICS, slow: { '/$batch': 6000 } }, init: { scp: SAVE_SCP }, photos: true, saves: true, wait: 'sales',
+    async run({ t, w, c, today }) {
+      // The first load: the ATS report is 10 days old (amber), so it may not save; its photos are being looked up.
+      await t.waitFor(`(() => { const c = document.getElementById('chip-sales'); return !!c && c.dataset.state === 'load' && /its photos/.test(c.textContent); })()`, 'the photo check after the first load', 45000);
+      const s1 = await t.snap();
+      c('first load: the ATS report amber (10 days old)', s1.chips.ats.state === 'warn', `${s1.chips.ats.state}: ${s1.chips.ats.text}`);
+      // Meanwhile the next load reads a report 2 days old: clean.
+      w.o.ats = { age: 2, file: 'ats-sell.xlsx' };
+      const fired = await t.eval('window.__headless.fireLong()');
+      await t.waitFor(`document.getElementById('chip-ats').dataset.state === 'ok'`, 'the next load', 20000);
+      c('the next load finished while the first one\'s photos were still looked up', fired === 1 && w.slowNow > 0 && !w.sales.made, `fired ${fired}, slow ${w.slowNow}, sessions ${w.sales.made}`);
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved', 60000);
+      await sleep(1500);
+      const got = await openSheet(w.sales.file.sent, MARKS_SELL), p = await sa(t);
+      c("one upload: the clean load's sheet; the first load's (from the old report) never saved", w.sales.made === 1 && got.sub.endsWith(`stock from the ERP report of ${C.fmtDay(TODAY - 2)}`) &&
+        /^saved /.test(p.chip.em), `${w.sales.made} sessions · ${got.sub} · ${p.chip.em}`);
+    },
+  },
+  {
+    name: 'sales-view', title: 'rows of Available to sell shown while the sales sheet\'s photos are looked up get their photos when that lookup ends',
+    world: { ...SELLW, ats: SELL_ATS, ...PICS, slow: { '/$batch': 5000 } }, init: { tab: 'inv' }, photos: true, wait: 'sales',
+    async run({ t, w, c }) {
+      // The page opens on Where it is: no row of Available to sell is drawn when the sources are in, and the sales
+      // sheet's own lookup of every style's photo is under way.
+      const end = Date.now() + 45000;
+      while (!w.slowNow && Date.now() < end) await sleep(50);
+      // Only styles with something available, so every row shown is on the sales sheet (each one's photo in that lookup).
+      const before = await t.eval(`(() => { const el = document.getElementById('fAvail'); el.checked = true; el.dispatchEvent(new Event('change', { bubbles: true }));
+        return document.querySelector('#tabs .tab.on').dataset.tab; })()`);
+      await t.click('#tabs .tab[data-tab="sell"]');
+      await sleep(500);
+      const batches = w.calls.filter(x => x.path === '/$batch').length;
+      c('Available to sell shown (only styles with something available) while the photo lookup runs; no other lookup for its rows', before === 'inv' && w.slowNow === 1 && batches === 1, `${before}, ${w.slowNow} waiting, ${batches} batches`);
+      await t.waitFor(PICS_DRAWN, 'the photos on the rows', 30000);
+      const p = await sa(t);
+      c('every row in view has its photo, or "no photo"', p.pics.length > 5 && p.pics.every(x => x.img || (x.none && x.text === 'no photo')) && p.pics.some(x => x.img), JSON.stringify(p.pics.map(x => `${x.style}:${x.img ? 'img' : x.text}`)));
+    },
+  },
+  {
+    name: 'sales-hidden', title: 'the account can\'t see the sales library (its site doesn\'t list it): amber, said plainly, no email',
+    world: { ...SELLW, ats: SELL_ATS, ...PICS, salesHidden: true }, init: { scp: SAVE_SCP }, photos: true,
+    async run({ t, w, c }) {
+      const p = await sa(t);
+      c("amber: \"Your account can't see Sales Test Library on /sites/TestReports (or salesLibrary in config.js names it wrongly)\"", p.chip.state === 'warn' && p.chip.em === 'not saved' &&
+        p.chip.small === "your account can't see it" && p.chip.title.includes("Your account can't see Sales Test Library on /sites/TestReports (or salesLibrary in config.js names it wrongly), so the sales sheet isn't saved from here.") &&
+        !p.chip.buttons.length, JSON.stringify(p.chip));
+      c('no email, Problems not red, no "not saved" line', !sendMails(w.calls).length && !p.probBad && !p.iss.some(x => x.code === 'not-saved'), JSON.stringify(p.iss));
+    },
+  },
+  ...['sell', 'stages'].map(kind => ({
+    name: 'sales-sum-' + kind, title: `${kind === 'sell' ? "the rows of Available to sell don't add up to the selling engine's total" : "the stage engine's balance is off"} (a bug): no sales sheet, nothing saved`,
+    world: { ...SELLW, ats: SELL_ATS, ...PICS }, init: { scp: SAVE_SCP, breakSum: kind }, photos: true,
+    async run({ t, w, c }) {
+      const p = await sa(t), why = `${kind === 'sell' ? "Available to sell doesn't" : "The stage numbers don't"} add up (a bug in Shalam Tool), so there's no sales sheet until it's fixed.`;
+      const note = await t.eval(`document.getElementById('${kind === 'sell' ? 'sellNote' : 'health'}').textContent`);
+      c(kind === 'sell' ? 'the page says Available to sell doesn\'t add up' : 'the page says the balance is off', kind === 'sell' ? /Available to sell doesn't add up/.test(note) : /Balance off by 7 units/.test(note), note.slice(0, 300));
+      c('not saved, the reason in plain words, no Save anyway', p.chip.state === 'warn' && p.chip.em === 'not saved' && p.chip.small === why && !p.chip.buttons.length, JSON.stringify(p.chip));
+      c('the Download button is off, with the reason', p.dl.disabled && p.dl.title === why, JSON.stringify(p.dl));
+      c('nothing asked of the sales library', !w.calls.some(x => x.path.includes(SALES_DRV)));
+    },
+  })),
+  {
+    name: 'sales-photostore', title: 'the photo store can\'t be read (moved): not saved (the file keeps its photos), red, Saul emailed; Save anyway saves it without photos',
+    world: { ...SELLW, ats: SELL_ATS, cfg: { photos: '/sites/TestSite/Shared Documents/Moved Photos' }, photos: k => SELL_PICS[k] || null }, init: { scp: SAVE_SCP }, photos: true, saves: true,
+    async run({ t, w, c, today }) {
+      const end = Date.now() + 15000;
+      while (!sendMails(w.calls).length && Date.now() < end) await sleep(100);
+      await sleep(300);
+      let p = await sa(t);
+      const why = "the photos couldn't be read from Quote Images (There's no thumb folder in Moved Photos on /sites/TestSite (photos in config.js), so no photo can be found.)";
+      c('red: not saved, why, with Save anyway', p.chip.state === 'err' && p.chip.em === 'not saved' && p.chip.small === why && p.chip.buttons.join() === 'Save anyway', JSON.stringify(p.chip));
+      c('nothing uploaded yet', !w.sales.made && !w.calls.some(x => x.path === SESSION_PATH));
+      c('on Problems: the tab red, the photo line and the "not saved" line', p.probBad && p.iss.some(x => x.code === 'photo-error') && p.iss.some(x => x.code === 'not-saved'), JSON.stringify(p.iss));
+      const sends = sendMails(w.calls), msg = mailText(sends[0]);
+      c('one email: "Shalam Tool: Sales sheet — photos can\'t be read", saying what fixes it', sends.length === 1 && msg.subject === "Shalam Tool: Sales sheet — photos can't be read" &&
+        msg.body.content.includes('What fixes it: Check Quote Images and its thumb folder are still where photos in config.js says (moved or renamed?), or fix photos in config.js.'), `${sends.length} · ${msg.subject} · ${(msg.body && msg.body.content) || ''}`.slice(0, 600));
+      await t.click('#chip-sales button[data-sales="save"]');
+      await t.waitFor(chipIs('ok'), 'Save anyway to save', 30000);
+      const want = sheetFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS });
+      await savedChecks(c, t, w, want, { pics: 0 });
+      c('still one email', sendMails(w.calls).length === 1);
+    },
+  },
+  {
+    name: 'sales-badloc', title: 'salesLibrary in config.js isn\'t a /sites/<site>/<library>: red, and the email says to fix it in config.js',
+    world: { ...SELLW, ats: SELL_ATS, cfg: { salesLibrary: '/sites/TestReports' } }, init: { scp: SAVE_SCP },
+    async run({ t, w, c }) {
+      const end = Date.now() + 15000;
+      while (!sendMails(w.calls).length && Date.now() < end) await sleep(100);
+      await sleep(300);
+      const p = await sa(t), sends = sendMails(w.calls), msg = mailText(sends[0]);
+      c('red: not saved, the location', p.chip.state === 'err' && p.chip.em === 'not saved' && /salesLibrary in config.js \("\/sites\/TestReports"\) isn't a \/sites\/<site>\/<library>/.test(p.chip.title), JSON.stringify(p.chip));
+      c('one email, "What fixes it: Fix salesLibrary in config.js."', sends.length === 1 && msg.body.content.includes('What fixes it: Fix salesLibrary in config.js.'), `${sends.length} · ${(msg.body && msg.body.content) || ''}`.slice(0, 600));
+    },
+  },
+  {
+    name: 'sales-chunks', title: 'the sales sheet on 2,400 styles with photos: uploaded in 10 × 320 KiB parts, every byte arrives',
+    world: { ...BIG, ats: { age: 1, file: 'ats-big.xlsx' }, cfg: { photos: PHOTO_LOC }, photos: k => { const m = /^ST(\d{4})$/.exec(k); return m && +m[1] % 4 === 0 ? `photo-${(+m[1] / 4) % 4 + 1}.jpg` : null; } },
+    init: { scp: SAVE_SCP }, photos: true, saves: true, readyMs: 150000,
+    async run({ t, w, c, today }) {
+      const want = sheetFor(w.fx, today, { ...BIG_FILES, ats: { age: 1, file: 'ats-big.xlsx' } }), pics = want ? want.rows.filter(r => photoFile(w, r.photoKey)).length : 0;
+      c('the sheet worked out here has many rows and photos', !!want && want.rows.length > 1000 && pics > 150, JSON.stringify(want && want.counts));
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved', 60000);
+      const { got } = await savedChecks(c, t, w, want, { pics, parts: 2 });
+      const f = w.sales.file;
+      if (f) console.log(`  sales-chunks: ${fmtN(want.rows.length)} styles, ${fmtN(pics)} photos (invented noise) → ${fmtN(f.size)} bytes in ${w.sales.puts.length} parts`);
+      c('the file opened with every style in order', !!got && got.styles.length === want.rows.length);
+    },
+  },
+  {
+    name: 'sales-notclean', title: 'the sales sheet with a red source: not saved, says why, Save anyway saves it',
+    world: { ...SELLW, ats: SELL_ATS, ...PICS, drayFile: 'dray-bad.csv', drayOldFile: 'dray-bad.csv' }, init: { scp: SAVE_SCP }, photos: true, saves: true,
+    async run({ t, w, c, today }) {
+      const s = await t.snap(), p = await sa(t);
+      c('Drayage is red', s.chips.drayage.state === 'err', `${s.chips.drayage.state}: ${s.chips.drayage.text}`);
+      c('not saved: the chip says why ("Drayage didn\'t load"), amber, with Save anyway', p.chip.state === 'warn' && p.chip.em === 'not saved' && p.chip.small === "Drayage didn't load" &&
+        p.chip.title.includes("Not saved: Drayage didn't load. The file in Shalam Sales tool keeps its last good copy.") && p.chip.buttons.join() === 'Save anyway', JSON.stringify(p.chip));
+      c('nothing was saved and the library was not even looked up', !w.sales.made && !w.calls.some(x => x.path.includes(SALES_DRV)));
+      c('the drayage email went (the existing rules); none about the sales sheet', sendMails(w.calls).length === 1 && /Drayage/.test(mailText(sendMails(w.calls)[0]).subject || ''), sendMails(w.calls).map(x => mailText(x).subject).join(' | '));
+      await t.click('#chip-sales button[data-sales="save"]');
+      await t.waitFor(chipIs('ok'), 'Save anyway to save', 30000);
+      const want = sheetFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS, dray: null });
+      await savedChecks(c, t, w, want, { pics: want.rows.filter(r => SELL_PICS[r.photoKey]).length });
+      c('still only the drayage email', sendMails(w.calls).length === 1);
+      t.shots.push(await t.shot('sales-notclean'));
+    },
+  },
+  {
+    name: 'sales-noscope', title: 'no saving permission in the token: saving off, said plainly; photos and the Download button still work',
+    world: { ...SELLW, ats: SELL_ATS, ...PICS }, photos: true,
+    async run({ t, w, c, today }) {
+      const want = sheetFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS }), pics = want.rows.filter(r => SELL_PICS[r.photoKey]).length;
+      await t.waitFor(`[...document.querySelectorAll('#issTable tr.gh')].some(x => /^Sales sheet/.test(x.textContent.trim()))`, 'the photo line on Problems', 20000);
+      await t.waitFor(PICS_DRAWN, 'the photos on the rows', 20000);
+      let p = await sa(t);
+      c('saving off: grey, "Shalam Tool isn\'t allowed to save yet: the Entra step isn\'t done", not red, no button', p.chip.state === 'off' && p.chip.em === 'saving off' &&
+        p.chip.title.includes("Shalam Tool isn't allowed to save yet: the Entra step isn't done") && !p.chip.buttons.length && !p.probBad, JSON.stringify(p.chip));
+      c('nothing asked of the sales library, no email', !w.calls.some(x => x.path.includes(SALES_DRV)) && !sendMails(w.calls).length);
+      c('photos still on the rows (read access)', p.pics.filter(x => x.img).length === p.pics.filter(x => SELL_PICS[x.style]).length && p.pics.some(x => x.img), JSON.stringify(p.pics.map(x => `${x.style}:${x.img ? 'img' : x.text}`)));
+      c('the Problems line is there too', p.iss.some(x => x.code === 'no-photo'), JSON.stringify(p.iss));
+      c('the Download button "Sales sheet" is on Available to sell, ready', p.dl.shown && !p.dl.disabled && /^Download Sales Test\.xlsx/.test(p.dl.title), JSON.stringify(p.dl));
+      // Clicked: progress and Cancel show at once; the file is handed over to save.
+      const first = await t.eval(`(() => { document.getElementById('btnSalesDl').click(); return { msg: document.getElementById('salesDlMsg').textContent, cancel: !document.getElementById('btnSalesDlX').hidden, disabled: document.getElementById('btnSalesDl').disabled }; })()`);
+      c('while it is made: progress, Cancel, the button off', !!first.msg && first.cancel && first.disabled, JSON.stringify(first));
+      await t.waitFor('window.__headless.saved.length === 1', 'the download', 30000);
+      p = await sa(t);
+      const bytes = Buffer.from(await t.eval('window.__headless.savedFile(0)'), 'base64');
+      const got = await openSheet(bytes, MARKS_SELL);
+      c(`the downloaded ${SALES_FILE} opens: both tabs, ${want.rows.length} style rows, ${want.byDate.length} schedule rows`, p.saved[0].name === SALES_FILE &&
+        got.tabs.join('|') === `${SS.TABS.sell}|${SS.TABS.byDate}` && got.rows === want.rows.length + 2 && got.dateRows === want.byDate.length + 1 && got.styles.join() === want.rows.map(r => r.style).join(),
+        JSON.stringify({ name: p.saved[0].name, tabs: got.tabs, rows: got.rows, dateRows: got.dateRows }));
+      c(`it has ${pics} pictures`, got.images === pics && got.media === pics, `${got.images} images, ${got.media} media`);
+      c('none of the names, numbers or words that stay inside are in it', !got.found.length && got.creator === 'Shalam Tool', got.found.slice(0, 8).join('; ') || got.creator);
+      c('the toast says what it holds; the button is back', p.toast === `Sales sheet downloaded: ${want.rows.length} styles, ${pics} photos.` && !p.dl.disabled && !p.dl.cancel && !p.dl.msg, JSON.stringify({ toast: p.toast, dl: p.dl }));
+      // Cancel while it's made: nothing handed over.
+      await t.eval(`(() => { document.getElementById('btnSalesDl').click(); document.getElementById('btnSalesDlX').click(); })()`);
+      await t.waitFor(`/download cancelled/.test(document.getElementById('toast').textContent)`, 'the cancel', 15000);
+      await sleep(300);
+      p = await sa(t);
+      c('Cancel stops it: no second file, the button back', p.saved.length === 1 && !p.dl.disabled && !p.dl.cancel, JSON.stringify({ saved: p.saved.length, dl: p.dl }));
+      t.shots.push(await t.shot('sales-noscope'));
+    },
+  },
+  {
+    name: 'sales-403', title: 'the library refuses the upload session (403): amber, said plainly, no email',
+    world: { ...SELLW, ats: SELL_ATS, ...PICS, salesSession: 403 }, init: { scp: SAVE_SCP }, photos: true, saves: true,
+    async run({ t, w, c }) {
+      const p = await sa(t);
+      c("amber: \"Your account can't save to Shalam Sales tool, or the library hasn't been opened to Shalam Tool yet\"", p.chip.state === 'warn' && p.chip.em === 'not saved' &&
+        p.chip.title.includes("Your account can't save to Shalam Sales tool, or the library hasn't been opened to Shalam Tool yet") && !p.probBad, JSON.stringify(p.chip));
+      c('one session asked for, refused; no PUT, nothing saved, no email', w.sales.made === 0 && w.sales.bodies.length === 1 && !w.sales.puts.length && !w.sales.file && !sendMails(w.calls).length,
+        `${w.sales.bodies.length} asked, ${w.sales.puts.length} PUTs, ${sendMails(w.calls).length} emails`);
+      c('not on Problems as an issue', !p.iss.some(x => x.code === 'not-saved'), JSON.stringify(p.iss));
+    },
+  },
+  {
+    name: 'sales-cancel', title: 'Cancel while the sales sheet uploads: the upload stops, the library keeps its file; Save now saves it',
+    world: { ...SELLW, ats: SELL_ATS, ...PICS, salesSlowPut: true }, init: { scp: SAVE_SCP }, photos: true, saves: true, wait: 'sales',
+    async run({ t, w, c, today }) {
+      const end = Date.now() + 45000;
+      while (!w.pending.has('put') && Date.now() < end) await sleep(100);
+      let p = await sa(t);
+      c('saving shows on the chip, with Cancel', w.pending.has('put') && p.chip.state === 'load' && p.chip.em === 'saving…' && p.chip.buttons.join() === 'Cancel', JSON.stringify(p.chip));
+      await t.click('#chip-sales button[data-sales="cancel"]');
+      await t.waitFor(chipIs('warn'), 'the save to stop', 15000);
+      await sleep(300);
+      p = await sa(t);
+      c('the upload was stopped; the library keeps what it had (nothing replaced)', w.sales.aborted === 1 && !w.sales.file, `aborted ${w.sales.aborted}, file ${!!w.sales.file}`);
+      c('the chip: not saved, cancelled, with Save now; no email', p.chip.em === 'not saved' && p.chip.small === 'cancelled' && p.chip.buttons.join() === 'Save now' && !sendMails(w.calls).length, JSON.stringify(p.chip));
+      w.o.salesSlowPut = false;
+      await t.click('#chip-sales button[data-sales="save"]');
+      await t.waitFor(chipIs('ok'), 'Save now to save', 30000);
+      const want = sheetFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS });
+      await savedChecks(c, t, w, want, { pics: want.rows.filter(r => SELL_PICS[r.photoKey]).length, sessions: 2 });
+    },
+  },
+  {
+    name: 'sales-error', title: "the library holds the sales sheet cut short (not the size sent, and the copy read back doesn't open whole): red, on Problems, Saul emailed once",
+    world: { ...SELLW, ats: SELL_ATS, ...PICS, salesBadSize: true }, init: { scp: SAVE_SCP }, photos: true, saves: true,
+    async run({ t, w, c, today }) {
+      const end = Date.now() + 15000;
+      while (!sendMails(w.calls).length && Date.now() < end) await sleep(100);
+      await sleep(300);
+      const p = await sa(t), s = await t.snap(), sends = sendMails(w.calls), msg = mailText(sends[0]);
+      c('red: not saved, the sheet may not have been saved whole, with Save now', p.chip.state === 'err' && p.chip.em === 'not saved' && /may not have been saved whole/.test(p.chip.title) && p.chip.buttons.join() === 'Save now', JSON.stringify(p.chip));
+      c('on Problems: the tab red, the line under "Sales sheet", its row in the sources table', p.probBad && p.iss.some(x => x.code === 'not-saved' && /may not have been saved whole/.test(x.msg)) && /not saved/.test(p.rowPill),
+        JSON.stringify({ iss: p.iss, pill: p.rowPill }));
+      c('one email, as for a red source: "Shalam Tool: Sales sheet — not saved", to errorEmailTo', sends.length === 1 && msg.subject === 'Shalam Tool: Sales sheet — not saved' &&
+        msg.toRecipients[0].emailAddress.address === MAIL_TO && /may not have been saved whole/.test(msg.body.content) && !!(s.store && s.store[mailKey(today, 'sales')]), `${sends.length} · ${msg.subject}`);
+      c('no mark of a good save kept', !(s.store && s.store['inv:sales']));
+      t.shots.push(await t.shot('sales-error'));
+    },
+  },
+  {
+    name: 'sales-atsmissing', title: "no ATS report: no sales sheet (\"Available now\" would be wrong): not saved, no Save anyway, the Download button off with the reason",
+    world: { ...SELLW, ...PICS }, init: { scp: SAVE_SCP }, photos: true,
+    async run({ t, w, c }) {
+      const p = await sa(t), why = "There's no ATS report, so stock available now isn't known and there's no sales sheet.";
+      c('not saved, the reason in plain words, no button', p.chip.state === 'warn' && p.chip.em === 'not saved' && p.chip.small === why && !p.chip.buttons.length, JSON.stringify(p.chip));
+      c('the Download button is off, with the reason', p.dl.shown && p.dl.disabled && p.dl.title === why, JSON.stringify(p.dl));
+      c('nothing asked of the sales library; no photo line on Problems (there is no sheet)', !w.calls.some(x => x.path.includes(SALES_DRV)) && !p.iss.length, JSON.stringify(p.iss));
+    },
+  },
   {
     name: 'sell-real', title: 'Available to sell on local copies of the real files and the real ATS report (only when named, with REAL_DIR and REAL_ATS; numbers printed, nothing else)',
     world: { ...REAL, ats: { age: 1, file: 'real-ats.xlsx' } }, optIn: true,
@@ -2554,7 +3136,7 @@ async function main() {
   const ORIGIN = `http://127.0.0.1:${page.address().port}`;
   DL = `http://127.0.0.1:${dl.address().port}`;
   const allowedNet = okNet(ORIGIN);
-  const allCalls = [], allDownloads = [];
+  const allCalls = [], allDownloads = [], allWorlds = [];
 
   let edge = null;
   try {
@@ -2562,6 +3144,14 @@ async function main() {
     console.log(`Edge ${edge.version}, headless, InPrivate, sync off · page ${ORIGIN} · downloads ${DL}`);
     const early = await signInWindows(edge.cdp);
     sc('Edge opened no sign-in or sync window', !early.length, early.join(', '));
+    // The invented photos (noise, so they stay a realistic size once made small), drawn by Edge in a blank tab.
+    if (run.some(s => s.photos)) {
+      const pt = await openTab(edge.cdp, '(() => {})();');
+      const pics = await pt.eval(`(${makePhotos})()`);
+      await pt.close();
+      pics.forEach((b64, i) => fx.bytes.set(`photo-${i + 1}.jpg`, Buffer.from(b64, 'base64')));
+      sc('the invented photos were made (4 JPEGs, square, wide, tall)', pics.length === 4 && pics.every(b => Buffer.from(b, 'base64').subarray(0, 2).toString('hex') === 'ffd8'), pics.map(b => b.length).join(', '));
+    }
     let t = null, w = null;
     for (const s of run) {
       const checks = [];
@@ -2571,16 +3161,23 @@ async function main() {
       try {
         if (!s.after) {
           if (t) await t.close();
-          if (w) { allCalls.push(...w.calls); allDownloads.push(...w.downloads); }
+          if (w) { allCalls.push(...w.calls); allDownloads.push(...w.downloads); allWorlds.push(w); }
           w = world = newWorld(fx, s.world);
           t = await openTab(edge.cdp, initScript(ORIGIN, s.init));
           t.shots = [];
           await t.send('Page.navigate', { url: `${ORIGIN}/index.html` });
-          if (s.wait !== 'busy') await t.waitFor(READY, 'the sources to load');
+          if (!s.wait) await t.waitFor(READY, 'the sources to load', s.readyMs || 45000);
         }
         const before = { blocked: t.blocked.length, exceptions: t.exceptions.length, net: s.after ? t.net.length : 0,
           calls: s.after ? w.calls.length : 0, downloads: s.after ? w.downloads.length : 0 };
-        await s.run({ t, w, c, e, today });
+        // newTab(): another browser (its own storage) on the same SharePoint, loaded; the caller closes it.
+        const newTab = async () => {
+          const t2 = await openTab(edge.cdp, initScript(ORIGIN, s.init));
+          await t2.send('Page.navigate', { url: `${ORIGIN}/index.html` });
+          await t2.waitFor(READY, 'the other browser to load', s.readyMs || 45000);
+          return t2;
+        };
+        await s.run({ t, w, c, e, today, newTab });
         // Checks every scenario gets.
         const snap = await t.snap();
         const calls = w.calls.slice(before.calls), dls = w.downloads.slice(before.downloads), net = t.net.slice(before.net);
@@ -2588,8 +3185,15 @@ async function main() {
           ...net.filter(x => !allowedNet(x)).map(x => `Edge sent ${x.method} ${x.url}`),
           ...calls.filter(x => !okCall(x)).map(x => `Graph got ${x.method} ${x.path}`),
           ...dls.filter(d => d.method !== 'GET').map(d => `download host got ${d.method} ${d.name}`),
-          ...w.pageGets.filter(x => x.method !== 'GET').map(x => `page host got ${x.method} ${x.path}`)];
-        c('read-only: no request but GETs and POST https://graph.microsoft.com/v1.0/me/sendMail', net.length > 0 && !bad.length, bad.join('; ') || 'no requests seen');
+          ...w.pageGets.filter(x => x.method !== 'GET').map(x => `page host got ${x.method} ${x.path}`),
+          ...(putsOk(w) ? [] : w.sales.puts.map(p => `upload host got ${p.method} ${p.id}${p.auth ? ' with a token' : ''}`))];
+        c('only what may leave the page: GETs, the email POST, batches of GETs, the sales sheet\'s upload session and PUTs to its address (no token)', net.length > 0 && !bad.length, bad.join('; ') || 'no requests seen');
+        // The sales sheet is saved only with the saving permission in the token, and only in the scenarios that expect it.
+        const sessions = calls.filter(x => x.method === 'POST' && x.path === SESSION_PATH);
+        c(s.saves ? 'the sales sheet\'s upload session was asked for' : 'no upload session, no PUT (nothing saved in this scenario)',
+          s.saves ? sessions.length > 0 : !sessions.length && !w.sales.puts.length, `${sessions.length} sessions, ${w.sales.puts.length} PUTs`);
+        c('every batch held only GETs with no body, at most 20', calls.filter(x => x.path === '/$batch').every(x => batchOfGets(x.body)),
+          calls.filter(x => x.path === '/$batch' && !batchOfGets(x.body)).map(x => JSON.stringify(x.body).slice(0, 200)).join('; '));
         c('title is "M1S · …"', /^M1S · /.test(snap.title), snap.title);
         c('fake sign-in in place: the vendored msal loaded and could not replace it', snap.msalFake && snap.msalSetTried >= 1, `fake ${snap.msalFake}, set tried ${snap.msalSetTried}`);
         const cfg = snap.msalConfig && snap.msalConfig.auth;
@@ -2612,7 +3216,7 @@ async function main() {
       r.shots = t ? t.shots.splice(0) : [];
     }
     if (t) await t.close();
-    if (w) { allCalls.push(...w.calls); allDownloads.push(...w.downloads); }
+    if (w) { allCalls.push(...w.calls); allDownloads.push(...w.downloads); allWorlds.push(w); }
     // The guards themselves: a request to another host must be refused by both. 127.0.0.2 is still this machine, so
     // nothing leaves it even if a guard were broken.
     world = newWorld(fx, {});
@@ -2627,9 +3231,10 @@ async function main() {
     await t.close();
     // The read-only rule over the whole run, every tab: and the one POST was really seen, so the check is live.
     const badNet = ALL_NET.filter(x => !allowedNet(x) && !/guard-probe/.test(x.url));
-    sc(`whole run: every one of ${fmtN(ALL_NET.length)} requests was a GET or the email POST`, ALL_NET.length > 0 && !badNet.length, badNet.map(x => `${x.method} ${x.url}`).join('; '));
-    sc('whole run: the stand-in got no write (no PUT, PATCH, DELETE, or POST other than /me/sendMail)', !allCalls.filter(x => !okCall(x)).length && !allDownloads.some(d => d.method !== 'GET'),
+    sc(`whole run: every one of ${fmtN(ALL_NET.length)} requests was a GET, the email POST, a batch, the sales sheet's upload session or a PUT to its address`, ALL_NET.length > 0 && !badNet.length, badNet.map(x => `${x.method} ${x.url}`).join('; '));
+    sc('whole run: the stand-in got no other write (no PATCH, DELETE, or POST but the email, batches of GETs and the one upload session)', !allCalls.filter(x => !okCall(x)).length && !allDownloads.some(d => d.method !== 'GET'),
       allCalls.filter(x => !okCall(x)).map(x => `${x.method} ${x.path}`).join('; '));
+    sc('whole run: every PUT went to an address an upload session gave, without a token', allWorlds.every(putsOk), allWorlds.flatMap(x => x.sales.puts.filter(p => p.auth)).map(p => p.id).join(', '));
     // A few scenarios run by name may send no email at all; the whole run always does.
     if (!pick.length || allCalls.some(x => x.method === 'POST' && x.path === '/me/sendMail')) {
       sc('whole run: the email POST was seen (the check above is live)', ALL_NET.some(x => x.method === 'POST' && /\/__graph\/me\/sendMail$/.test(x.url)));

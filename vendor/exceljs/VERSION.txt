@@ -1,0 +1,6 @@
+ExcelJS 4.4.0 (its bundle is dated 19-10-2023), dist/exceljs.min.js, MIT License (LICENSE, from the npm package).
+From https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js, the address Quote Tracker loads it from;
+byte for byte the npm package's dist/exceljs.min.js (exceljs@4.4.0), and it matches cdnjs's published SRI hash
+sha512-dlPw+ytv/6JyepmelABrgeYgHI0O+frEwgfnPdXDTOIZz+eDgfW07QXG02/O8COfivBdGNINy+Vex+lYmJ5rxw==
+Writes the sales sheet with its photos. Loaded only when a sales sheet is built, not at the start.
+sha256: 7e49da68588e250dbb8bba190d2caa8ab3787cc0284bda1d8b2f805c4df742c9
