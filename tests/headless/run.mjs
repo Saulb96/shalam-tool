@@ -3,13 +3,16 @@
 // error email, the read-only rules and the tabs. The step 2 scenarios (s2-…) compare every stage number the page shows
 // with core/stages.js run here on the same files; the Available to sell scenarios (sell-…, ats…) compare the selling
 // view with core/ats.js and core/sell.js run here on the same files, and check Saul's pull-from date rule lot by lot
-// on their own (10 days before the ETD; else 5 days before the CRD; else about 75 days after the order date).
+// on their own (10 days before the ETD; else 5 days before the CRD; else about 75 days after the order date). The ERP
+// pictures scenarios (pics-…) serve invented ATS reports over 2 MB with a picture per style and check where each photo
+// comes from, what is downloaded, this browser's copy (IndexedDB) and that the pictures worker makes no request.
 //   node tests/headless/run.mjs [scenario,scenario…]      (default: all but s2-real and sell-real)
 //   REAL_DIR=<folder> [REAL_LISTS=<lists.json>] node tests/headless/run.mjs s2-real
 //   REAL_DIR=<folder> REAL_ATS=<ATS report.xlsx> node tests/headless/run.mjs sell-real
 // s2-real and sell-real run only when named: the page on local copies of the real files (served on 127.0.0.1 only;
 // numbers printed, nothing else). <folder> as for tools/check-real.mjs; the lists default to <folder>/lists.json;
-// sell-real serves the ATS report as saved yesterday, with yesterday's date in its name.
+// sell-real serves the ATS report as saved yesterday, with yesterday's date in its name; a report saved with its pictures
+// (2 MB or more) is read in the pictures worker, and sell-real then prints how long its pictures took in Edge.
 // Edge runs InPrivate, with sync off and a new throwaway profile; each scenario gets its own fresh browser context;
 // every request that isn't to 127.0.0.1 is blocked. Screenshots go to .tmp/. Exits 1 when any check fails.
 import { createServer } from 'node:http';
@@ -17,6 +20,7 @@ import { createServer as netServer } from 'node:net';
 import { spawn } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { deflateSync } from 'node:zlib';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep, extname } from 'node:path';
 import { loadXLSX, loadExcelJS, xlsxParts, core, root, xlsxBytes } from '../load.mjs';
@@ -62,7 +66,7 @@ const NAMES = { msl: 'Master Sheet Live', tracker: 'PO Status Tracker', pobook: 
 
 const X = loadXLSX();
 const C = core('common'), PB = core('pobook'), CT = core('ct'), SH = core('shipping'), UPC = core('upc'), ST = core('stages');
-const ATS = core('ats'), SELL = core('sell'), SS = core('salesSheet');
+const ATS = core('ats'), SELL = core('sell'), SS = core('salesSheet'), EP = core('erpPictures');
 const TODAY = C.todayNY(Date.now());   // the page works its dates out from the same clock
 const iso = days => new Date(Date.now() - days * 864e5).toISOString();
 const fmtN = v => (typeof v === 'number' ? v.toLocaleString('en-US') : String(v));
@@ -278,7 +282,60 @@ function buildFixtures(today) {
   // The PO Book page, served at /po-book/index.html: its CORE block as copied into core/pobook.js, or changed.
   const block = PB.coreText(readFileSync(join(REPO, 'core', 'pobook.js'), 'utf8'));
   const poBook = body => `<!doctype html><html><head><title>PO Book</title></head><body><script>\n/*CORE-START*/${body}/*CORE-END*/\n</script></body></html>`;
-  return { bytes, pob, upcPages, poBookSame: poBook(block), poBookChanged: poBook(block + '\n/* a rule changed */'), blockMatches: block != null && sha(block) === PB.CORE_SHA256 };
+  return { bytes, pob, upcPages, poBookSame: poBook(block), poBookChanged: poBook(block + '\n/* a rule changed */'), blockMatches: block != null && sha(block) === PB.CORE_SHA256,
+    sellAts, AH };
+}
+
+// ---- the ERP's report saved with its pictures (Saul, Nov 2): the selling report again, in the ERP's layout ("Image"
+// first in the header), with a picture in column A on a style's row, as ExcelJS writes them (the way the ERP does: a
+// two-cell anchor per picture). The invented pictures are noise, 3 wide by 1 high (so the page and the saved file can
+// tell them from Quote Images' invented photos), ~800 KB each, so the report is over 2 MB as a real one is.
+//   ats-pics-1.xlsx  five styles with a picture (ERP_PICS_1)
+//   ats-pics-2.xlsx  a newer one: six, every picture new; SL-108 also on a second warehouse row (In WH 0) with another
+//                    picture (its first by row is used, and Problems says they differ)
+//   ats-big-nopics.xlsx / -2  over 2 MB, no picture on the report's sheet (a big picture on another sheet only)
+//   ats-pics-bad.xlsx  ats-pics-1 with its drawing damaged (its pictures can't be read; its numbers can)
+const ERP_PICS_1 = { 'SL-101': 1, 'SL-104': 2, 'SL-105': 3, 'SL-108': 4, 'SL-109': 5 };
+const ERP_PICS_2 = { 'SL-101': 11, 'SL-102': 12, 'SL-104': 13, 'SL-105': 14, 'SL-108': 15, 'SL-109': 16 };
+// A PNG of noise (RGB), w × h, from a seed.
+function pngNoise(w, h, seed) {
+  const raw = Buffer.alloc((w * 3 + 1) * h);
+  let x = seed * 2654435761 >>> 0;
+  for (let i = 0; i < raw.length; i++) { if (i % (w * 3 + 1) === 0) { raw[i] = 0; continue; } x = (Math.imul(x, 1103515245) + 12345) >>> 0; raw[i] = x >>> 24; }
+  const chunk = (type, data) => { const len = Buffer.alloc(4), crc = Buffer.alloc(4), td = Buffer.concat([Buffer.from(type), data]); len.writeUInt32BE(data.length); crc.writeUInt32BE(EP.crc32(td)); return Buffer.concat([len, td, crc]); };
+  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = 2;
+  return new Uint8Array(Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', ihdr), chunk('IDAT', deflateSync(raw, { level: 1 })), chunk('IEND', Buffer.alloc(0))]));
+}
+async function erpReport(fx, pics, o = {}) {
+  const E = loadExcelJS(), wb = new E.Workbook(), ws = wb.addWorksheet('Report'), more = o.more || [];
+  wb.creator = wb.lastModifiedBy = 'Test Saver';   // a person in its file properties, never kept by the page
+  const rows = [...fx.sellAts, ...more.map(x => x[0])];
+  ws.addRow(['Inventory Report - On Hand_In Transit_In Production (invented)']);
+  ws.addRow(['Image', ...fx.AH]);
+  for (const r of rows) ws.addRow([null, ...r]);
+  const sum = j => rows.reduce((t, r) => t + (Number(String(r[j] ?? '').replace(/,/g, '')) || 0), 0);
+  ws.addRow([null, 'Grand Total', null, null, null, null, null, sum(6), sum(7)]);
+  rows.forEach((r, i) => {
+    const seed = i < fx.sellAts.length ? pics[r[1]] : more[i - fx.sellAts.length][1];
+    if (seed == null) return;
+    ws.addImage(wb.addImage({ buffer: pngNoise(900, 300, seed), extension: 'png' }), { tl: { col: 0, row: 2 + i }, br: { col: 1, row: 3 + i } });
+  });
+  if (o.filler) wb.addWorksheet('Notes').addImage(wb.addImage({ buffer: pngNoise(1200, 700, o.filler), extension: 'png' }), { tl: { col: 0, row: 0 }, br: { col: 4, row: 10 } });
+  return new Uint8Array(await wb.xlsx.writeBuffer());
+}
+// A copy of a zip with one part's packed bytes overwritten (0xff is never valid deflate).
+function spoilPart(bytes, name) {
+  const e = EP.zipEntries(bytes).find(x => x.name === name), out = Uint8Array.from(bytes), v = new DataView(out.buffer);
+  const start = e.offset + 30 + v.getUint16(e.offset + 26, true) + v.getUint16(e.offset + 28, true);
+  out.fill(0xff, start, start + e.compressedSize);
+  return out;
+}
+async function addPictureReports(fx) {
+  fx.bytes.set('ats-pics-1.xlsx', await erpReport(fx, ERP_PICS_1));
+  fx.bytes.set('ats-pics-2.xlsx', await erpReport(fx, ERP_PICS_2, { more: [[['C1', 'SL-108', 'Desc SL-108', 'Lip', 'Gloss', 'NJ', 0, 0, 0, null, null, null, null, null], 17]] }));
+  fx.bytes.set('ats-big-nopics.xlsx', await erpReport(fx, {}, { filler: 98 }));
+  fx.bytes.set('ats-big-nopics-2.xlsx', await erpReport(fx, {}, { filler: 99 }));
+  fx.bytes.set('ats-pics-bad.xlsx', spoilPart(fx.bytes.get('ats-pics-1.xlsx'), 'xl/drawings/drawing1.xml'));
 }
 
 // Local copies of the real files for s2-real, under names the stand-in serves (read from REAL_DIR, never printed).
@@ -505,6 +562,7 @@ function fileMeta(id, name, fx, age) {
 }
 const folderMeta = (id, name) => ({ id, name, webUrl: webUrl(id), folder: { childCount: 3 }, lastModifiedDateTime: iso(1) });
 const listMeta = (id, name) => ({ id, displayName: name, name, webUrl: webUrl(id), lastModifiedDateTime: iso(1), lastModifiedBy: by });
+const atsSaved = w => w.atsSaved || (w.atsSaved = iso(Math.max(0, w.o.ats.age)));
 const kid = (id, name, age, extra) => ({ id, name, lastModifiedDateTime: iso(age), lastModifiedBy: by, webUrl: webUrl(id), file: {}, ...extra });
 
 // /sites/<site> paths go to the host app.js gives them; the sites, their libraries and two sharing links.
@@ -566,14 +624,26 @@ function graph(w, method, path, q, body) {
     if (path === `/drives/${SRC}/items/itm-ats-dir/children` && o.ats) {
       const lock = kid('itm-ats-lock', '~$ats-report-new.xlsx', 0), sub = { id: 'itm-ats-sub', name: 'Old', folder: { childCount: 2 }, lastModifiedDateTime: iso(0) };
       if (o.ats.empty) return J(200, { value: [lock, sub] });
-      // A newer file that isn't Excel is skipped: the newest Excel file is the report.
+      // A newer file that isn't Excel is skipped: the newest Excel file is the report. Each report with its size and eTag.
       // o.ats.resaved: the older report was opened and saved again after the newest one (it must not win).
-      return J(200, { value: [kid('itm-ats-txt', 'read-me.txt', 0), kid('itm-ats-1', atsName(o.ats), Math.max(0, o.ats.age)),
-        kid('itm-ats-0', atsName(o.ats, 7), o.ats.resaved ? 0 : Math.max(0, o.ats.age) + 7), lock, sub] });
+      // o.ats.stable: the newest report keeps the saved time it was first given (elsewhere each look gives a new one, so the
+      // page reads it again on every load).
+      const sized = (id, file) => ({ size: w.fx.bytes.get(file).length, eTag: `"${id}-1"`, ...(id === 'itm-ats-1' && o.ats.stable ? { lastModifiedDateTime: atsSaved(w) } : {}) });
+      return J(200, { value: [kid('itm-ats-txt', 'read-me.txt', 0), kid('itm-ats-1', atsName(o.ats), Math.max(0, o.ats.age), sized('itm-ats-1', o.ats.file || 'ats.xlsx')),
+        kid('itm-ats-0', atsName(o.ats, 7), o.ats.resaved ? 0 : Math.max(0, o.ats.age) + 7, sized('itm-ats-0', 'ats.xlsx')),
+        ...(o.ats.extra || []).map(x => kid(x.id, atsName(o.ats, x.older), Math.max(0, o.ats.age) + x.older, { size: w.fx.bytes.get(x.file).length, eTag: `"${x.id}-${x.v || 1}"` })), lock, sub] });
     }
-    // The newest report, with its download link (the invented workbook o.ats.file); the older one only if asked for.
-    if (path === `/drives/${SRC}/items/itm-ats-1` && o.ats && !o.ats.empty) return J(200, fileMeta('itm-ats-1', atsName(o.ats), o.ats.file || 'ats.xlsx', Math.max(0, o.ats.age)));
+    // The newest report, with its download link (the invented workbook o.ats.file); the older ones only if asked for.
+    if (path === `/drives/${SRC}/items/itm-ats-1` && o.ats && !o.ats.empty) {
+      const meta = fileMeta('itm-ats-1', atsName(o.ats), o.ats.file || 'ats.xlsx', Math.max(0, o.ats.age));
+      return J(200, o.ats.stable ? { ...meta, lastModifiedDateTime: atsSaved(w) } : meta);
+    }
     if (path === `/drives/${SRC}/items/itm-ats-0` && o.ats && !o.ats.empty) return J(200, fileMeta('itm-ats-0', atsName(o.ats, 7), 'ats.xlsx', o.ats.resaved ? 0 : Math.max(0, o.ats.age) + 7));
+    // o.ats.extra: more reports in the folder ({ id, file, older: days before the newest, v: its version, in its eTag }).
+    if ((m = /^\/drives\/drv-src\/items\/(itm-ats-x\w+)$/.exec(path)) && o.ats && !o.ats.empty) {
+      const x = (o.ats.extra || []).find(y => y.id === m[1]);
+      if (x) return J(200, { ...fileMeta(x.id, atsName(o.ats, x.older), x.file, Math.max(0, o.ats.age) + x.older), eTag: `"${x.id}-${x.v || 1}"` });
+    }
     if (path === `/drives/${SRC}/items/itm-msl`) return J(200, fileMeta('itm-msl', 'Master Sheet Live.xlsx', o.mslFile, 1));
     if (path === `/drives/${SRC}/items/itm-trk`) return o.tracker === 403 ? denied() : J(200, fileMeta('itm-trk', 'PO Status Tracker.xlsx', o.trkFile, 1));
     if (path === `/drives/${SRC}/items/itm-ct`) return J(200, fileMeta('itm-ct', o.ctReplaced ? 'Test Container Sheet OLD.xlsx' : 'Test Container Sheet.xlsx', o.ctFile, o.ctReplaced ? 5 : 0));
@@ -632,7 +702,7 @@ function graph(w, method, path, q, body) {
 }
 
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.png': 'image/png', '.json': 'application/json', '.svg': 'image/svg+xml' };
-const SERVED = /^(index\.html|app\.js|app\.css|favicon\.png|core\/[\w.-]+\.js|vendor\/[\w./-]+)$/;
+const SERVED = /^(index\.html|app\.js|app\.css|favicon\.png|picturesWorker\.js|core\/[\w.-]+\.js|vendor\/[\w./-]+)$/;
 
 function pageServer() {
   return createServer((req, res) => {
@@ -741,7 +811,7 @@ function downloadServer() {
     const buf = w && w.fx.bytes.get(name);
     if (!buf || req.method !== 'GET') { res.writeHead(404, cors); res.end(); return; }
     const send = () => { res.writeHead(200, { ...cors, 'Content-Type': 'application/octet-stream', 'Content-Length': buf.length }); res.end(buf); };
-    if (w.o.slowCt && name === w.o.ctFile) {
+    if ((w.o.slowCt && name === w.o.ctFile) || (w.o.slowFile && name === w.o.slowFile)) {
       w.pending.add(name);
       const timer = setTimeout(() => { w.pending.delete(name); send(); }, 25000);
       res.on('close', () => { if (w.pending.delete(name)) { clearTimeout(timer); w.aborted.push(name); } });
@@ -758,6 +828,10 @@ function downloadServer() {
 // opts.noStorage: browser storage blocked, as in some locked-down browsers. opts.tab: the tab the page last showed (it
 // opens on it). opts.breakSum: a bug made on purpose, so the page's own sums disagree with an engine's: 'sell' adds a
 // unit to the selling engine's Available now total, 'stages' puts the stage engine's balance off by 7 units.
+// opts.fastTimeouts: a time limit of 10 minutes or more runs out after 2 s (a picture report's download). opts.slowCib:
+// the page's first createImageBitmap waits that many ms (H.cibHeld meanwhile), so a check can act while a save makes its
+// photos small. opts.lostBlobs: once localStorage 'headless:lose' is '1', the Blobs of the pictures' copy read from
+// IndexedDB can't be read back (NotReadableError), as when the browser's copy has lost its data.
 function initScript(pageOrigin, opts = {}) {
   return `(() => {
   if (window.__headless) return;
@@ -791,7 +865,30 @@ function initScript(pageOrigin, opts = {}) {
   H.longWaiting = () => long.size;
   H.fireLong = () => { const due = [...long.values()]; long.clear(); for (const t of due) t.fn(...t.args); return due.length; };
   ${opts.noStorage ? `Object.defineProperty(window, 'localStorage', { configurable: true, get() { throw new DOMException('Storage is blocked.', 'SecurityError'); } });` : ''}
+  ${opts.noIdb === 'blocked' ? `Object.defineProperty(window, 'indexedDB', { configurable: true, get() { throw new DOMException('IndexedDB is blocked.', 'SecurityError'); } });` : ''}
+  ${opts.noIdb === 'full' ? `IDBObjectStore.prototype.put = function () { throw new DOMException('The quota has been exceeded.', 'QuotaExceededError'); };` : ''}
   ${opts.tab ? `try { localStorage.setItem('inv:tab2', ${JSON.stringify(opts.tab)}); } catch (e) { /* about:blank */ }` : ''}
+  ${opts.fastTimeouts ? `(() => { const t = AbortSignal.timeout.bind(AbortSignal); AbortSignal.timeout = ms => t(ms >= 600000 ? 2000 : ms); })();` : ''}
+  ${opts.slowCib ? `(() => {
+    const cib = window.createImageBitmap.bind(window);
+    let once = false;
+    window.createImageBitmap = (...a) => {
+      if (once) return cib(...a);
+      once = true; H.cibHeld = true;
+      return new Promise(r => setTimeout(r, ${Number(opts.slowCib)})).then(() => { H.cibHeld = false; return cib(...a); });
+    };
+  })();` : ''}
+  ${opts.lostBlobs ? `(() => {
+    const lost = new WeakSet(), ab = Blob.prototype.arrayBuffer, get = IDBObjectStore.prototype.get;
+    Blob.prototype.arrayBuffer = function () { return lost.has(this) ? Promise.reject(new DOMException('Invented: this copy has lost its data.', 'NotReadableError')) : ab.call(this); };
+    IDBObjectStore.prototype.get = function (k) {
+      const rq = get.call(this, k);
+      let lose = false;
+      try { lose = k === 'set' && localStorage.getItem('headless:lose') === '1'; } catch (e) { /* about:blank */ }
+      if (lose) rq.addEventListener('success', () => { const x = rq.result; if (x && Array.isArray(x.styles)) for (const y of x.styles) if (y[2] instanceof Blob) lost.add(y[2]); });
+      return rq;
+    };
+  })();` : ''}
   ${opts.breakSum ? `(() => {
     const kind = ${JSON.stringify(opts.breakSum)}, name = kind === 'stages' ? 'InvStages' : 'InvSell', fn = kind === 'stages' ? 'build' : 'buildSell';
     let api;
@@ -945,17 +1042,42 @@ async function signInWindows(cdp) {
 }
 
 const ALL_NET = [];   // every request any tab made in the whole run, as Edge saw it
+const ALL_WORKER_NET = [];   // every request any worker made in the whole run
+// What the pictures worker may load: itself and the four files it imports, from the page's own server.
+const WORKER_FILES = ['picturesWorker.js', 'vendor/xlsx-js-style/xlsx.bundle.js', 'core/common.js', 'core/ats.js', 'core/erpPictures.js'];
+const workerOk = origin => r => r.method === 'GET' && WORKER_FILES.some(f => r.url === `${origin}/${f}`);
 
 // A tab in its own new browser context, so its browser storage starts empty (the email marks, the saved locations).
 async function openTab(cdp, init) {
   const { browserContextId } = await cdp.send('Target.createBrowserContext', { disposeOnDetach: true });
   const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank', browserContextId });
   const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
-  const t = { targetId, sessionId, browserContextId, blocked: [], net: [], console: [], exceptions: [] };
+  const t = { targetId, sessionId, browserContextId, blocked: [], net: [], console: [], exceptions: [], workers: new Set(), workerNet: [], workerInit: '' };
   t.send = (m, p) => cdp.send(m, p, sessionId);
   t.off = cdp.on(m => {
-    if (m.sessionId !== sessionId) return;
     const p = m.params || {};
+    // The pictures worker (and any other worker the page starts): attached paused, its requests logged (Edge has no Fetch
+    // domain on a worker, so they are watched there and checked: only the page's own files, from 127.0.0.1), then let go.
+    // t.workerInit: code a scenario runs in each new worker first (to slow it down, so Cancel can be clicked while it reads).
+    if (m.method === 'Target.attachedToTarget' && m.sessionId === sessionId) {
+      const ws = p.sessionId, type = (p.targetInfo && p.targetInfo.type) || '';
+      (async () => {
+        if (/worker/.test(type)) {
+          t.workers.add(ws);
+          await cdp.send('Network.enable', {}, ws).catch(e => t.exceptions.push('worker Network.enable: ' + e.message));
+          await cdp.send('Runtime.enable', {}, ws).catch(() => {});
+          if (t.workerInit) await cdp.send('Runtime.evaluate', { expression: t.workerInit }, ws).catch(e => t.exceptions.push('worker init: ' + e.message));
+        }
+        await cdp.send('Runtime.runIfWaitingForDebugger', {}, ws).catch(() => {});
+      })();
+      return;
+    }
+    if (t.workers.has(m.sessionId)) {
+      if (m.method === 'Network.requestWillBeSent') { const r = { method: p.request.method, url: p.request.url }; t.workerNet.push(r); ALL_WORKER_NET.push(r); }
+      else if (m.method === 'Runtime.exceptionThrown') { const d = p.exceptionDetails || {}; t.exceptions.push('worker: ' + String((d.exception && d.exception.description) || d.text || 'error').slice(0, 300)); }
+      return;
+    }
+    if (m.sessionId !== sessionId) return;
     if (m.method === 'Fetch.requestPaused') {
       const r = { method: p.request.method, url: p.request.url };
       t.net.push(r); ALL_NET.push(r);
@@ -971,6 +1093,7 @@ async function openTab(cdp, init) {
     }
   });
   await t.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+  await t.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
   await t.send('Page.enable');
   await t.send('Runtime.enable');
   await t.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
@@ -1218,7 +1341,9 @@ const SA = `(() => {
     dl: { shown: !!dl && !dl.hidden && !dl.closest('[hidden]'), disabled: q('#btnSalesDl').disabled, title: dl ? dl.title : '', msg: txt(q('#salesDlMsg')), cancel: !q('#btnSalesDlX').hidden },
     picsClass: q('#sellTable').classList.contains('pics'),
     pics: [...document.querySelectorAll('#sellTable tbody tr.r')].map(tr => { const p = tr.querySelector('.pic');
-      return { style: txt(tr.querySelector('button.sb')), img: !!p && p.tagName === 'IMG' && /^blob:/.test(p.src) && p.naturalWidth > 0, none: !!p && p.classList.contains('none'), text: txt(p), upc: txt(tr.querySelector('td .u')) }; }),
+      return { style: txt(tr.querySelector('button.sb')), img: !!p && p.tagName === 'IMG' && /^blob:/.test(p.src) && p.naturalWidth > 0, none: !!p && p.classList.contains('none'), text: txt(p), upc: txt(tr.querySelector('td .u')),
+        from: (p && p.dataset.from) || '', ratio: p && p.naturalHeight ? p.naturalWidth / p.naturalHeight : 0 }; }),
+    ats: (() => { const a = q('#chip-ats'), l = a && a.querySelector('small.pl'); return { state: a ? a.dataset.state : '', pics: txt(l), amber: !!l && l.classList.contains('a'), cancel: !!a && !!a.querySelector('button[data-pics]'), title: a ? a.getAttribute('title') || '' : '' }; })(),
     issGroup: [...document.querySelectorAll('#issTable tr.gh')].map(txt).find(t => t.startsWith('Sales sheet')) || '', iss,
     probBad: q('#tabs .tab.iss').classList.contains('bad'), saved: (H.saved || []).map(x => ({ name: x.name, has: !!x.blob })), toast: txt(q('#toast')),
   };
@@ -1266,10 +1391,14 @@ async function openSheet(bytes, marks) {
   const styles = [];
   if (ws) ws.eachRow((r, n) => { if (n > 2) styles.push(String(r.getCell(2).value)); });
   const coreXml = (xml.find(([p]) => p === 'docProps/core.xml') || [])[1] || '';
-  return { tabs: wb.worksheets.map(x => x.name), rows: ws ? ws.rowCount : 0, dateRows: wd ? wd.rowCount : 0, images: ws ? ws.getImages().length : 0,
+  // Each picture's style row (0 for the first) and its shape: the ERP report's invented pictures are 3 wide by 1 high.
+  const imgs = ws ? ws.getImages().map(x => ({ i: x.range.tl.nativeRow - 2, ratio: x.range.ext && x.range.ext.height ? x.range.ext.width / x.range.ext.height : 0 })) : [];
+  return { tabs: wb.worksheets.map(x => x.name), rows: ws ? ws.rowCount : 0, dateRows: wd ? wd.rowCount : 0, images: ws ? ws.getImages().length : 0, imgs,
     media: [...parts.keys()].filter(p => /^xl\/media\//.test(p)).length, styles, found, creator: (/<dc:creator>([^<]*)</.exec(coreXml) || [])[1] || '',
     keywords: (/<cp:keywords>([^<]*)</.exec(coreXml) || [])[1] || '', title: ws ? String(ws.getCell('A1').value) : '', sub: ws ? String(ws.getCell('D1').value) : '' };
 }
+// How many styles the sales sheet holds, from the selling engine's answer.
+const want0 = (S, today) => (S && S.ok ? SS.salesRows(S, { today }).rows.length : 0);
 // The sheet's rows as the page should make them: the selling engine here, then core/salesSheet.js.
 const sheetFor = (fx, today, f) => { const { S } = sellFor(fx, today, f); return S && S.ok ? SS.salesRows(S, { today }) : null; };
 // What every saving scenario checks once the sheet is saved: one session (replacing the file), every part in order with
@@ -1303,6 +1432,68 @@ async function savedChecks(c, t, w, want, o = {}) {
   c('the chip: "Sales sheet saved m/d h:mm AM", styles and photos, no name', p.chip.state === 'ok' && /^saved \d{1,2}\/\d{1,2} \d{1,2}:\d{2} [AP]M$/.test(p.chip.em) &&
     p.chip.small === `${fmtN(want.rows.length)} style${want.rows.length === 1 ? '' : 's'}, ${fmtN(o.pics)} photo${o.pics === 1 ? '' : 's'}` && !/Test (User|Saver)/.test(p.chip.text + p.chip.title), JSON.stringify(p.chip));
   return { got, p };
+}
+
+// ---- the ERP report's pictures: where each style's photo should come from, and what the checks wait for.
+// 'erp' (the ERP report's picture), 'quote' (Quote Images': SELL_PICS), or '' (none).
+const picFrom = (style, erp) => (erp[style] != null ? 'erp' : SELL_PICS[style] ? 'quote' : '');
+const mdy = d => C.fmtDay(d).replace(/\/\d{4}$/, '');
+// The ATS chip's pictures line, once the pictures are known (no Cancel, nothing in progress).
+const PICS_SETTLED = `(() => { const c = document.getElementById('chip-ats'), l = c && c.querySelector('small.pl'); return !!l && !c.querySelector('button[data-pics]') && !/…/.test(l.textContent); })()`;
+// Every row in view shows the picture it should (the ERP report's, Quote Images', or "no photo"), decoded.
+const picsDrawn = erp => `(() => { const erp = ${JSON.stringify(erp)}, quote = ${JSON.stringify(SELL_PICS)};
+  return [...document.querySelectorAll('#sellTable tbody tr.r')].every(tr => { const b = tr.querySelector('button.sb'), p = tr.querySelector('.pic');
+    if (!b || !p) return false;
+    const want = erp[b.textContent] != null ? 'erp' : quote[b.textContent] ? 'quote' : '';
+    return want ? p.tagName === 'IMG' && p.dataset.from === want && p.naturalWidth > 0 : p.classList.contains('none'); }); })()`;
+// In a sheet the page saved: where each style row's picture came from, by its shape.
+const fileFroms = (got, want) => want.rows.map((r, i) => { const im = got.imgs.find(x => x.i === i); return im ? (im.ratio > 2.5 ? 'erp' : 'quote') : ''; });
+// This browser's copy of the pictures (IndexedDB), read in the page: its keys and its set (no picture bytes).
+const IDB = `new Promise(res => { try { const rq = indexedDB.open('shalam-tool'); rq.onerror = () => res({ error: String(rq.error) });
+  rq.onsuccess = () => { const db = rq.result; if (!db.objectStoreNames.contains('erpPictures')) { db.close(); return res({ keys: [], set: null }); }
+    const tx = db.transaction('erpPictures', 'readonly'), st = tx.objectStore('erpPictures'), a = st.getAllKeys(), b = st.get('set');
+    tx.oncomplete = () => { const x = b.result; db.close(); res({ keys: a.result.map(String), set: x ? { itemId: x.itemId, eTag: x.eTag, fileName: x.fileName, n: x.styles.length,
+      jpeg: x.styles.every(y => y[2] instanceof Blob && y[2].type === 'image/jpeg' && y[2].size > 0), text: JSON.stringify({ ...x, styles: x.styles.map(y => [y[0], y[1], y[3], y[4], y[5]]) }) } : null }); }; };
+} catch (e) { res({ error: String(e) }); } })`;
+// The worker, slowed down (each picture made small 1.5 s later), so Cancel can be clicked while it reads.
+const SLOW_WORKER = `(() => { const cib = self.createImageBitmap; if (typeof cib === 'function') self.createImageBitmap = (...a) => new Promise(r => setTimeout(r, 1500)).then(() => cib(...a)); })()`;
+// The worker failing on purpose: it can draw nothing (no 2D context, as when the browser's drawing fails); it crashes
+// while making the pictures small, or before the numbers (unpacking never ends), with an error it doesn't catch (as when
+// it runs out of memory); its own files don't load.
+const UNDRAWN_WORKER = `(() => { if (self.OffscreenCanvas) self.OffscreenCanvas.prototype.getContext = function () { return null; }; })()`;
+const CRASH_WORKER = `(() => { self.createImageBitmap = () => { setTimeout(() => { throw new Error('invented crash: the picture reader ran out of memory'); }, 0); return new Promise(() => {}); }; })()`;
+const CRASH_EARLY_WORKER = `(() => { self.DecompressionStream = class {
+  constructor() { setTimeout(() => { throw new Error('invented crash: the picture reader ran out of memory'); }, 0); this.writable = new TransformStream().writable; this.readable = new ReadableStream({ start() {} }); } }; })()`;
+const NOREADER_WORKER = `(() => { const imp = self.importScripts.bind(self); self.importScripts = (...f) => { imp(f[0]); throw new Error("invented: the reader's other files didn't load"); }; })()`;
+// This browser's copy of the newest report's numbers' part (IndexedDB 'numbers'), read in the page: its report, its
+// size, and whether it holds a person's name, the file's properties, a drawing or a picture (it is a stored zip: its
+// names and text are plain in it).
+const IDB_NUM = `new Promise(res => { try { const rq = indexedDB.open('shalam-tool'); rq.onerror = () => res({ error: String(rq.error) });
+  rq.onsuccess = () => { const db = rq.result; if (!db.objectStoreNames.contains('erpPictures')) { db.close(); return res(null); }
+    const tx = db.transaction('erpPictures', 'readonly'), g = tx.objectStore('erpPictures').get('numbers');
+    tx.oncomplete = async () => { const x = g.result; db.close(); if (!x) return res(null);
+      const t = x.slim instanceof Blob ? new TextDecoder('latin1').decode(await x.slim.arrayBuffer()) : '';
+      res({ itemId: x.itemId, eTag: x.eTag, size: x.slim ? x.slim.size : 0, sheet: t.includes('<sheetData'), person: /Test (Saver|User)/.test(t),
+        props: /<(cp:)?coreProperties|<Properties\\b/.test(t), drawing: /<xdr:wsDr|\\x89PNG/.test(t) }); }; };
+} catch (e) { res({ error: String(e) }); } })`;
+const PICS_OLDER = { ...SELL_ATS, extra: [{ id: 'itm-ats-xp1', file: 'ats-pics-1.xlsx', older: 3 }] };
+const fileDownloads = (w, f) => w.downloads.filter(d => d.name === f && d.method === 'GET').length;
+// The checks each ERP pictures scenario makes once its sheet is saved: the ATS chip's line, the rows' pictures on the
+// page, Quote Images asked only for the styles with no ERP picture, the saved file's pictures by where they come from.
+async function erpChecks(c, t, w, want, erp, day, lookupsFrom = 0) {
+  await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+  await t.waitFor(picsDrawn(erp), 'the pictures on the rows', 20000);
+  const p = await sa(t), n = Object.keys(erp).length;
+  c(`the ATS chip: "pictures from the ${mdy(day)} report (${n})", not amber, no Cancel`, p.ats.pics === `pictures from the ${mdy(day)} report (${n})` && !p.ats.amber && !p.ats.cancel && p.ats.state === 'ok', JSON.stringify(p.ats));
+  const rows = p.pics.map(x => `${x.style}:${x.from || x.text}`), wantRows = p.pics.map(x => `${x.style}:${picFrom(x.style, erp) || 'no photo'}`);
+  c("Available to sell: each row has the ERP report's picture where it has one (3 wide by 1 high, made small), Quote Images' only for the rest", p.picsClass && p.pics.length > 5 && rows.join() === wantRows.join() &&
+    p.pics.filter(x => x.from === 'erp').length > 0 && p.pics.filter(x => x.from === 'erp').every(x => x.ratio > 2.5), `${rows.join(' ')} vs ${wantRows.join(' ')}`);
+  const asked = [...new Set(w.photoLookups.slice(lookupsFrom))];
+  c('Quote Images were asked only for styles with no ERP picture', asked.length > 0 && !asked.some(k => erp[k] != null), asked.join(', '));
+  const got = await openSheet(w.sales.file.sent, MARKS_SELL), froms = fileFroms(got, want), wantFroms = want.rows.map(r => picFrom(r.style, erp));
+  c("the saved sheet: each style's picture from the ERP report where it has one, from Quote Images for the rest", froms.join() === wantFroms.join() && got.images === wantFroms.filter(Boolean).length,
+    `${want.rows.map((r, i) => `${r.style}:${froms[i] || '-'}`).join(' ')} vs ${wantFroms.join(',')}`);
+  return { p, got };
 }
 
 const SCENARIOS = [
@@ -2687,8 +2878,8 @@ const SCENARIOS = [
         p.picsClass && p.pics.length > 5 && withPic.join() === wantPic.join() && p.pics.every(x => x.img || (x.none && x.text === 'no photo')), JSON.stringify(p.pics.map(x => `${x.style}:${x.img ? 'img' : x.text}`)));
       c('the row keeps its UPC line under the style', p.pics.some(x => /^\d{12}/.test(x.upc)), JSON.stringify(p.pics.map(x => x.upc)));
       const none = want.rows.filter(r => !SELL_PICS[r.photoKey]).map(r => r.style), line = p.iss.find(x => x.code === 'no-photo');
-      c(`Problems: one line under "Sales sheet": "${none.length} styles on the sales sheet have no photo in Quote Images", naming them`,
-        p.iss.length === 1 && !!line && line.msg === `${none.length} styles on the sales sheet have no photo in Quote Images: ${none.join(', ')}.` && /^Sales sheet · 1 issue/.test(p.issGroup), JSON.stringify(p.iss));
+      c(`Problems: one line under "Sales sheet": "${none.length} styles on the sales sheet have no picture (not in the ERP report's pictures, not in Quote Images)", naming them`,
+        p.iss.length === 1 && !!line && line.msg === `${none.length} styles on the sales sheet have no picture (not in the ERP report's pictures, not in Quote Images): ${none.join(', ')}.` && /^Sales sheet · 1 issue/.test(p.issGroup), JSON.stringify(p.iss));
       const batches = w.calls.filter(x => x.path === '/$batch');
       c('photos looked up by key in the thumb folder, in batches of GETs (20 at most)', batches.length > 0 && batches.every(x => batchOfGets(x.body) &&
         x.body.requests.every(r => /^\/drives\/drv-src\/root:\/Photo%20Store\/thumb\/[A-Z0-9_-]+\.jpg\?select=id,size,@microsoft\.graph\.downloadUrl$/.test(r.url))), batches.map(x => x.body.requests.map(r => r.url).join(' ')).join(' | ').slice(0, 300));
@@ -2989,9 +3180,482 @@ const SCENARIOS = [
     },
   },
   {
+    name: 'pics-older', title: "the ERP's pictures: the newest ATS report has none, an older one does: its pictures on the rows and in the saved sheet, Quote Images only for the rest; the next visit takes them from this browser's copy (no download)",
+    world: { ...SELLW, ...PICS, ats: PICS_OLDER }, init: { scp: SAVE_SCP }, photos: true, saves: true, worker: true, erpPics: true,
+    async run({ t, w, c, today }) {
+      const want = sheetFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS }), day = TODAY - SELL_ATS.age - 3, big = w.fx.bytes.get('ats-pics-1.xlsx').length;
+      c(`the invented picture report is over 2 MB (${fmtN(big)} bytes), the newest report under`, big >= EP.BIG_REPORT && w.fx.bytes.get('ats-sell.xlsx').length < EP.BIG_REPORT);
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved', 45000);
+      const { p } = await erpChecks(c, t, w, want, ERP_PICS_1, day);
+      await savedChecks(c, t, w, want, { pics: want.rows.filter(r => picFrom(r.style, ERP_PICS_1)).length });
+      c('the numbers from the newest report, the pictures from the older one: each downloaded once; the oldest (small) report not opened',
+        fileDownloads(w, 'ats-sell.xlsx') === 1 && fileDownloads(w, 'ats-pics-1.xlsx') === 1 && !w.calls.some(x => /itm-ats-0$/.test(x.path)), `${w.downloads.map(d => d.name).join(', ')}`);
+      const s = await t.snap();
+      c("the ATS card: the pictures' report, 5 styles with a picture, kept in this browser", pair(s.cards.ats, 'From') === `${atsName(w.o.ats, 3)} (${C.fmtDay(day)})` &&
+        pair(s.cards.ats, 'Styles with a picture') === '5' && pair(s.cards.ats, 'Kept in this browser') === 'yes: not downloaded again', JSON.stringify(s.cards.ats && s.cards.ats.pairs));
+      const none = want.rows.filter(r => !picFrom(r.style, ERP_PICS_1)).map(r => r.style), line = p.iss.find(x => x.code === 'no-photo');
+      c(`Problems: "${none.length} styles on the sales sheet have no picture (not in the ERP report's pictures, not in Quote Images)", naming them; nothing else`,
+        p.iss.length === 1 && !!line && line.msg === `${none.length} styles on the sales sheet have no picture (not in the ERP report's pictures, not in Quote Images): ${none.join(', ')}.` && !p.probBad, JSON.stringify(p.iss));
+      c("the sales sheet's status says how many of its photos are the ERP report's", p.chip.title.includes(`(${want.rows.filter(r => ERP_PICS_1[r.style] != null).length} from the ${C.fmtDay(day)} ATS report's pictures)`), p.chip.title);
+      const db = await t.eval(IDB);
+      c("this browser's copy: one set (the latest), its 5 pictures as JPEGs, no link or person's name in it", !!db.set && db.keys.join() === 'set' && db.set.itemId === 'itm-ats-xp1' &&
+        db.set.eTag === '"itm-ats-xp1-1"' && db.set.n === 5 && db.set.jpeg && !/https?:|Test (User|Saver)|example/.test(db.set.text), JSON.stringify(db).slice(0, 400));
+      // Each picture's hash (the sales sheet's fingerprint) is of its bytes in the report, not of the small copy, so it is
+      // the same in any browser.
+      const hashes = db.set ? Object.fromEntries(JSON.parse(db.set.text).styles.map(y => [y[0], y[4]])) : {};
+      c("each picture's hash is the SHA-256 of its bytes in the report (the same in any browser)", Object.keys(ERP_PICS_1).every(k => hashes[k] === createHash('sha256').update(pngNoise(900, 300, ERP_PICS_1[k])).digest('hex')),
+        JSON.stringify(hashes).slice(0, 300));
+      t.shots.push(await t.shot('pics-older'));
+      // The next visit, in the same browser: the pictures from its copy, the big report not downloaded, no worker started.
+      const dl = fileDownloads(w, 'ats-pics-1.xlsx'), made = w.sales.made, workers = t.workers.size;
+      await t.reload();
+      await t.waitFor(chipIs('ok'), 'the sales sheet check', 45000);
+      await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+      await t.waitFor(picsDrawn(ERP_PICS_1), 'the pictures on the rows', 20000);
+      const p2 = await sa(t);
+      c("the next visit: the pictures from this browser's copy; the picture report not downloaded again, no worker started (network log)",
+        fileDownloads(w, 'ats-pics-1.xlsx') === dl && t.workers.size === workers && p2.ats.pics === `pictures from the ${mdy(day)} report (5)`, `${fileDownloads(w, 'ats-pics-1.xlsx')} downloads, ${t.workers.size - workers} workers, ${p2.ats.pics}`);
+      c('the next visit: the sales sheet "up to date" (the same pictures, the same fingerprint), nothing uploaded', p2.chip.em === 'up to date' && w.sales.made === made, `${p2.chip.em} · ${w.sales.made} sessions`);
+    },
+  },
+  {
+    name: 'pics-newest', title: "the newest ATS report is the one with pictures: ONE download; its numbers (read in the worker, as the whole file gives them) and its pictures from it; Refresh and the next visit read its numbers from this browser's copy, not downloading it again",
+    world: { ...SELLW, ...PICS, ats: { age: 2, file: 'ats-pics-1.xlsx', stable: true } }, init: { scp: SAVE_SCP }, photos: true, saves: true, worker: true, erpPics: true,
+    async run({ t, w, c, today }) {
+      const f = { ...SELL_FILES, ats: w.o.ats }, { A, S } = sellFor(w.fx, today, f), want = sheetFor(w.fx, today, f);
+      c('the engines (run here, reading the whole file) are ok on it', !!A && A.ok && !!S && S.ok, JSON.stringify(A && (A.ok || A.error)));
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved', 45000);
+      const pl = await sl(t), s = await t.snap();
+      c("Available to sell's tiles are the engine's on the same report", SELL_TILE_KEYS.every(k => unitsIs(sellTile(pl, k).n, S.totals[k])), sellTilesSay(pl, S));
+      const diff = sellRowsDiffer(pl, S, today, 'ok');
+      c("the rows drawn are the engine's", !diff.length, diff.slice(0, 5).join(' | '));
+      c(`ATS chip green: "${A.counts.rowsRead} read / ${A.counts.styleRows} counted"; its card: read in the background, with its pictures`, s.chips.ats.state === 'ok' &&
+        s.chips.ats.text.includes(`${fmtN(A.counts.rowsRead)} read / ${fmtN(A.counts.styleRows)} counted`) && /MB: read in the background, with its pictures$/.test(pair(s.cards.ats, 'Size') || ''), `${s.chips.ats.text} · ${pair(s.cards.ats, 'Size')}`);
+      await erpChecks(c, t, w, want, ERP_PICS_1, TODAY - 2);
+      await savedChecks(c, t, w, want, { pics: want.rows.filter(r => picFrom(r.style, ERP_PICS_1)).length });
+      c('ONE download of the report: its numbers and its pictures from it', fileDownloads(w, 'ats-pics-1.xlsx') === 1 && !fileDownloads(w, 'ats.xlsx'), w.downloads.map(d => d.name).join(', '));
+      t.shots.push(await t.shot('pics-newest'));
+      // The 5-minute refresh, the report unchanged: not downloaded again (its numbers kept from this visit), no worker
+      // started, the same pictures, the sheet up to date.
+      const workers = t.workers.size;
+      await runRefresh(t, w);
+      await t.waitFor(chipIs('ok'), 'the sales sheet check', 30000);
+      await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+      const p = await sa(t);
+      c('the 5-minute refresh: the report not downloaded again, no worker started, the same pictures, the sheet up to date', fileDownloads(w, 'ats-pics-1.xlsx') === 1 && t.workers.size === workers &&
+        p.ats.pics === `pictures from the ${mdy(TODAY - 2)} report (5)` && p.chip.em === 'up to date' && w.sales.made === 1, `${fileDownloads(w, 'ats-pics-1.xlsx')} · ${t.workers.size - workers} · ${p.ats.pics} · ${p.chip.em}`);
+      // Refresh (forced): the report unchanged (its id and eTag), so not downloaded again: its numbers read again from this
+      // browser's copy of its numbers' part, its pictures known already; the same numbers and pictures, the sheet up to date.
+      const dl = w.downloads.length;
+      await t.click('#btnRefresh');
+      await sleep(300);
+      await t.waitFor(IDLE, 'the refresh', 30000);
+      await t.waitFor(chipIs('ok'), 'the sales sheet check', 30000);
+      await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+      const q = await sa(t), again = w.downloads.slice(dl).filter(d => d.name === 'ats-pics-1.xlsx').length, plq = await sl(t);
+      c("Refresh: the report not downloaded again (its numbers from this browser's copy, the engine's); the same pictures, the sheet up to date", again === 0 && t.workers.size === workers &&
+        SELL_TILE_KEYS.every(k => unitsIs(sellTile(plq, k).n, S.totals[k])) && q.ats.pics === `pictures from the ${mdy(TODAY - 2)} report (5)` && q.chip.em === 'up to date',
+        `${again} · ${t.workers.size - workers} · ${sellTilesSay(plq, S)} · ${q.ats.pics} · ${q.chip.em}`);
+      // This browser keeps the report's numbers' part (its XML, a small part of the file): no person's name in it.
+      const num = await t.eval(IDB_NUM), big = w.fx.bytes.get('ats-pics-1.xlsx').length;
+      c(`this browser keeps the report's numbers' part (by its id and eTag), a small part of the ${fmtN(big)} bytes, with no person's name, file properties, drawing or picture in it`,
+        !!num && num.itemId === 'itm-ats-1' && num.eTag === '"itm-ats-1-1"' && num.sheet && num.size > 0 && num.size < big / 10 && !num.person && !num.props && !num.drawing, JSON.stringify(num));
+      // The next visit, the report unchanged: its numbers from that copy, its pictures from theirs: not downloaded, no
+      // worker started; the same numbers, rows and pictures; the sheet up to date.
+      const dl2 = fileDownloads(w, 'ats-pics-1.xlsx'), workers2 = t.workers.size;
+      await t.reload();
+      await t.waitFor(chipIs('ok'), 'the sales sheet check', 45000);
+      await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+      await t.waitFor(picsDrawn(ERP_PICS_1), 'the pictures on the rows', 20000);
+      const pl2 = await sl(t), s2 = await t.snap(), v = await sa(t), diff2 = sellRowsDiffer(pl2, S, today, 'ok');
+      c("the next visit: the report not downloaded again, no worker started; the ATS card says its numbers come from this browser's copy",
+        fileDownloads(w, 'ats-pics-1.xlsx') === dl2 && t.workers.size === workers2 && s2.chips.ats.state === 'ok' &&
+        /MB: its numbers read from this browser's copy \(not downloaded again\)$/.test(pair(s2.cards.ats, 'Size') || ''), `${fileDownloads(w, 'ats-pics-1.xlsx') - dl2} downloads · ${t.workers.size - workers2} workers · ${pair(s2.cards.ats, 'Size')}`);
+      c("the next visit: the tiles and rows are the engine's on the whole file, the same pictures, the sheet up to date", SELL_TILE_KEYS.every(k => unitsIs(sellTile(pl2, k).n, S.totals[k])) && !diff2.length &&
+        s2.chips.ats.text.includes(`${fmtN(A.counts.rowsRead)} read / ${fmtN(A.counts.styleRows)} counted`) && v.ats.pics === `pictures from the ${mdy(TODAY - 2)} report (5)` && v.chip.em === 'up to date' && w.sales.made === 1,
+        `${sellTilesSay(pl2, S)} · ${diff2.slice(0, 3).join(' | ')} · ${v.ats.pics} · ${v.chip.em} · ${w.sales.made}`);
+    },
+  },
+  {
+    name: 'pics-nopics', title: "big reports with no pictures are passed over (remembered) and the next one is tried; at most 2 big downloads per load (said on Problems); the next visit downloads none",
+    world: { ...SELLW, ...PICS, ats: { ...SELL_ATS, extra: [{ id: 'itm-ats-xn1', file: 'ats-big-nopics.xlsx', older: 1 }, { id: 'itm-ats-xn2', file: 'ats-big-nopics-2.xlsx', older: 2 },
+      { id: 'itm-ats-xp1', file: 'ats-pics-1.xlsx', older: 3 }] } }, init: { scp: SAVE_SCP }, photos: true, saves: true, worker: true, erpPics: true,
+    async run({ t, w, c, today }) {
+      const want = sheetFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS });
+      c('the invented reports with no pictures are over 2 MB', w.fx.bytes.get('ats-big-nopics.xlsx').length >= EP.BIG_REPORT && w.fx.bytes.get('ats-big-nopics-2.xlsx').length >= EP.BIG_REPORT);
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved', 45000);
+      await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+      let p = await sa(t);
+      c('first load: the two big reports with no pictures downloaded once each; the third big one not (at most 2 per load)', fileDownloads(w, 'ats-big-nopics.xlsx') === 1 &&
+        fileDownloads(w, 'ats-big-nopics-2.xlsx') === 1 && fileDownloads(w, 'ats-pics-1.xlsx') === 0, w.downloads.map(d => d.name).join(', '));
+      c('the ATS chip: "no report with pictures: photos from Quote Images", quiet', p.ats.pics === 'no report with pictures: photos from Quote Images' && !p.ats.amber, JSON.stringify(p.ats));
+      const skip = p.iss.find(x => x.code === 'erp-pictures-skipped');
+      c("Problems: one line saying a big report wasn't looked in (at most 2 per load); the tab not red", !!skip && skip.msg === "1 more report of 2 MB or more in the ATS folder wasn't looked in for pictures this time: at most 2 big reports are downloaded per load. The next load looks further." && !p.probBad, JSON.stringify(p.iss));
+      await savedChecks(c, t, w, want, { pics: want.rows.filter(r => SELL_PICS[r.style]).length });
+      // The next load: the two with no pictures are known; the one with pictures is read, and the sheet saved again.
+      const lk = w.photoLookups.length;
+      await runRefresh(t, w);
+      for (const end = Date.now() + 45000; w.sales.made < 2 && Date.now() < end;) await sleep(100);
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved again', 30000);
+      c('the next load: the reports with no pictures not downloaded again; the one with pictures read', fileDownloads(w, 'ats-big-nopics.xlsx') === 1 && fileDownloads(w, 'ats-big-nopics-2.xlsx') === 1 &&
+        fileDownloads(w, 'ats-pics-1.xlsx') === 1, w.downloads.map(d => d.name).join(', '));
+      await erpChecks(c, t, w, want, ERP_PICS_1, TODAY - SELL_ATS.age - 3, lk);
+      p = await sa(t);
+      c('the sheet saved again with them; nothing on Problems about the pictures now', w.sales.made === 2 && !p.iss.some(x => /^erp-/.test(x.code)), `${w.sales.made} · ${JSON.stringify(p.iss)}`);
+      // The next visit: this browser has the pictures, and knows the two have none: no big report downloaded.
+      const before = w.downloads.length;
+      await t.reload();
+      await t.waitFor(chipIs('ok'), 'the sales sheet check', 45000);
+      await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+      const db = await t.eval(IDB), big = w.downloads.slice(before).filter(d => /^ats-(big|pics)/.test(d.name));
+      p = await sa(t);
+      c('the next visit: no big report downloaded; the same pictures', !big.length && p.ats.pics === `pictures from the ${mdy(TODAY - SELL_ATS.age - 3)} report (5)` && p.chip.em === 'up to date', `${big.map(d => d.name).join(', ')} · ${p.ats.pics} · ${p.chip.em}`);
+      c('its copy: the one set, and a "no pictures" mark for each of the two', !!db.set && db.set.itemId === 'itm-ats-xp1' &&
+        (db.keys || []).slice().sort().join() === ['none:itm-ats-xn1|"itm-ats-xn1-1"', 'none:itm-ats-xn2|"itm-ats-xn2-1"', 'set'].sort().join(), JSON.stringify(db.keys));
+    },
+  },
+  {
+    name: 'pics-cancel', title: "Cancel while the pictures download, and while the worker reads them: stopped, nothing half-read in use or kept, the sheet not saved by itself (Save anyway saves it); the next load reads them",
+    world: { ...SELLW, ...PICS, ats: PICS_OLDER, slowFile: 'ats-pics-1.xlsx' }, init: { scp: SAVE_SCP }, photos: true, saves: true, worker: true, erpPics: true, wait: 'pics',
+    async run({ t, w, c, today }) {
+      const want = sheetFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS }), cancelled = 'pictures not read (cancelled): photos from Quote Images';
+      const why = "reading the ATS report's pictures was cancelled";
+      // 1. While the picture report downloads (held by the stand-in).
+      await t.waitFor(`(() => { const c = document.getElementById('chip-ats'); return !!c && !!c.querySelector('button[data-pics]') && /downloading/.test(c.textContent); })()`, "the picture report's download", 45000);
+      let p = await sa(t);
+      c('while it downloads: the ATS chip says so, with Cancel; the sales sheet waits for it', w.pending.has('ats-pics-1.xlsx') && /^downloading the \d+\/\d+ report for its pictures…$/.test(p.ats.pics) &&
+        p.ats.cancel && p.chip.state === 'load' && p.chip.small === "the ATS report's pictures", JSON.stringify({ ats: p.ats, chip: p.chip }));
+      await t.click('#chip-ats button[data-pics]');
+      await t.waitFor(chipIs('warn'), 'the sales sheet to stop', 20000);
+      p = await sa(t);
+      c(`Cancel stops the download; the ATS chip: "${cancelled}"`, w.aborted.includes('ats-pics-1.xlsx') && p.ats.pics === cancelled && !p.ats.cancel, `${w.aborted.join(',')} · ${JSON.stringify(p.ats)}`);
+      c(`the sales sheet: not saved, "${why}", with Save anyway; nothing uploaded`, p.chip.em === 'not saved' && p.chip.small === why && p.chip.buttons.join() === 'Save anyway' && !w.sales.made, JSON.stringify(p.chip));
+      await t.click('#chip-sales button[data-sales="save"]');
+      await t.waitFor(chipIs('ok'), 'Save anyway to save', 30000);
+      await savedChecks(c, t, w, want, { pics: want.rows.filter(r => SELL_PICS[r.style]).length });
+      // 2. The next load, the worker slowed down: Cancel while it reads.
+      w.o.slowFile = ''; t.workerInit = SLOW_WORKER;
+      const workers = t.workers.size;
+      await t.eval('window.__headless.fireLong()');
+      await t.waitFor(`(() => { const c = document.getElementById('chip-ats'); return !!c && !!c.querySelector('button[data-pics]') && /reading pictures|making pictures small/.test(c.textContent); })()`, 'the worker to read the pictures', 45000);
+      p = await sa(t);
+      c('while the worker reads: "reading pictures…" on the ATS chip, with Cancel', p.ats.cancel && /^(reading pictures|making pictures small)…/.test(p.ats.pics) && t.workers.size > workers, `${JSON.stringify(p.ats)} · ${t.workers.size - workers} workers`);
+      await t.click('#chip-ats button[data-pics]');
+      await t.waitFor(PICS_SETTLED, 'the cancel', 15000);
+      await sleep(4500);   // longer than the slowed worker needs: had it gone on, its pictures would show by now
+      p = await sa(t);
+      const db = await t.eval(IDB);
+      c('Cancel ends the worker: none of its pictures in use (rows, chip) or kept in this browser', p.ats.pics === cancelled && !p.pics.some(x => x.from === 'erp') && p.pics.some(x => x.from === 'quote') &&
+        !!db.keys && !db.set, `${p.ats.pics} · ${p.pics.map(x => `${x.style}:${x.from || x.text}`).join(' ')} · ${JSON.stringify(db.keys)}`);
+      c('the sheet not saved again by itself', w.sales.made === 1 && p.chip.small === why, `${w.sales.made} · ${p.chip.small}`);
+      // 3. The next load reads them, and the sheet is saved again with them.
+      t.workerInit = '';
+      const lk = w.photoLookups.length;
+      await t.eval('window.__headless.fireLong()');
+      for (const end = Date.now() + 45000; w.sales.made < 2 && Date.now() < end;) await sleep(100);
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved again', 30000);
+      await erpChecks(c, t, w, want, ERP_PICS_1, TODAY - SELL_ATS.age - 3, lk);
+      c('the next load read them (the third download: one per load) and saved the sheet again with them', w.sales.made === 2 && fileDownloads(w, 'ats-pics-1.xlsx') === 3, `${w.sales.made} · ${fileDownloads(w, 'ats-pics-1.xlsx')}`);
+    },
+  },
+  {
+    name: 'pics-unreadable', title: "a report whose pictures can't be read: amber on the ATS chip and a line on Problems, Quote Images used and saved; not red, no email; not downloaded again this visit",
+    world: { ...SELLW, ...PICS, ats: { ...SELL_ATS, extra: [{ id: 'itm-ats-xb1', file: 'ats-pics-bad.xlsx', older: 3 }] } }, init: { scp: SAVE_SCP }, photos: true, saves: true, worker: true, erpPics: true,
+    async run({ t, w, c, today }) {
+      const want = sheetFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS }), day = TODAY - SELL_ATS.age - 3;
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved', 45000);
+      await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+      let p = await sa(t);
+      const s = await t.snap(), amber = `the ${mdy(day)} report's pictures couldn't be read: photos from Quote Images`;
+      c(`the ATS chip green (its numbers are fine), its pictures line amber: "${amber}"`, s.chips.ats.state === 'ok' && p.ats.amber && p.ats.pics === amber, JSON.stringify(p.ats));
+      const line = p.iss.find(x => x.code === 'erp-pictures-unread');
+      c("Problems: one line, its pictures couldn't be read (damaged), Quote Images used, the numbers not affected", !!line && line.msg.startsWith(`The pictures in ${atsName(w.o.ats, 3)} (the ATS report of ${C.fmtDay(day)}) couldn't be read: `) &&
+        /damaged/.test(line.msg) && line.msg.endsWith("Photos come from Quote Images until a report with pictures can be read. The numbers aren't affected.") && p.iss.filter(x => x.code === 'erp-pictures-unread').length === 1, JSON.stringify(p.iss));
+      c('not red: the Problems tab not red, no email', !p.probBad && !sendMails(w.calls).length && !banner(s, 'err'), `${p.probBad} · ${sendMails(w.calls).length}`);
+      c('no ERP picture on the rows; Quote Images\' where they have one', !p.pics.some(x => x.from === 'erp') && p.pics.some(x => x.from === 'quote'), p.pics.map(x => `${x.style}:${x.from || x.text}`).join(' '));
+      await savedChecks(c, t, w, want, { pics: want.rows.filter(r => SELL_PICS[r.style]).length });
+      await runRefresh(t, w);
+      await t.waitFor(chipIs('ok'), 'the sales sheet check', 30000);
+      await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+      p = await sa(t);
+      c('the 5-minute refresh: not downloaded again (it can\'t be read), still said, the sheet up to date', fileDownloads(w, 'ats-pics-bad.xlsx') === 1 && p.ats.pics === amber && p.chip.em === 'up to date', `${fileDownloads(w, 'ats-pics-bad.xlsx')} · ${p.ats.pics} · ${p.chip.em}`);
+      // The file itself can't be read: this browser notes it for the day, so the next visit doesn't download it again.
+      const db = await t.eval(IDB);
+      c("this browser notes the report whose pictures can't be read (by its id and eTag)", (db.keys || []).includes('bad:itm-ats-xb1|"itm-ats-xb1-1"'), JSON.stringify(db.keys));
+      await t.reload();
+      await t.waitFor(chipIs('ok'), 'the sales sheet check', 45000);
+      await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+      p = await sa(t);
+      const again = p.iss.find(x => x.code === 'erp-pictures-unread');
+      c('the next visit (the same day): not downloaded again, still said (amber, and on Problems), the sheet up to date', fileDownloads(w, 'ats-pics-bad.xlsx') === 1 && p.ats.pics === amber && p.ats.amber &&
+        !!again && /damaged/.test(again.msg) && p.chip.em === 'up to date', `${fileDownloads(w, 'ats-pics-bad.xlsx')} · ${p.ats.pics} · ${p.chip.em} · ${JSON.stringify(p.iss)}`);
+    },
+  },
+  {
+    name: 'pics-new', title: 'a newer report with pictures lands in the folder: its pictures replace the others (this browser keeps only the latest set) and the sales sheet is saved again',
+    world: { ...SELLW, ...PICS, ats: PICS_OLDER }, init: { scp: SAVE_SCP }, photos: true, saves: true, worker: true, erpPics: true,
+    async run({ t, w, c, today }) {
+      const want = sheetFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS });
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved', 45000);
+      await erpChecks(c, t, w, want, ERP_PICS_1, TODAY - SELL_ATS.age - 3);
+      const mark1 = JSON.parse((await t.snap()).store['inv:sales'] || 'null');
+      w.o.ats = { ...w.o.ats, extra: [...w.o.ats.extra, { id: 'itm-ats-xp2', file: 'ats-pics-2.xlsx', older: 1 }] };
+      const lk = w.photoLookups.length;
+      await runRefresh(t, w);
+      for (const end = Date.now() + 45000; w.sales.made < 2 && Date.now() < end;) await sleep(100);
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved again', 30000);
+      await erpChecks(c, t, w, want, ERP_PICS_2, TODAY - SELL_ATS.age - 1, lk);
+      const mark2 = JSON.parse((await t.snap()).store['inv:sales'] || 'null');
+      c('the sales sheet saved again (a second upload), its fingerprint new', w.sales.made === 2 && !!mark1 && !!mark2 && mark1.fp !== mark2.fp, `${w.sales.made} · ${mark1 && mark1.fp} · ${mark2 && mark2.fp}`);
+      const db = await t.eval(IDB);
+      c("this browser's copy holds only the new set", !!db.set && db.set.itemId === 'itm-ats-xp2' && db.set.n === 6 && db.set.jpeg && db.keys.join() === 'set', JSON.stringify(db).slice(0, 300));
+      c('each picture report downloaded once', fileDownloads(w, 'ats-pics-1.xlsx') === 1 && fileDownloads(w, 'ats-pics-2.xlsx') === 1, w.downloads.map(d => d.name).join(', '));
+      const p = await sa(t), d = p.iss.filter(x => x.code === 'erp-pictures-differ');
+      c(`Problems: one line for the style whose rows have different pictures in the new report: "1 style has different pictures on its rows in the ${mdy(TODAY - SELL_ATS.age - 1)} report (the first by row is used): SL-108 (rows 9, 15)."`,
+        d.length === 1 && d[0].msg === `1 style has different pictures on its rows in the ${mdy(TODAY - SELL_ATS.age - 1)} report (the first by row is used): SL-108 (rows 9, 15).` && !p.probBad, JSON.stringify(p.iss));
+      t.shots.push(await t.shot('pics-new'));
+    },
+  },
+  {
+    name: 'pics-noidb', title: "this browser can't keep the pictures (IndexedDB blocked): they're used for the visit all the same, nothing alarming said; the 5-minute refresh doesn't download them again, the next visit does",
+    world: { ...SELLW, ...PICS, ats: PICS_OLDER }, init: { scp: SAVE_SCP, noIdb: 'blocked' }, photos: true, saves: true, worker: true, erpPics: true,
+    async run({ t, w, c, today }) {
+      const want = sheetFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS }), day = TODAY - SELL_ATS.age - 3;
+      c('IndexedDB is blocked in this browser', (await t.eval(`(() => { try { return !indexedDB; } catch (e) { return e.name === 'SecurityError'; } })()`)) === true);
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved', 45000);
+      const { p } = await erpChecks(c, t, w, want, ERP_PICS_1, day);
+      await savedChecks(c, t, w, want, { pics: want.rows.filter(r => picFrom(r.style, ERP_PICS_1)).length });
+      const s = await t.snap();
+      c("the ATS card says they aren't kept in this browser (read again next visit)", pair(s.cards.ats, 'Kept in this browser') === 'no: read again next visit', JSON.stringify(s.cards.ats && s.cards.ats.pairs));
+      c('nothing alarming: the pictures line not amber, nothing on Problems about the pictures, not red, no email', !p.ats.amber && !p.iss.some(x => /^erp-/.test(x.code)) && !p.probBad &&
+        !sendMails(w.calls).length && !/IndexedDB|blocked|quota/i.test(p.ats.title), `${JSON.stringify(p.ats)} · ${JSON.stringify(p.iss)}`);
+      await runRefresh(t, w);
+      await t.waitFor(chipIs('ok'), 'the sales sheet check', 30000);
+      await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+      const p2 = await sa(t);
+      c('the 5-minute refresh: the pictures kept for the visit, not downloaded again; the sheet up to date', fileDownloads(w, 'ats-pics-1.xlsx') === 1 &&
+        p2.ats.pics === `pictures from the ${mdy(day)} report (5)` && p2.chip.em === 'up to date' && w.sales.made === 1, `${fileDownloads(w, 'ats-pics-1.xlsx')} · ${p2.ats.pics} · ${p2.chip.em}`);
+      await t.reload();
+      await t.waitFor(chipIs('ok'), 'the sales sheet check', 45000);
+      await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+      await t.waitFor(picsDrawn(ERP_PICS_1), 'the pictures on the rows', 20000);
+      const p3 = await sa(t);
+      c('the next visit: the report downloaded and read again (nothing was kept); the same pictures, so the sheet is up to date (its fingerprint the same)',
+        fileDownloads(w, 'ats-pics-1.xlsx') === 2 && p3.ats.pics === `pictures from the ${mdy(day)} report (5)` && p3.chip.em === 'up to date' && w.sales.made === 1, `${fileDownloads(w, 'ats-pics-1.xlsx')} · ${p3.ats.pics} · ${p3.chip.em} · ${w.sales.made}`);
+    },
+  },
+  {
+    name: 'pics-idbfull', title: "this browser's storage is full (IndexedDB refuses the pictures): they're used for the visit, nothing alarming said, read again next visit",
+    world: { ...SELLW, ...PICS, ats: PICS_OLDER }, init: { scp: SAVE_SCP, noIdb: 'full' }, photos: true, saves: true, worker: true, erpPics: true,
+    async run({ t, w, c, today }) {
+      const want = sheetFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS }), day = TODAY - SELL_ATS.age - 3;
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved', 45000);
+      const { p } = await erpChecks(c, t, w, want, ERP_PICS_1, day);
+      const s = await t.snap(), db = await t.eval(IDB);
+      c("nothing kept (the store refused it), and the card says so; nothing alarming", !!db.keys && !db.set && pair(s.cards.ats, 'Kept in this browser') === 'no: read again next visit' &&
+        !p.ats.amber && !p.iss.some(x => /^erp-/.test(x.code)) && !p.probBad, `${JSON.stringify(db).slice(0, 200)} · ${pair(s.cards.ats, 'Kept in this browser')} · ${JSON.stringify(p.iss)}`);
+      await t.reload();
+      await t.waitFor(chipIs('ok'), 'the sales sheet check', 45000);
+      await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+      const p2 = await sa(t);
+      c('the next visit: read again, the same pictures, the sheet up to date', fileDownloads(w, 'ats-pics-1.xlsx') === 2 && p2.ats.pics === `pictures from the ${mdy(day)} report (5)` &&
+        p2.chip.em === 'up to date', `${fileDownloads(w, 'ats-pics-1.xlsx')} · ${p2.ats.pics} · ${p2.chip.em}`);
+    },
+  },
+  {
+    name: 'pics-undrawn', title: "the browser can draw none of a report's pictures: amber (never \"no report with pictures\"), not noted as a report without them; not read again this visit, read again on the next",
+    world: { ...SELLW, ...PICS, ats: PICS_OLDER }, init: { scp: SAVE_SCP }, photos: true, saves: true, worker: true, erpPics: true, workerInit: UNDRAWN_WORKER,
+    async run({ t, w, c, today }) {
+      const want = sheetFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS }), day = TODAY - SELL_ATS.age - 3;
+      const amber = `the ${mdy(day)} report's pictures couldn't be read: photos from Quote Images`;
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved', 45000);
+      await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+      let p = await sa(t);
+      const line = p.iss.find(x => x.code === 'erp-pictures-unread');
+      c(`the ATS chip's pictures line amber: "${amber}"; Problems: none of its pictures could be drawn in this browser; not red`, p.ats.amber && p.ats.pics === amber && !!line &&
+        /couldn't be read: none of its pictures could be drawn in this browser\./.test(line.msg) && !p.probBad, `${JSON.stringify(p.ats)} · ${JSON.stringify(p.iss)}`);
+      const db = await t.eval(IDB);
+      c("nothing noted or kept in this browser for it (it isn't a report without pictures)", !!db.keys && !db.keys.length, JSON.stringify(db.keys));
+      await savedChecks(c, t, w, want, { pics: want.rows.filter(r => SELL_PICS[r.style]).length });
+      const workers = t.workers.size;
+      await runRefresh(t, w);
+      await t.waitFor(chipIs('ok'), 'the sales sheet check', 30000);
+      await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+      p = await sa(t);
+      c('the 5-minute refresh: not downloaded again, no worker started, still said', fileDownloads(w, 'ats-pics-1.xlsx') === 1 && t.workers.size === workers && p.ats.pics === amber,
+        `${fileDownloads(w, 'ats-pics-1.xlsx')} · ${t.workers.size - workers} · ${p.ats.pics}`);
+      // The next visit, the browser drawing again: read again, its pictures used, the sheet saved again with them.
+      t.workerInit = '';
+      const lk = w.photoLookups.length;
+      await t.reload();
+      for (const end = Date.now() + 45000; w.sales.made < 2 && Date.now() < end;) await sleep(100);
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved again', 30000);
+      await erpChecks(c, t, w, want, ERP_PICS_1, day, lk);
+      c('the next visit: the report downloaded and read again, the sheet saved again with its pictures', fileDownloads(w, 'ats-pics-1.xlsx') === 2 && w.sales.made === 2,
+        `${fileDownloads(w, 'ats-pics-1.xlsx')} · ${w.sales.made}`);
+    },
+  },
+  {
+    name: 'pics-crash', title: 'the picture reader crashes on a report (as when it runs out of memory): amber, Quote Images used; not downloaded again on each 5-minute refresh; tried again next visit',
+    world: { ...SELLW, ...PICS, ats: PICS_OLDER }, init: { scp: SAVE_SCP }, photos: true, saves: true, worker: true, erpPics: true, workerInit: CRASH_WORKER, exceptionsOk: /invented crash/,
+    async run({ t, w, c, today }) {
+      const want = sheetFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS }), day = TODAY - SELL_ATS.age - 3;
+      const amber = `the ${mdy(day)} report's pictures couldn't be read: photos from Quote Images`;
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved', 45000);
+      await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+      let p = await sa(t);
+      const line = p.iss.find(x => x.code === 'erp-pictures-unread');
+      c(`amber "${amber}"; Problems: the picture reader stopped; not red, no email`, p.ats.amber && p.ats.pics === amber && !!line && /couldn't be read: The picture reader stopped \(.*invented crash/.test(line.msg) &&
+        !p.probBad && !sendMails(w.calls).length, `${JSON.stringify(p.ats)} · ${JSON.stringify(p.iss)}`);
+      await savedChecks(c, t, w, want, { pics: want.rows.filter(r => SELL_PICS[r.style]).length });
+      const workers = t.workers.size;
+      for (let i = 0; i < 2; i++) {
+        await runRefresh(t, w);
+        await t.waitFor(chipIs('ok'), 'the sales sheet check', 30000);
+        await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+      }
+      p = await sa(t);
+      const db = await t.eval(IDB);
+      c('two 5-minute refreshes: the report not downloaded again, no worker started, still said; nothing noted in this browser (a crash may be passing)',
+        fileDownloads(w, 'ats-pics-1.xlsx') === 1 && t.workers.size === workers && p.ats.pics === amber && !!db.keys && !db.keys.length,
+        `${fileDownloads(w, 'ats-pics-1.xlsx')} · ${t.workers.size - workers} · ${p.ats.pics} · ${JSON.stringify(db.keys)}`);
+      t.workerInit = '';
+      const lk = w.photoLookups.length;
+      await t.reload();
+      for (const end = Date.now() + 45000; w.sales.made < 2 && Date.now() < end;) await sleep(100);
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved again', 30000);
+      await erpChecks(c, t, w, want, ERP_PICS_1, day, lk);
+      c('the next visit: read again (its second download), its pictures used, the sheet saved again', fileDownloads(w, 'ats-pics-1.xlsx') === 2 && w.sales.made === 2,
+        `${fileDownloads(w, 'ats-pics-1.xlsx')} · ${w.sales.made}`);
+    },
+  },
+  {
+    name: 'pics-crash-newest', title: "the picture reader crashes reading the newest report's numbers (the one with pictures): the ATS report can't be read (red), never read whole on the page instead; not downloaded again for its pictures",
+    world: { ...SELLW, ...PICS, ats: { age: 2, file: 'ats-pics-1.xlsx', stable: true } }, init: { scp: SAVE_SCP }, photos: true, worker: true, erpPics: true, workerInit: CRASH_EARLY_WORKER,
+    exceptionsOk: /invented crash/,
+    async run({ t, w, c }) {
+      await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+      const s = await t.snap(), p = await sa(t), card = (s.cards.ats && s.cards.ats.text) || '';
+      c("the ATS chip red, \"can't read the file\": reading it stopped part-way (the picture reader stopped), Refresh to try again", s.chips.ats.state === 'err' &&
+        /can't read the file/.test(s.chips.ats.text) && /stopped part-way: The picture reader stopped \(.*invented crash.*\)\. Click Refresh to try again; if it keeps happening, tell Saul\./.test(card), `${JSON.stringify(s.chips.ats)} · ${card.slice(0, 400)}`);
+      c('downloaded once: not read whole on the page instead, and not downloaded again for its pictures; its pictures line amber', fileDownloads(w, 'ats-pics-1.xlsx') === 1 && p.ats.amber,
+        `${fileDownloads(w, 'ats-pics-1.xlsx')} · ${JSON.stringify(p.ats)}`);
+    },
+  },
+  {
+    name: 'pics-noreader', title: "the picture reader's own files don't load: said once (amber), no other big report downloaded for nothing this visit, not on each 5-minute refresh either",
+    world: { ...SELLW, ...PICS, ats: { ...SELL_ATS, extra: [{ id: 'itm-ats-xp2', file: 'ats-pics-2.xlsx', older: 1 }, { id: 'itm-ats-xp1', file: 'ats-pics-1.xlsx', older: 3 }] } },
+    init: { scp: SAVE_SCP }, photos: true, saves: true, worker: true, erpPics: true, workerInit: NOREADER_WORKER,
+    async run({ t, w, c, today }) {
+      const want = sheetFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS }), day = TODAY - SELL_ATS.age - 1;
+      const amber = `the ${mdy(day)} report's pictures couldn't be read: photos from Quote Images`;
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved', 45000);
+      await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+      let p = await sa(t);
+      const lines = p.iss.filter(x => x.code === 'erp-pictures-unread');
+      c(`amber "${amber}"; one Problems line: part of the picture reader didn't load`, p.ats.amber && p.ats.pics === amber && lines.length === 1 && /Part of the picture reader didn't load/.test(lines[0].msg) && !p.probBad,
+        `${JSON.stringify(p.ats)} · ${JSON.stringify(p.iss)}`);
+      c('only the newer picture report downloaded (the older one not, for nothing)', fileDownloads(w, 'ats-pics-2.xlsx') === 1 && fileDownloads(w, 'ats-pics-1.xlsx') === 0, w.downloads.map(d => d.name).join(', '));
+      await savedChecks(c, t, w, want, { pics: want.rows.filter(r => SELL_PICS[r.style]).length });
+      await runRefresh(t, w);
+      await t.waitFor(chipIs('ok'), 'the sales sheet check', 30000);
+      await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+      p = await sa(t);
+      c('the 5-minute refresh: no big report downloaded, still said', fileDownloads(w, 'ats-pics-2.xlsx') === 1 && fileDownloads(w, 'ats-pics-1.xlsx') === 0 && p.ats.pics === amber,
+        `${w.downloads.map(d => d.name).join(', ')} · ${p.ats.pics}`);
+    },
+  },
+  {
+    name: 'pics-slowdl', title: "a picture report's download that stalls is given up after its time limit (10 minutes; 2 s here): amber, and the sales sheet is saved with Quote Images instead of waiting",
+    world: { ...SELLW, ...PICS, ats: PICS_OLDER, slowFile: 'ats-pics-1.xlsx' }, init: { scp: SAVE_SCP, fastTimeouts: true }, photos: true, saves: true, erpPics: true,
+    async run({ t, w, c, today }) {
+      const want = sheetFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS }), day = TODAY - SELL_ATS.age - 3, from = Date.now();
+      const amber = `the ${mdy(day)} report's pictures couldn't be read: photos from Quote Images`;
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved', 20000);
+      await t.waitFor(PICS_SETTLED, 'the pictures to be known', 5000);
+      const p = await sa(t), line = p.iss.find(x => x.code === 'erp-pictures-unread'), secs = (Date.now() - from) / 1000;
+      c(`the download given up (the stand-in holds it 25 s; ${secs.toFixed(1)} s here): amber "${amber}", Problems says it took too long`, w.aborted.includes('ats-pics-1.xlsx') && secs < 20 &&
+        p.ats.amber && p.ats.pics === amber && !!line && /it took more than 10 minutes to download, so it was given up/.test(line.msg) && !p.probBad, `${w.aborted.join(',')} · ${JSON.stringify(p.ats)} · ${JSON.stringify(p.iss)}`);
+      await savedChecks(c, t, w, want, { pics: want.rows.filter(r => SELL_PICS[r.style]).length });
+      c('no ERP picture on the rows; Quote Images\' where they have one', !p.pics.some(x => x.from === 'erp') && p.pics.some(x => x.from === 'quote'), p.pics.map(x => `${x.style}:${x.from || x.text}`).join(' '));
+    },
+  },
+  {
+    name: 'pics-race', title: 'a newer picture report comes in while the sales sheet is being made: the file and its fingerprint keep to the pictures it started with, and the sheet is saved again with the new ones',
+    world: { ...SELLW, ...PICS, ats: PICS_OLDER }, init: { scp: SAVE_SCP, slowCib: 15000 }, photos: true, saves: true, worker: true, erpPics: true, wait: 'pics',
+    async run({ t, w, c, today }) {
+      const want = sheetFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS }), day2 = TODAY - SELL_ATS.age - 1;
+      // The first save makes its Quote Images photos small (the first, held 15 s): a newer picture report lands meanwhile,
+      // and the 5-minute refresh takes its pictures into use before that save writes the file (not waiting for the page to
+      // be idle: the save in progress keeps it busy).
+      await t.waitFor('window.__headless.cibHeld === true', 'the first save to make its photos small', 45000);
+      w.o.ats = { ...w.o.ats, extra: [...w.o.ats.extra, { id: 'itm-ats-xp2', file: 'ats-pics-2.xlsx', older: 1 }] };
+      const lk = w.photoLookups.length;
+      c('the 5-minute refresh was waiting, and ran', (await t.eval('window.__headless.fireLong()')) >= 1);
+      await t.waitFor(`(() => { const l = document.querySelector('#chip-ats small.pl'); return !!l && l.textContent === ${JSON.stringify(`pictures from the ${mdy(day2)} report (6)`)}; })()`, 'the new pictures in use', 14000);
+      const during = await t.eval('window.__headless.cibHeld === true');
+      c('the new pictures came into use while the first save was still making its photos', during && w.sales.made === 0, `held ${during} · ${w.sales.made} saved`);
+      for (const end = Date.now() + 60000; w.sales.made < 2 && Date.now() < end;) await sleep(100);
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved again', 30000);
+      c('saved twice: the first save with the pictures it started with, then again with the new ones (its fingerprint differed)', w.sales.made === 2, `${w.sales.made} saved`);
+      await erpChecks(c, t, w, want, ERP_PICS_2, day2, lk);
+    },
+  },
+  {
+    name: 'pics-lost', title: "this browser's copy of the pictures can't give them back (its data lost): the file goes without them (Quote Images), the copy is let go, the sheet saved again to match; the next visit reads the report again",
+    world: { ...SELLW, ...PICS, ats: PICS_OLDER }, init: { scp: SAVE_SCP, lostBlobs: true }, photos: true, saves: true, worker: true, erpPics: true,
+    async run({ t, w, c, today }) {
+      const want = sheetFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS }), day = TODAY - SELL_ATS.age - 3;
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved', 45000);
+      await erpChecks(c, t, w, want, ERP_PICS_1, day);
+      // The next visit: the pictures from this browser's copy, whose data is gone (as the browser can lose it).
+      await t.eval(`localStorage.setItem('headless:lose', '1')`);
+      await t.reload();
+      await t.waitFor(chipIs('ok'), 'the sales sheet check', 45000);
+      await t.waitFor(PICS_SETTLED, 'the pictures to be known', 30000);
+      let p = await sa(t);
+      c('the next visit: the pictures from the copy, the sheet up to date (nothing changed)', p.ats.pics === `pictures from the ${mdy(day)} report (5)` && p.chip.em === 'up to date' && w.sales.made === 1, `${p.ats.pics} · ${p.chip.em}`);
+      // The Download button makes the file: the copy's pictures can't be read back.
+      await t.click('#btnSalesDl');
+      await t.waitFor('window.__headless.saved.length === 1', 'the download', 30000);
+      const got = await openSheet(Buffer.from(await t.eval('window.__headless.savedFile(0)'), 'base64'), MARKS_SELL), quoteOnly = want.rows.map(r => picFrom(r.style, {}));
+      c("the downloaded file: Quote Images' photos where there are any, no ERP picture (none could be read back)", fileFroms(got, want).join() === quoteOnly.join() && got.images === quoteOnly.filter(Boolean).length,
+        `${fileFroms(got, want).join()} vs ${quoteOnly.join()}`);
+      const db = await t.eval(IDB), s = await t.snap(), onSheet = want.rows.filter(r => ERP_PICS_1[r.style] != null).length;
+      c(`the copy let go (read again next visit), and the ATS card says how many couldn't be given back (the ${onSheet} on the sheet)`, !!db.keys && !db.keys.includes('set') &&
+        pair(s.cards.ats, "Pictures this browser's copy couldn't give back (Quote Images used; the report is read again next visit)") === String(onSheet) && pair(s.cards.ats, 'Kept in this browser') === 'no: read again next visit',
+        `${JSON.stringify(db.keys)} · ${JSON.stringify(s.cards.ats && s.cards.ats.pairs)}`);
+      // The 5-minute refresh: the file in the library still has the ERP pictures, the sheet now doesn't: saved again to match.
+      await runRefresh(t, w);
+      for (const end = Date.now() + 30000; w.sales.made < 2 && Date.now() < end;) await sleep(100);
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved again', 30000);
+      const g2 = await openSheet(w.sales.file.sent, MARKS_SELL);
+      c('the 5-minute refresh: the sheet saved again, its photos what the page has now (Quote Images only)', w.sales.made === 2 && fileFroms(g2, want).join() === quoteOnly.join(), `${w.sales.made} · ${fileFroms(g2, want).join()}`);
+      // The next visit, the copy gone: the report downloaded and read again, the sheet saved again with its pictures.
+      await t.eval(`localStorage.removeItem('headless:lose')`);
+      const lk = w.photoLookups.length;
+      await t.reload();
+      for (const end = Date.now() + 45000; w.sales.made < 3 && Date.now() < end;) await sleep(100);
+      await t.waitFor(chipIs('ok'), 'the sales sheet to be saved again', 30000);
+      await erpChecks(c, t, w, want, ERP_PICS_1, day, lk);
+      p = await sa(t);
+      c('the next visit: the report downloaded again (the second time), the sheet saved a third time with its pictures', fileDownloads(w, 'ats-pics-1.xlsx') === 2 && w.sales.made === 3, `${fileDownloads(w, 'ats-pics-1.xlsx')} · ${w.sales.made}`);
+    },
+  },
+  {
     name: 'sell-real', title: 'Available to sell on local copies of the real files and the real ATS report (only when named, with REAL_DIR and REAL_ATS; numbers printed, nothing else)',
     world: { ...REAL, ats: { age: 1, file: 'real-ats.xlsx' } }, optIn: true,
     async run({ t, w, c, today }) {
+      // A report saved with its pictures (2 MB or more): its numbers are read in the pictures worker, and its pictures follow
+      // the main view. Timed in the page from the main view (this point) until they are shown, before anything else here.
+      const bigAts = w.fx.bytes.get('real-ats.xlsx').length >= EP.BIG_REPORT;
+      let pict = null;
+      if (bigAts) {
+        const ready = await t.eval('performance.now()');
+        await t.waitFor(PICS_SETTLED, "the report's pictures", 240000);
+        pict = { ready, settled: await t.eval('performance.now()'),
+          worker: await t.eval(`(() => { const e = performance.getEntriesByType('resource').find(x => /picturesWorker\\.js$/.test(x.name)); return e ? e.startTime : null; })()`) };
+      }
       const f = { msl: 'real-msl.xlsx', trk: 'real-trk.xlsx', ct: 'real-ct.xlsx', fwd: 'real-fwd.xlsx', dray: 'real-dray.csv', pob: w.fx.real.pob, upc: w.fx.real.upcPages.flat(), sections: realSections(), ats: w.o.ats };
       const { R, A, S } = sellFor(w.fx, today, f);
       c('the engines (run here) on the real files: balance 0, the ATS report adds up', R.ok && R.balance.diff === 0 && R.balance.ct.diff === 0 && !!A && A.ok && !!S && S.ok && !S.atsMissing,
@@ -3056,6 +3720,17 @@ const SCENARIOS = [
       console.log(`REAL dates disagree: ${fmtN(cnt.datesDisagreeLots)} lots on ${fmtN(cnt.datesDisagreePairs)} PO + style · styles ${fmtN(S.styles.length)}, with stock now ${fmtN(cnt.stylesWithStock)}, not on the report ${fmtN(cnt.stylesNotOnReport)}, report only ${fmtN(cnt.erpOnlyStyles)}`);
       console.log('REAL Available to sell issue codes: ' + Object.entries(codes).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(', '));
       console.log(`REAL page: ${p.tr} rows drawn; only available ${ms.map(x => x.toFixed(0)).join('/')} ms, scroll ${sm.toFixed(0)} ms, From China panel ${tm.toFixed(0)} ms`);
+      // The report's pictures: counts and times only (never a style or a link).
+      await t.click('#tabs .tab[data-tab="sell"]'); await sleep(500);
+      const q = await sa(t), sc = await t.snap(), erpRows = q.pics.filter(x => x.from === 'erp').length;
+      if (bigAts) {
+        c('the page drew the ERP report\'s pictures: the ATS chip says from which report, and the rows in view show them', /^pictures from the \d+\/\d+ report \([\d,]+\)$/.test(q.ats.pics) && !q.ats.amber && erpRows > 0,
+          `${q.ats.pics} · ${erpRows} of ${q.pics.length}`);
+        const none = q.iss.find(x => x.code === 'no-photo'), nNone = none ? Number(none.msg.split(' ')[0].replace(/,/g, '')) : 0;
+        const sec = ms => (ms == null ? 'not known' : `${(ms / 1000).toFixed(1)} s`);
+        console.log(`REAL pictures: ${q.ats.pics} · ${pair(sc.cards.ats, 'Size')} · rows in view with an ERP picture ${erpRows} of ${q.pics.length} · sales sheet styles with no picture ${fmtN(nNone)} of ${fmtN(want0(S, today))}`);
+        console.log(`REAL picture times in Edge (from the page's start): the worker started at ${sec(pict.worker)} (after the report's download), the main view at ${sec(pict.ready)}, the pictures shown at ${sec(pict.settled)}: ${sec(pict.settled - pict.ready)} after the main view${pict.worker != null ? `, ${sec(pict.settled - pict.worker)} after the worker started` : ''}`);
+      } else console.log(`REAL pictures: ${q.ats.pics || '(no line)'} (the ATS report is under 2 MB: no pictures in it)`);
       await t.click('#tabs .tab[data-tab="sell"]');
     },
   },
@@ -3118,6 +3793,7 @@ async function main() {
       fx.bytes.set('real-ats.xlsx', readFileSync(ats));
     }
   }
+  if (run.some(s => s.erpPics)) await addPictureReports(fx);
   const e = expected(fx, today);
   const results = [];
   const setup = { name: 'setup checks', title: 'fixtures, harness and the whole run', checks: [] };
@@ -3165,11 +3841,12 @@ async function main() {
           w = world = newWorld(fx, s.world);
           t = await openTab(edge.cdp, initScript(ORIGIN, s.init));
           t.shots = [];
+          t.workerInit = s.workerInit || '';   // from the first load on (a scenario can change it later)
           await t.send('Page.navigate', { url: `${ORIGIN}/index.html` });
           if (!s.wait) await t.waitFor(READY, 'the sources to load', s.readyMs || 45000);
         }
         const before = { blocked: t.blocked.length, exceptions: t.exceptions.length, net: s.after ? t.net.length : 0,
-          calls: s.after ? w.calls.length : 0, downloads: s.after ? w.downloads.length : 0 };
+          calls: s.after ? w.calls.length : 0, downloads: s.after ? w.downloads.length : 0, wnet: s.after ? t.workerNet.length : 0 };
         // newTab(): another browser (its own storage) on the same SharePoint, loaded; the caller closes it.
         const newTab = async () => {
           const t2 = await openTab(edge.cdp, initScript(ORIGIN, s.init));
@@ -3188,6 +3865,12 @@ async function main() {
           ...w.pageGets.filter(x => x.method !== 'GET').map(x => `page host got ${x.method} ${x.path}`),
           ...(putsOk(w) ? [] : w.sales.puts.map(p => `upload host got ${p.method} ${p.id}${p.auth ? ' with a token' : ''}`))];
         c('only what may leave the page: GETs, the email POST, batches of GETs, the sales sheet\'s upload session and PUTs to its address (no token)', net.length > 0 && !bad.length, bad.join('; ') || 'no requests seen');
+        // The pictures worker: only its own files, from the page's server (GETs), never anything else.
+        const wnet = t.workerNet.slice(before.wnet);
+        if (s.worker || wnet.length) {
+          c('the pictures worker made no request but loading its own files from the page\'s server', (!s.worker || wnet.length > 0) && wnet.every(workerOk(ORIGIN)),
+            wnet.filter(x => !workerOk(ORIGIN)(x)).map(x => `${x.method} ${x.url}`).join('; ') || 'no worker requests seen');
+        }
         // The sales sheet is saved only with the saving permission in the token, and only in the scenarios that expect it.
         const sessions = calls.filter(x => x.method === 'POST' && x.path === SESSION_PATH);
         c(s.saves ? 'the sales sheet\'s upload session was asked for' : 'no upload session, no PUT (nothing saved in this scenario)',
@@ -3202,7 +3885,8 @@ async function main() {
         c('no interactive sign-in, sign-out or token popup', !snap.msalInteractive.length, snap.msalInteractive.join(','));
         const blocked = [...t.blocked.slice(before.blocked), ...snap.fetchBlocked];
         c('no request left 127.0.0.1', !blocked.length, blocked.join(', '));
-        const ex = t.exceptions.slice(before.exceptions);
+        // s.exceptionsOk: the invented failure a scenario sets off on purpose (a worker that crashes).
+        const ex = t.exceptions.slice(before.exceptions).filter(x => !(s.exceptionsOk && s.exceptionsOk.test(x)));
         c('no uncaught errors in the page', !ex.length, ex.join(' | '));
         c('every Graph call carried a bearer token', (s.noGraph || calls.length > 0) && calls.every(x => /^Bearer \S+/.test(x.auth)), `${calls.length} calls`);
         c('file downloads went through the download link, without the token', dls.every(d => !d.auth) && !calls.some(x => x.method === 'GET' && /\/content$/.test(x.path)),
@@ -3235,6 +3919,10 @@ async function main() {
     sc('whole run: the stand-in got no other write (no PATCH, DELETE, or POST but the email, batches of GETs and the one upload session)', !allCalls.filter(x => !okCall(x)).length && !allDownloads.some(d => d.method !== 'GET'),
       allCalls.filter(x => !okCall(x)).map(x => `${x.method} ${x.path}`).join('; '));
     sc('whole run: every PUT went to an address an upload session gave, without a token', allWorlds.every(putsOk), allWorlds.flatMap(x => x.sales.puts.filter(p => p.auth)).map(p => p.id).join(', '));
+    if (run.some(s => s.worker)) {
+      sc(`whole run: every one of the pictures workers' ${fmtN(ALL_WORKER_NET.length)} requests was a GET of its own files from the page's server`, ALL_WORKER_NET.length > 0 && ALL_WORKER_NET.every(workerOk(ORIGIN)),
+        ALL_WORKER_NET.filter(x => !workerOk(ORIGIN)(x)).map(x => `${x.method} ${x.url}`).join('; ') || 'none seen');
+    }
     // A few scenarios run by name may send no email at all; the whole run always does.
     if (!pick.length || allCalls.some(x => x.method === 'POST' && x.path === '/me/sendMail')) {
       sc('whole run: the email POST was seen (the check above is live)', ALL_NET.some(x => x.method === 'POST' && /\/__graph\/me\/sendMail$/.test(x.url)));

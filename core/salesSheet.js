@@ -177,11 +177,15 @@
   const blankIfNone = v => (isDay(v) && v !== 0 ? v : null);
   // A date as the sheet shows it: now, about m/d/yyyy (an estimate), or the date itself.
   const whenCell = (when, estimate, any) => (when === 'now' ? 'now' : isDay(when) ? (estimate ? `about ${fmt(when)}` : dateOf(when)) : any ? 'no date yet' : null);
-  const photoOf = (photos, key) => (!photos || !key ? null : photos instanceof Map ? photos.get(key) : Object.prototype.hasOwnProperty.call(photos, key) ? photos[key] : null);
+  // A row's photo: from a list in the rows' order (the page's: each style's own picture, the ERP report's or Quote
+  // Images'), else by its photo key.
+  const photoOf = (photos, key, n) => (!photos ? null : Array.isArray(photos) ? photos[n] || null : !key ? null : photos instanceof Map ? photos.get(key)
+    : Object.prototype.hasOwnProperty.call(photos, key) ? photos[key] : null);
 
   // ExcelJS: the library (window.ExcelJS, or require('vendor/exceljs/exceljs.min.js') in Node). sheet: salesRows's
   // answer (ok, with rows). photos: a Map (or object) of photoKey -> { data (the image's bytes: ArrayBuffer or
-  // Uint8Array), width, height (pixels), extension ('jpeg' when not given) }; a style with none gets an empty cell.
+  // Uint8Array), width, height (pixels), extension ('jpeg' when not given) }, or a list of those in the rows' order (null
+  // for none); a style with none gets an empty cell.
   // opts.print: the page's fingerprint of what the file holds (a hash: letters and digits only), kept in the file's
   // keywords, so a later look at the file in the library can tell it holds the same sheet whoever saved it.
   // Answers the ExcelJS Workbook (workbookBytes writes it).
@@ -210,7 +214,7 @@
       cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
     });
     head.height = 45;
-    const withPhotos = !!photos && (photos instanceof Map ? photos.size > 0 : Object.keys(photos).length > 0);
+    const withPhotos = !!photos && (Array.isArray(photos) ? photos.some(Boolean) : photos instanceof Map ? photos.size > 0 : Object.keys(photos).length > 0);
     const picCol = COLS.findIndex(c => c.photo);
     sheet.rows.forEach((r, n) => {
       const row = ws.getRow(n + 3);
@@ -227,7 +231,7 @@
         if ((c.first || c.date) && cell.value instanceof Date) cell.numFmt = DATE;
       });
       if (withPhotos) row.height = PHOTO_ROW_PT;
-      const p = photoOf(photos, r.photoKey);
+      const p = photoOf(photos, r.photoKey, n);
       if (!p || !p.data) return;
       const id = wb.addImage({ buffer: p.data, extension: p.extension || 'jpeg' });
       const d = isDay(p.width) && p.width > 0 && isDay(p.height) && p.height > 0 ? { w: p.width, h: p.height } : { w: 160, h: 160 };

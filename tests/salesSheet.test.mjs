@@ -360,6 +360,18 @@ test('the workbook without photos: no pictures, ordinary rows; never an empty sh
   const one = xlsxParts(await SS.workbookBytes(SS.buildWorkbook(loadExcelJS(), sh, { SS999: { data: PNG1, width: 1, height: 1, extension: 'png' } })));
   assert.equal([...one.keys()].filter(p => /^xl\/media\//.test(p)).length, 0);
 
+  // Photos as a list in the rows' order (the page's: each style's own picture, whatever its photo key): placed on those
+  // rows only; null for none; an empty list is no photos.
+  const list = sh.rows.map((r, i) => (i === 1 ? { data: PNG1, width: 1, height: 1, extension: 'png' } : i === 3 ? { data: PNG2, width: 2, height: 1, extension: 'png' } : null));
+  const lp = xlsxParts(await SS.workbookBytes(SS.buildWorkbook(loadExcelJS(), sh, list)));
+  assert.equal([...lp.keys()].filter(p => /^xl\/media\//.test(p)).length, 2);
+  const ld = Buffer.from(lp.get('xl/drawings/drawing1.xml')).toString('utf8');
+  assert.deepEqual([...ld.matchAll(/<xdr:from><xdr:col>(\d+)<\/xdr:col><xdr:colOff>\d+<\/xdr:colOff><xdr:row>(\d+)<\/xdr:row>/g)].map(m => [+m[1], +m[2]]), [[0, 3], [0, 5]]);
+  assert.match(Buffer.from(lp.get('xl/worksheets/sheet1.xml')).toString('utf8'), new RegExp(`<row r="3"[^>]* ht="${SS.PHOTO_ROW_PT}"`));
+  const none = xlsxParts(await SS.workbookBytes(SS.buildWorkbook(loadExcelJS(), sh, sh.rows.map(() => null))));
+  assert.equal([...none.keys()].filter(p => /^xl\/(media|drawings)\//.test(p)).length, 0);
+  assert.doesNotMatch(Buffer.from(none.get('xl/worksheets/sheet1.xml')).toString('utf8'), /<row r="3"[^>]* ht="82.5"/);
+
   const E = loadExcelJS();
   assert.throws(() => SS.buildWorkbook(E, SS.salesRows(sellOf([alloc()], null), { today: TODAY }), null), /There's no ATS report/);
   assert.throws(() => SS.buildWorkbook(E, SS.salesRows(sellOf([], atsOf({ SS100: [0, 0] })), { today: TODAY }), null), /would be empty/);

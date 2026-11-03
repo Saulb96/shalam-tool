@@ -40,6 +40,11 @@ a.chip.src:hover{background:#fff}
 .chip.sales a{color:inherit;text-decoration:none}
 .chip.sales a:hover b{text-decoration:underline}
 .chip.sales button{flex:none;padding:0 4px;font-size:11.5px}
+/* The ATS chip's third line: where the pictures come from, or how reading them goes (Cancel beside it while it runs). */
+.chip.src .ct small.pl.a{color:var(--amb)}
+.chip.src>button{flex:none;padding:0 4px;font-size:11.5px}
+.chip.src .l1 a{color:inherit;text-decoration:none}
+.chip.src .l1 a:hover b{text-decoration:underline}
 
 /* banners */
 #banners:empty{display:none}

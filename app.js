@@ -1,7 +1,8 @@
 // Shalam Tool: sign-in, reading every source from SharePoint, the source chips, the failure rules, the error email,
 // what can be sold (Available to sell: stock after customer orders, and goods from China with one date each, with a
-// photo per style), where the goods are (Where it is and Pull from China tabs, the side panel), the Problems tab, and
-// the sales sheet (core/salesSheet.js: saved into Shalam Sales tool after a clean load, and the Download button).
+// photo per style: the ERP report's picture, else Quote Images'), where the goods are (Where it is and Pull from China
+// tabs, the side panel), the Problems tab, and the sales sheet (core/salesSheet.js: saved into Shalam Sales tool after a
+// clean load, and the Download button). A big ATS report (one saved with its pictures) is read in picturesWorker.js.
 // Parsing, the stage rules and the selling rules live in core/*.js; this file fetches, calls them and draws.
 // The page only reads, except the error email and saving the sales sheet into the one library in config.js (the request
 // guard below refuses anything else before it leaves the page).
@@ -142,7 +143,10 @@
     // what one of the ATS report's In Trans shipments is to our sheets
     'erp-ours-sailed': 'Ours on the water or at port (counted here, once)', 'erp-off-china': 'Left China per the ATS report: taken off our lots still in China',
     // the sales sheet (its photos, and saving it into Shalam Sales tool)
-    'no-photo': 'No photo in Quote Images', 'photo-error': "Photos couldn't be read", 'not-saved': 'Sales sheet not saved',
+    'no-photo': 'No picture (not in the ERP report, not in Quote Images)', 'photo-error': "Photos couldn't be read", 'not-saved': 'Sales sheet not saved',
+    // the ERP report's pictures (the newest ATS report that has them)
+    'erp-pictures-unread': "The ATS report's pictures couldn't be read", 'erp-pictures-differ': "Different pictures on a style's rows (the first used)",
+    'erp-pictures-skipped': 'Reports not looked in for pictures (at most 2 downloaded per load)',
   };
   // The same code from another file, where its words differ (the ATS report's rows aren't product lines).
   const SOURCE_LABELS = { 'ATS report': { 'no-style': 'Row with no style' } };
@@ -949,11 +953,17 @@
     return /^\/sites\//i.test(locText('ats')) && parts.length > 3 ? `${parts.slice(3).join('/')} on the ${parts[1]} site` : 'the ATS folder set in config.js';
   }
   const isBook = n => /\.(xlsx|xlsm|xls)$/i.test(String(n || ''));
+  // The ATS folder's reports as this load listed them, newest first, for the pictures after the main view:
+  // { driveId, reports: [{ id, name, size, eTag, day }] } (null until the folder is listed).
+  let atsList = null;
+  let atsBigLoads = 0;   // big reports this load downloaded already (the newest, for its numbers): they count towards the pictures' 2
   // The report's date: from its file name ("… 10-29-2026 12-58 PM.xlsx"), else the day it was saved. Its age decides
-  // amber (after 8 days) and the error email (after 10).
+  // amber (after 8 days) and the error email (after 10). A report of 2 MB or more (one saved with its pictures) is read
+  // in the pictures worker, off the page's main thread: its numbers first, then its pictures, from the one download.
   async function loadAts(today, force, signal) {
     const s = fresh('ats');
     showLoading('ats');
+    atsList = null; atsBigLoads = 0;
     const noReport = why => off(s, 'no report yet', `${why || 'No ATS report yet.'} Save the weekly ATS report into ${atsPlace()}.`, `save it into ${atsPlace()}`);
     await attempt(s, async () => {
       let at;
@@ -963,29 +973,50 @@
       const folder = at.item;
       s.file = folder.name || s.file; s.webUrl = folder.webUrl || s.webUrl;
       setBusy('Looking in the ATS folder…');
-      const files = (await gAll(`/drives/${at.driveId}/items/${folder.id}/children?$select=id,name,lastModifiedDateTime,lastModifiedBy,file,webUrl&$top=999`, signal))
+      const files = (await gAll(`/drives/${at.driveId}/items/${folder.id}/children?$select=id,name,lastModifiedDateTime,lastModifiedBy,file,webUrl,size,eTag&$top=999`, signal))
         .filter(x => x.file && !/^~\$/.test(x.name || ''));
       const kids = files.filter(x => isBook(x.name));
       s.rows = [['Files in the folder', files.length]];
       if (!kids.length) return noReport(files.length ? `No Excel file in the ATS folder (${plural(files.length, 'other file')}).` : '');
       // The newest report: by the date in its file name (a report opened and saved again keeps its own date), else the
-      // day it was saved; then the latest saved.
+      // day it was saved; then the latest saved. The pictures walk the same order.
       const dayOfKid = x => { const d = window.InvAts.dayFromName(x.name); if (d != null) return d; const ms = Date.parse(x.lastModifiedDateTime); return Number.isFinite(ms) ? window.InvCommon.todayNY(ms) : -Infinity; };
-      const f = kids.slice().sort((a, b) => (dayOfKid(b) - dayOfKid(a)) || String(b.lastModifiedDateTime).localeCompare(String(a.lastModifiedDateTime)))[0];
+      const order = kids.slice().sort((a, b) => (dayOfKid(b) - dayOfKid(a)) || String(b.lastModifiedDateTime).localeCompare(String(a.lastModifiedDateTime)));
+      const f = order[0];
+      atsList = { driveId: at.driveId, reports: order.map(x => ({ id: x.id, name: x.name || '', size: numOr(x.size), eTag: String(x.eTag || ''), day: Number.isFinite(dayOfKid(x)) ? dayOfKid(x) : null })) };
+      // Until the pictures are known, a style's Quote Images photo waits (a style with an ERP picture is never asked there).
+      if (atsList.reports.some(x => x.size != null && x.size >= window.InvErpPictures.BIG_REPORT)) picsDue = true;
       s.file = f.name; s.webUrl = f.webUrl || s.webUrl; s.savedAt = f.lastModifiedDateTime || ''; s.savedBy = who(f.lastModifiedBy);
       const meta = await gj(`/drives/${at.driveId}/items/${f.id}`, { signal });   // with its download link
       s.file = meta.name || f.name; s.webUrl = meta.webUrl || s.webUrl;
       s.savedAt = meta.lastModifiedDateTime || s.savedAt; s.savedBy = who(meta.lastModifiedBy) || s.savedBy;
       let c = cache['file:ats'];
-      if (force || !unchanged(c, meta)) {
-        const buf = await fetchBytes(meta, 'the ATS report', signal);
-        c = { id: meta.id, lm: meta.lastModifiedDateTime, wb: readBook(buf, meta.name) };
+      if (force || !unchanged(c, meta) || (c.numbers && c.today !== today)) {
+        // A big report (saved with its pictures) this browser has read before: its numbers from the copy kept of its
+        // numbers' part, read again as the file would be, so it isn't downloaded on every visit or Refresh. Its id and
+        // eTag say it is the very same file; a new or changed report is downloaded.
+        const x = atsList.reports[0], kept = x.size != null && x.size >= window.InvErpPictures.BIG_REPORT ? await atsKept(x, meta, c, today) : null;
+        if (kept) c = { id: meta.id, lm: meta.lastModifiedDateTime, size: x.size, numbers: kept.numbers, slim: kept.slim, key: kept.key, today, copy: true };
+        else {
+          const buf = await fetchBytes(meta, 'the ATS report', signal);
+          c = { id: meta.id, lm: meta.lastModifiedDateTime, size: buf.byteLength };
+          if (buf.byteLength >= window.InvErpPictures.BIG_REPORT) {
+            atsBigLoads = 1;
+            const got = await atsInWorker(buf, meta, x, today, signal);
+            if (got) Object.assign(c, { numbers: got.numbers, slim: got.slim, key: picKey(x.id, x.eTag || meta.eTag || '') });
+            c.today = today;
+          }
+          if (!c.numbers) c.wb = readBook(buf, meta.name);   // a small report, or no worker in this browser
+        }
         cache['file:ats'] = c;
       }
       setBusy('Reading the ATS report…'); await yieldUi();
       let r;
-      try { r = window.InvAts.parseAts(XLSX, c.wb, meta.name, today); }
-      catch (e) { console.error(e); throw problem("can't read the file", 'Reading the ATS report failed: ' + ((e && e.message) || e)); }
+      if (c.numbers) r = c.numbers;
+      else {
+        try { r = window.InvAts.parseAts(XLSX, c.wb, meta.name, today); }
+        catch (e) { console.error(e); throw problem("can't read the file", 'Reading the ATS report failed: ' + ((e && e.message) || e)); }
+      }
       if (!r || typeof r !== 'object') throw problem("can't read the file", "Reading the ATS report gave nothing back.");
       const ms = Date.parse(s.savedAt);
       const savedDay = Number.isFinite(ms) ? window.InvCommon.todayNY(ms) : null;
@@ -998,7 +1029,9 @@
       s.read = firstNum(r.counts, ['rowsRead', 'rows']); s.counted = firstNum(r.counts, ['styleRows']) ?? n;
       s.rows.push(['Newest file', meta.name],
         ['Report date', day == null ? 'not known' : `${window.InvCommon.fmtDay(day)} (${fromName ? 'from the file name' : 'the day it was saved: no date in the file name'})`],
-        ['Age', age == null ? '' : plural(age, 'day')], ...countRows(r.counts, SRC_LABELS.ats), ...(r.counts && typeof r.counts.styles === 'number' ? [] : [['Styles', n]]));
+        ['Age', age == null ? '' : plural(age, 'day')],
+        ...(c.numbers ? [['Size', `${(c.size / 1048576).toFixed(1)} MB: ${c.copy ? "its numbers read from this browser's copy (not downloaded again)" : 'read in the background, with its pictures'}`]] : []),
+        ...countRows(r.counts, SRC_LABELS.ats), ...(r.counts && typeof r.counts.styles === 'number' ? [] : [['Styles', n]]));
       s.issues = (r.issues || []).map(i => normIssue('ATS report', { ...i, source: 'ATS report' }));
       if (!r.ok) {
         const msg = unprefix('ATS report', String(r.error || '')) || "The ATS report couldn't be read.";
@@ -1018,6 +1051,59 @@
       data.ats = r; s.data = r;
     });
     commit('ats', s);
+  }
+  // The newest report when it is big (saved with its pictures): read in the pictures worker. Answers { numbers
+  // (parseAts's, exactly as the whole file gives them), slim (the numbers' part of the file, kept in this browser so the
+  // next visit reads the numbers from it instead of downloading the report again) }, or null when the worker can't run in
+  // this browser (the page then reads it itself, as it reads a small one). A worker that stops part-way through the
+  // report (out of memory, or no answer) isn't followed by the page reading the same file whole itself, which could stop
+  // the page too: the report can't be read (red), and a Refresh tries again. The worker goes on with its pictures, unless
+  // this browser has them already, and the pictures step after the main view takes them over (picPend): one download for
+  // both.
+  async function atsInWorker(buf, meta, x, today, signal) {
+    const key = picKey(x.id, x.eTag || meta.eTag || '');
+    await picCacheLoad();
+    const known = picKnown(key, today);
+    // The worker is handed a copy, so the page still has the bytes if the worker can't run.
+    const job = workerRead(buf.slice(0), meta.name, today, { numbersOnly: known });
+    if (!job) return null;
+    const stop = () => job.cancel();
+    signal.addEventListener('abort', stop, { once: true });
+    setBusy('Reading the ATS report (a big one: its pictures come after)…');
+    let n;
+    try { n = await job.numbers; } finally { signal.removeEventListener('abort', stop); }
+    if (signal.aborted) { job.cancel(); throw abortErr(); }
+    if (n.noReader) { console.error(n.error); job.cancel(); picNoReader = picNoReader || n.error; return null; }
+    if (n.crashed) {
+      console.error(n.error); job.cancel();
+      picBad.set(key, n.error);   // nor downloaded again for its pictures this visit
+      throw problem("can't read the file", `Reading ${meta.name} stopped part-way: ${String(n.error || 'the picture reader stopped').replace(/\.$/, '')}. Click Refresh to try again; if it keeps happening, tell Saul.`);
+    }
+    if (!n.numbers || typeof n.numbers !== 'object') throw problem("can't read the file", n.error || `Couldn't open ${meta.name} as an Excel workbook.`);
+    const fixed = { ...x, eTag: x.eTag || meta.eTag || '' };
+    if (n.slim) picKeepNumbers(key, fixed, meta.name, n.slim).catch(e => console.error(e));
+    if (!known) {
+      if (picPend) picPend.job.cancel();
+      picPend = { key, x: fixed, job };
+      job.onProgress = j => picShow({ what: j.step, n: j.n, m: j.m, report: picPend ? picPend.x : null });
+      picShow({ what: job.step, n: job.n, m: job.m, report: picPend.x }, true);
+    }
+    return { numbers: n.numbers, slim: n.slim };
+  }
+  // The newest report's numbers from this browser's copy of its numbers' part, when that copy is of this very file (its
+  // id and eTag): { key, numbers, slim }, or null (no copy, another file, or it can't be read: the report is downloaded).
+  async function atsKept(x, meta, c, today) {
+    const key = picKey(x.id, x.eTag || meta.eTag || '');
+    let slim = c && c.key === key && c.slim ? c.slim : null;
+    if (!slim) { const k = (await picCacheLoad()).numbers; slim = k && k.key === key ? k.slim : null; }
+    if (!slim) return null;
+    try {
+      setBusy("Reading the ATS report (from this browser's copy of its numbers)…"); await yieldUi();
+      const bytes = slim instanceof Blob ? new Uint8Array(await slim.arrayBuffer()) : slim;
+      const r = await window.InvErpPictures.readPictures({ XLSX, InvAts: window.InvAts, bytes, fileName: meta.name, today, readOpts: XOPT, numbersOnly: true });
+      if (!r.ok || !r.numbers || typeof r.numbers !== 'object') { console.error(r.error); return null; }
+      return { key, numbers: r.numbers, slim: bytes };
+    } catch (e) { console.error(e); return null; }
   }
 
   // ---------- UPC_MASTER ----------
@@ -1230,6 +1316,8 @@
     sell = null; sellErr = ''; sx = null;
     lastLoaded = null;
     if (salesCtl) salesCtl.abort();
+    if (picCtl) picCtl.abort();
+    picDrop();
     setSales({ state: 'off', label: 'not read', short: 'see the red banner', message: 'Not saved: Shalam Tool stopped because of its sign-in permissions (see the red banner).' }, true);
   }
 
@@ -1243,6 +1331,7 @@
     const today = window.InvCommon.todayNY(Date.now());
     fatal = ''; fatalAuth = false;
     photoCycle++; photoErr = ''; photoErrStatus = 0;   // styles with no photo, and a photo store that couldn't be read, are looked at again
+    let finished = false;
     setBusy('Connecting to SharePoint…');
     try {
       // Master Sheet Live, the tracker and Container Tracking first; UPC_MASTER last.
@@ -1256,6 +1345,7 @@
       applyCopyCheck();
       await emailProblems(today);
       lastLoaded = Date.now();
+      finished = true;
     } catch (e) {
       if (e && e.stop) {
         ctl.abort();   // stop the other sources still reading
@@ -1284,6 +1374,9 @@
       // After every cycle, finished or not: built from what each chip shows as read (a stopped page has nothing).
       if (scopeFatal) { stages = null; stageErr = ''; idx = null; sell = null; sellErr = ''; sx = null; } else buildStages(today);
       try { markNew(); } catch (e) { console.error(e); }
+      // The ERP report's pictures, after a load that finished (from its listing of the ATS folder): they run behind the
+      // main view drawn below, and the sales sheet waits for them.
+      if (!scopeFatal && finished) picturesAfterLoad(today); else picDrop();
       renderAll();
       // The sales sheet: saved when this load was clean (or says why not); its photos looked up for Problems.
       if (!scopeFatal) salesAfterLoad(today);
@@ -1318,14 +1411,20 @@
     const mailBad = s.mail && s.mail.state === 'failed';
     // No person's name on the chip itself (Saul, Nov 2): who saved it is in its tooltip and on Problems.
     const line2 = [s.savedAt ? 'saved ' + fmtShort(s.savedAt) : '', readCounted(s)].filter(Boolean).join(' · ') || s.short || '';
+    // The ATS chip's third line: where the pictures come from, or how reading them is going (with Cancel).
+    const pl = src.k === 'ats' ? picLine() : null;
     const tip = [src.name, s.file,
       s.savedAt ? 'Saved ' + fmtLong(s.savedAt) + (s.savedBy ? ' by ' + s.savedBy : '') : '',
       readCounted(s), s.state === 'ok' ? '' : s.message, s.stale ? `Not refreshed: this is what was read ${fmtShort(new Date(s.stale).toISOString())}.` : '',
-      ...s.notes, s.mail ? s.mail.text : '',
+      ...s.notes, s.mail ? s.mail.text : '', pl ? pl.tip : '',
       s.webUrl ? 'Click to open it on SharePoint.' : ''].filter(Boolean).join('\n');
-    const inner = `<span class="dot"></span><span class="ct"><span class="l1"><b>${esc(src.name)}</b>${label ? `<em>${esc(label)}</em>` : ''}${mailBad ? '<em>· email failed</em>' : ''}</span>${line2 ? `<small>${esc(line2)}</small>` : ''}</span>`;
+    const btn = pl && pl.busy ? '<button type="button" class="ghost" data-pics="cancel" title="Stop reading the pictures: the photos stay as they are">Cancel</button>' : '';
+    // With a button in it, only its name opens the file (a button can't sit inside a link).
+    const name = btn && s.webUrl ? `<a href="${esc(s.webUrl)}" target="_blank" rel="noopener"><b>${esc(src.name)}</b></a>` : `<b>${esc(src.name)}</b>`;
+    const inner = `<span class="dot"></span><span class="ct"><span class="l1">${name}${label ? `<em>${esc(label)}</em>` : ''}${mailBad ? '<em>· email failed</em>' : ''}</span>${line2 ? `<small>${esc(line2)}</small>` : ''}` +
+      `${pl ? `<small class="pl${pl.amber ? ' a' : ''}">${esc(pl.text)}</small>` : ''}</span>${btn}`;
     const attrs = `class="chip src ${s.state}" id="chip-${src.k}" data-state="${s.state}" title="${esc(tip)}"`;
-    return s.webUrl ? `<a ${attrs} href="${esc(s.webUrl)}" target="_blank" rel="noopener">${inner}</a>` : `<span ${attrs}>${inner}</span>`;
+    return s.webUrl && !btn ? `<a ${attrs} href="${esc(s.webUrl)}" target="_blank" rel="noopener">${inner}</a>` : `<span ${attrs}>${inner}</span>`;
   }
   function renderChips() {
     const el = $('chips');
@@ -1348,7 +1447,7 @@
     const file = s.file ? (s.webUrl ? `<a href="${esc(s.webUrl)}" target="_blank" rel="noopener">${esc(s.file)}</a>` : esc(s.file)) : '';
     const sub = [file, s.savedAt ? 'saved ' + esc(fmtLong(s.savedAt)) : '', esc(s.savedBy)].filter(Boolean).join(' · ');
     const msgs = [s.state === 'ok' ? '' : s.message, ...s.notes].filter(Boolean).map(m => `<div class="msg">${esc(m)}</div>`).join('');
-    const rows = (s.rows || []).map(r => (Array.isArray(r) ? `<dt>${esc(r[0])}</dt><dd>${esc(fmtV(r[1]))}</dd>` : `<dt class="h">${esc(r.h)}</dt>`)).join('');
+    const rows = [...(s.rows || []), ...(src.k === 'ats' ? picCardRows() : [])].map(r => (Array.isArray(r) ? `<dt>${esc(r[0])}</dt><dd>${esc(fmtV(r[1]))}</dd>` : `<dt class="h">${esc(r.h)}</dt>`)).join('');
     const iss = s.issues.length ? `<dt>Issues listed on Problems</dt><dd>${fmtN(s.issues.length)}</dd>` : '';
     return `<div class="scard ${s.state}" id="card-${src.k}"><div class="sh"><span class="dot"></span><b>${esc(src.name)}</b><span class="sp"></span><span class="pill ${s.state}">${esc(statusWord(s))}</span></div>` +
       `${sub ? `<div class="sub">${sub}</div>` : ''}${msgs}${s.mail ? `<div class="sub">${esc(s.mail.text)}</div>` : ''}` +
@@ -2441,7 +2540,7 @@
     const tip = [r.styleRaw, r.upcs.length ? 'UPC ' + r.upcs.join(', ') : '', r.category, r.factories.length ? 'Factory ' + r.factories.join(', ') : '',
       'Click for its stock and every lot, with their dates'].filter(Boolean).join('\n');
     const styleHtml = `<div class="sc"><button type="button" class="sb" data-b="all">${esc(r.styleRaw)}</button>${tags.join('')}</div><span class="u">${esc(upcLine) || '&nbsp;'}</span>`;
-    let h = `<tr class="r" data-i="${i}"><td class="fz f-sty" title="${esc(tip)}">${photoOn() ? `<div class="pw">${photoHtml(r)}<div class="sw">${styleHtml}</div></div>` : styleHtml}</td>` +
+    let h = `<tr class="r" data-i="${i}"><td class="fz f-sty" title="${esc(tip)}">${picsCol() ? `<div class="pw">${photoHtml(r)}<div class="sw">${styleHtml}</div></div>` : styleHtml}</td>` +
       `<td class="desc" title="${esc(r.desc)}">${esc(r.desc)}</td>` +
       `<td class="num"${s.casePack === 'mixed' ? ' title="Its goods come in different case packs"' : ''}>${typeof s.casePack === 'number' ? fmtN(s.casePack) : s.casePack === 'mixed' ? 'mixed' : ''}</td>`;
     const inWh = numOr(s.inWh), orders = numOr(s.orders);
@@ -2568,7 +2667,7 @@
     renderSellBanner();
     const rows = sx ? sellRows() : [];
     renderSellTiles(sx ? sellAgg(rows) : null, L);
-    $('sellTable').classList.toggle('pics', photoOn());
+    $('sellTable').classList.toggle('pics', picsCol());
     vtSell.set(rows, toTop);
     setInfo();
     renderDl();
@@ -3099,19 +3198,28 @@
     } finally { if (bm.close) bm.close(); }
   }
 
-  // On Available to sell: the photo at the start of a row; a blank box until it's in, a quiet mark when there's none.
+  // On Available to sell: the photo at the start of a row, the ERP report's picture first (from this browser's copy),
+  // else Quote Images'; a blank box until it's in (or until the report's pictures are known), a quiet mark when there's
+  // none.
   function photoHtml(r) {
-    const p = photos.get(photoKeyOf(r));
-    if (p && p.url) return `<img class="pic" src="${esc(p.url)}" alt="">`;
-    if (p && p.has === false) return '<span class="pic none" title="No photo in Quote Images">no photo</span>';
+    const e = erpOf(r.key);
+    if (e) return `<img class="pic" data-from="erp" src="${esc(erpUrl(e))}" alt="" title="${esc(`Picture from the ${picSet.reportDay != null ? fmtD(picSet.reportDay) + ' ' : ''}ATS report`)}">`;
+    // While the report's pictures are looked for, a Quote Images photo this visit has already stays; the others wait.
+    const p = photoOn() ? photos.get(photoKeyOf(r)) : null;
+    if (p && p.url) return `<img class="pic" data-from="quote" src="${esc(p.url)}" alt="">`;
+    if (picsDue) return '<span class="pic" aria-hidden="true"></span>';
+    const none = picSet ? `No picture: not in the ERP report's pictures${photoOn() ? ', not in Quote Images' : ''}` : 'No photo in Quote Images';
+    if (!photoOn()) return `<span class="pic none" title="${esc(none)}">no photo</span>`;
+    if (p && p.has === false) return `<span class="pic none" title="${esc(none)}">no photo</span>`;
     if (p && p.has === null) return `<span class="pic none" title="${esc(`The photo couldn't be read: ${p.why || 'not known why'}`)}">?</span>`;
     return '<span class="pic" aria-hidden="true"></span>';
   }
-  // The rows just drawn (its tab shown): their photos looked up, then the rows drawn again with them.
+  // The rows just drawn (its tab shown): the photos of those with no ERP picture looked up in Quote Images (once the
+  // report's pictures are known), then the rows drawn again with them.
   let photoViewBusy = false;
   function wantPhotos(rows) {
-    if (!photoOn() || tab !== 'sell' || scopeFatal || photoErr || photoViewBusy) return;
-    const keys = rows.map(photoKeyOf).filter(k => { const p = photos.get(k); return !!k && (!p || ((p.has === undefined || (p.has === true && !p.blob)) && !p.busy)); });
+    if (!photoOn() || tab !== 'sell' || scopeFatal || photoErr || photoViewBusy || picsDue) return;
+    const keys = rows.filter(r => !erpOf(r.key)).map(photoKeyOf).filter(k => { const p = photos.get(k); return !!k && (!p || ((p.has === undefined || (p.has === true && !p.blob)) && !p.busy)); });
     if (!keys.length) return;
     photoViewBusy = true;
     lookupPhotos(keys, { bytes: true, view: true })
@@ -3123,6 +3231,476 @@
   function photosRedraw() { if (vtSell && tab === 'sell') vtSell.redraw(); }
   // A token that allows other changes, met outside a load (by a photo lookup or the save): the page stops as a load would.
   function stopNow() { if (loading || !scopeFatal) return; stopAll(); cycleDone = true; schedule(); renderAll(); }
+
+  // ---------- the ERP report's pictures (Saul, Nov 2) ----------
+  // The ERP can save the weekly ATS report with a picture per style (~40 MB against ~160 KB without). Every report goes
+  // into the ATS folder; the numbers come from the newest (loadAts), the pictures from the newest report that HAS them,
+  // even one weeks older. After the main view is drawn, the reports are walked newest first: one under 2 MB has none; a
+  // big one this browser has read before is taken from its copy here (IndexedDB, by the file's id and eTag), with no
+  // download; else it is downloaded (its download link, as every file is) and read in the pictures worker
+  // (picturesWorker.js), at most 2 big downloads per load. Its picture per style, made small (160 px, JPEG), is used
+  // first on Available to sell and in the sales sheet; Quote Images only for the styles it doesn't cover. A picture is
+  // never taken from outside the report: the ERP's links to its picture server are never opened, kept or shown.
+  const PICS_DOWNLOADS = 2;
+  // A big report's download that takes longer than this is given up (said, amber), so the sales save never waits forever.
+  const PICS_DL_MS = 10 * 60 * 1000;
+  // The pictures in use: { key (id|eTag), itemId, eTag, fileName, reportDay, styles: Map(style key, as core/ats.js keys
+  // styles → { styleRaw, blob (JPEG), w, h, hash (of its bytes in the report), url (its object URL, made when drawn), file
+  // (its bytes for the sales sheet) }), counts, differs, cached (kept in this browser), redo (some pictures couldn't be
+  // drawn: the report is read once more on a later visit, in case that was passing), lost (pictures this browser's copy
+  // couldn't give back) }, or null.
+  let picSet = null;
+  // The ATS chip's pictures line: state '' (not looked for yet) · 'ok' (picSet in use) · 'none' (no report with pictures);
+  // busy (what: 'cache' | 'downloading' | 'opening' | 'reading' | 'scaling', n of m, report); unread (reports whose
+  // pictures couldn't be read: [{ name, day, why }]); skipped (big reports not downloaded: the limit); stop ('cancelled').
+  let pic = { state: '', busy: false, what: '', n: 0, m: 0, report: null, reading: '', unread: [], skipped: 0, stop: '' };
+  let picPend = null;    // the newest report's worker read, started by loadAts, for the pictures step to take over: { key, x, job }
+  let picCtl = null;     // the pictures step's Cancel
+  let picsDue = false;   // the pictures are being looked for: Quote Images wait (a style with an ERP picture is never asked there)
+  const picNone = new Set(), picBad = new Map();   // id|eTag of big reports with no pictures; of ones that couldn't be read this visit (→ why)
+  // The picture reader can't run in this browser this visit (its files didn't load, or there are no workers): why, and
+  // no big report is downloaded for its pictures again until the page is opened again.
+  let picNoReader = '';
+  const picKey = (id, eTag) => `${id}|${eTag}`;
+  const erpOf = key => (picSet && key ? picSet.styles.get(key) || null : null);
+  const erpOfRow = r => erpOf(window.InvCommon.normStyle(r.style));   // a sales sheet row (its style, as written)
+  // The same in a given set: a save takes the set in use when it starts and keeps to it, so a set coming in part-way
+  // (a later load's) never mixes into the file or its fingerprint; the next save has the new one.
+  const erpIn = (set, r) => (set ? set.styles.get(window.InvCommon.normStyle(r.style)) || null : null);
+  const erpUrl = e => e.url || (e.url = URL.createObjectURL(e.blob));
+  // The photo column on Available to sell: Quote Images set in config.js, or the ERP report's pictures in use.
+  const picsCol = () => photoOn() || !!(picSet && picSet.styles.size);
+  // This browser has a report's pictures already, or knows it has none (or that they can't be read): read for its numbers only.
+  const picKnown = (key, today) => (!!picSet && picSet.key === key) || (!!picCache && ((!!picCache.set && picCache.set.key === key && !picCache.set.redo) || picCache.none.has(key))) ||
+    picNone.has(key) || picBad.has(key) || !!picBadToday(key, today) || !!picNoReader || pic.reading === key;
+  const mdOf = d => (typeof d === 'number' ? window.InvCommon.fmtDay(d).replace(/\/\d{4}$/, '') : '');
+  const reportWords = x => (x && x.day != null ? `the ${mdOf(x.day)} report` : 'a report');
+
+  // ---- this browser's copy (IndexedDB): one database for the page, one store. Under 'set', the LATEST picture set only
+  // (a new one replaces it): { itemId, eTag, fileName, reportDay, savedAt, counts, differs, redo, styles: [[style key,
+  // styleRaw, Blob, width, height, hash]] }; under 'none:<id>|<eTag>', a big report found with no pictures; under
+  // 'bad:<id>|<eTag>', one whose pictures can't be read from the file ({ key, why, day }: not downloaded again that day);
+  // under 'numbers', the numbers' part of the newest report when it is a big one ({ itemId, eTag, fileName, slim: Blob,
+  // ~1.5 MB of its ~40 MB: its XML, read again for its numbers so it isn't downloaded on every visit). Never a link or a
+  // person's name. Every call is guarded: with IndexedDB missing, blocked or failing, the pictures are kept for the visit
+  // only and read again next time (nothing alarming is said).
+  const PIC_DB = 'shalam-tool', PIC_STORE = 'erpPictures';
+  // picCache: { set, none: Set(id|eTag), bad: Map(id|eTag → { why, day }), numbers: { key, slim (Blob) } or null }, as
+  // the cache holds them.
+  let picDbP = null, picCacheP = null, picCache = null;
+  function picDb() {
+    if (!picDbP) {
+      picDbP = new Promise(resolve => {
+        const t = setTimeout(() => resolve(null), 5000);   // a database that doesn't answer is no database
+        const done = db => { clearTimeout(t); resolve(db); };
+        try {
+          const rq = indexedDB.open(PIC_DB, 1);
+          rq.onupgradeneeded = () => { try { if (!rq.result.objectStoreNames.contains(PIC_STORE)) rq.result.createObjectStore(PIC_STORE); } catch (e) { console.error(e); } };
+          rq.onsuccess = () => { const db = rq.result; db.onversionchange = () => { try { db.close(); } catch (e) { /* closed */ } picDbP = null; }; done(db); };
+          rq.onerror = () => done(null);
+          rq.onblocked = () => done(null);
+        } catch (e) { done(null); }
+      });
+    }
+    return picDbP;
+  }
+  // One transaction: fn(store) makes its requests and answers the one whose result is wanted. Answers that result
+  // (readonly) or true (readwrite, once written), or undefined when anything failed.
+  async function picIdb(mode, fn) {
+    let db = null;
+    try { db = await picDb(); } catch (e) { db = null; }
+    if (!db) return undefined;
+    return new Promise(resolve => {
+      try {
+        const tx = db.transaction(PIC_STORE, mode);
+        let out;
+        const rq = fn(tx.objectStore(PIC_STORE));
+        if (rq) rq.onsuccess = () => { out = rq.result; };
+        tx.oncomplete = () => resolve(mode === 'readwrite' ? true : out);
+        tx.onerror = tx.onabort = () => { console.error(tx.error); resolve(undefined); };
+      } catch (e) { console.error(e); resolve(undefined); }
+    });
+  }
+  function picCacheLoad() {
+    if (!picCacheP) {
+      picCacheP = (async () => {
+        const rec = await picIdb('readonly', s => s.get('set'));
+        const keys = await picIdb('readonly', s => s.getAllKeys());
+        const bad = await picIdb('readonly', s => s.getAll(IDBKeyRange.bound('bad:', 'bad:￿')));
+        const num = await picIdb('readonly', s => s.get('numbers'));
+        picCache = { set: picFromStore(rec), none: new Set((Array.isArray(keys) ? keys : []).map(String).filter(k => k.startsWith('none:')).map(k => k.slice(5))),
+          bad: new Map((Array.isArray(bad) ? bad : []).filter(b => b && b.key && b.why).map(b => [String(b.key), { why: String(b.why), day: numOr(b.day) }])),
+          numbers: num && num.itemId && num.slim instanceof Blob && num.slim.size ? { key: picKey(num.itemId, num.eTag || ''), slim: num.slim } : null };
+        return picCache;
+      })().catch(e => { console.error(e); picCache = { set: null, none: new Set(), bad: new Map(), numbers: null }; return picCache; });
+    }
+    return picCacheP;
+  }
+  // A report whose pictures couldn't be read from the file, as this browser noted it today: why, or ''.
+  const picBadToday = (key, today) => { const b = picCache && picCache.bad.get(key); return b && b.day === today ? b.why : ''; };
+  // The cache's set as the page uses it (null when there's none, or it isn't whole).
+  function picFromStore(rec) {
+    try {
+      if (!rec || typeof rec !== 'object' || !rec.itemId || !Array.isArray(rec.styles)) return null;
+      const styles = new Map();
+      for (const x of rec.styles) {
+        if (!Array.isArray(x) || !x[0] || !(x[2] instanceof Blob) || !x[2].size || !x[5]) continue;
+        styles.set(String(x[0]), { styleRaw: String(x[1] || x[0]), blob: x[2], w: numOr(x[3]) || PHOTO_PX, h: numOr(x[4]) || PHOTO_PX, hash: String(x[5]), url: '', file: null });
+      }
+      if (!styles.size) return null;
+      return { key: picKey(rec.itemId, rec.eTag || ''), itemId: String(rec.itemId), eTag: String(rec.eTag || ''), fileName: String(rec.fileName || ''), reportDay: numOr(rec.reportDay),
+        styles, counts: rec.counts && typeof rec.counts === 'object' ? rec.counts : {}, differs: Array.isArray(rec.differs) ? rec.differs : [], cached: true, redo: !!rec.redo };
+    } catch (e) { console.error(e); return null; }
+  }
+  // Keeps a new set, replacing the one kept before (and any "can't be read" mark for its report). Answers whether it was kept.
+  async function picCacheSave(set) {
+    const rec = { itemId: set.itemId, eTag: set.eTag, fileName: set.fileName, reportDay: set.reportDay, savedAt: new Date().toISOString(), counts: set.counts,
+      differs: set.differs, redo: !!set.redo, styles: [...set.styles].map(([k, e]) => [k, e.styleRaw, e.blob, e.w, e.h, e.hash]) };
+    const kept = (await picIdb('readwrite', s => { s.delete('bad:' + set.key); return s.put(rec, 'set'); })) === true;
+    if (kept && picCache) { picCache.set = set; picCache.bad.delete(set.key); }
+    return kept;
+  }
+  // A big report with no pictures, so it isn't downloaded again.
+  async function picCacheNone(key) {
+    await picIdb('readwrite', s => s.put({ at: new Date().toISOString() }, 'none:' + key));
+    if (picCache) picCache.none.add(key);
+  }
+  // A big report whose pictures can't be read from the file itself: not downloaded again today in this browser (said
+  // from the mark meanwhile); tried again another day, in case the page has been improved since.
+  async function picCacheBad(key, why, today) {
+    await picIdb('readwrite', s => s.put({ key, why, day: today, at: new Date().toISOString() }, 'bad:' + key));
+    if (picCache) picCache.bad.set(key, { why, day: today });
+  }
+  // The numbers' part of the newest report (a big one), replacing the one kept before. Noted first, so tidying up never
+  // takes it for an old one.
+  async function picKeepNumbers(key, x, fileName, slim) {
+    if (!picCache || !(slim instanceof Uint8Array) || !slim.length) return;
+    const blob = new Blob([slim], { type: 'application/zip' });
+    picCache.numbers = { key, slim: blob };
+    await picIdb('readwrite', s => s.put({ itemId: x.id, eTag: x.eTag, fileName, slim: blob, savedAt: new Date().toISOString() }, 'numbers'));
+  }
+  // Marks for reports no longer in the folder go, and the numbers' part kept when the newest report is another one.
+  async function picCacheTidy(list) {
+    if (!picCache) return;
+    const ids = new Set(list.reports.map(x => x.id)), top = list.reports[0], gone = k => !ids.has(k.split('|')[0]);
+    const marks = [...[...picCache.none].filter(gone).map(k => 'none:' + k), ...[...picCache.bad.keys()].filter(gone).map(k => 'bad:' + k)];
+    const num = !!picCache.numbers && (!top || picCache.numbers.key !== picKey(top.id, top.eTag));
+    if (!marks.length && !num) return;
+    await picIdb('readwrite', s => { for (const m of marks) s.delete(m); if (num) s.delete('numbers'); });
+    for (const m of marks) { if (m.startsWith('none:')) picCache.none.delete(m.slice(5)); else picCache.bad.delete(m.slice(4)); }
+    if (num) picCache.numbers = null;
+  }
+  // A picture this browser kept that can't be read back (its copy lost its data): the style goes without it (Quote
+  // Images, if there), the copy is let go so the next visit reads the report again, and the ATS card says how many.
+  async function picLost(set, key) {
+    const e = set.styles.get(key);
+    if (!e) return;
+    if (e.url) URL.revokeObjectURL(e.url);
+    set.styles.delete(key);
+    set.lost = (set.lost || 0) + 1;
+    if (set.cached && picCache && picCache.set && picCache.set.key === set.key) {
+      set.cached = false; picCache.set = null;
+      await picIdb('readwrite', s => s.delete('set'));
+    }
+  }
+
+  // ---- one report read in the pictures worker: { numbers (a promise: { numbers, slim } once they're read, or { error,
+  // noReader, crashed, cancelled }), done (a promise: the worker's last answer), cancel(), step, n, m, onProgress(job) }.
+  // The worker is ended once it has answered, on cancel(), or when it stops answering for 90 s; nothing it sends after
+  // that is used, so a half-read report is never in use. One that stops before it has said anything never got going (its
+  // own file didn't load): noReader, as when its parts didn't load, since the report itself wasn't looked at; after
+  // that, crashed (it ran out of memory, or hung, on the report). null when this browser can't start a worker.
+  function workerRead(buf, fileName, today, o = {}) {
+    let w;
+    try { w = new Worker('picturesWorker.js'); } catch (e) { console.error(e); return null; }
+    let doneR, numR, dog = 0, heard = false;
+    const job = { step: 'opening', n: 0, m: 0, over: false, onProgress: null };
+    job.done = new Promise(r => { doneR = r; });
+    job.numbers = new Promise(r => { numR = r; });
+    const end = m => {
+      if (job.over) return;
+      job.over = true; clearTimeout(dog);
+      try { w.terminate(); } catch (e) { /* already gone */ }
+      numR({ numbers: m.numbers || null, slim: null, error: m.error || '', noReader: !!m.noReader, crashed: !!m.crashed, cancelled: !!m.cancelled });
+      doneR(m);
+    };
+    const stopped = why => end(heard ? { ok: false, crashed: true, error: `The picture reader stopped (${why}).` }
+      : { ok: false, noReader: true, error: `The picture reader didn't start (${why}). Reload the page; if it keeps happening, tell Saul.` });
+    const watch = () => { clearTimeout(dog); dog = setTimeout(() => stopped('no answer for 90 seconds'), 90000); };
+    w.onmessage = e => {
+      const m = e.data || {};
+      if (job.over) return;
+      heard = true;
+      watch();
+      if (m.type === 'progress') { job.step = m.step; job.n = m.done || 0; job.m = m.total || 0; if (job.onProgress) job.onProgress(job); }
+      else if (m.type === 'numbers') numR({ numbers: m.numbers || null, slim: m.slim instanceof Uint8Array && m.slim.length ? m.slim : null, error: '' });
+      else if (m.type === 'done') end(m);
+    };
+    w.onerror = e => { if (e && e.preventDefault) e.preventDefault(); stopped((e && e.message) || 'no reason given'); };
+    w.onmessageerror = () => end({ ok: false, crashed: true, error: "The picture reader's answer couldn't be read." });
+    job.cancel = () => end({ ok: false, cancelled: true, error: 'Cancelled.' });
+    watch();
+    try { w.postMessage({ type: 'read', bytes: buf, fileName, today, maxSide: PHOTO_PX, quality: 0.8, numbersOnly: !!o.numbersOnly }, [buf]); }
+    catch (e) { end({ ok: false, crashed: true, error: `The report couldn't be handed to the picture reader (${(e && e.message) || e}).` }); }
+    return job;
+  }
+
+  // ---- the walk, after each load that finished; once at a time (a load finishing while one runs has its own after).
+  let picRun = null, picAgain = null;
+  function picturesAfterLoad(today) {
+    if (picRun) { picAgain = today; return; }
+    picRun = picturesStep(today).catch(picFailed).finally(() => {
+      picRun = null;
+      if (picAgain != null && !scopeFatal) { const t = picAgain; picAgain = null; picturesAfterLoad(t); return; }
+      picAgain = null; picsDue = false;
+      // Everything that shows them, drawn again (the rows' Quote Images are asked for the styles left).
+      renderChips(); renderCards(); renderIssues();
+      if (vtSell) renderSell();
+    });
+  }
+  // The sales save and the Download button wait for the pictures (or their failure): the sheet's photos depend on them.
+  async function picturesSettled(signal) {
+    while (picRun) {
+      const p = picRun;
+      if (!signal) { await p; continue; }
+      await Promise.race([p, new Promise((res, rej) => { if (signal.aborted) rej(abortErr()); signal.addEventListener('abort', () => rej(abortErr()), { once: true }); })]);
+    }
+  }
+  function picFailed(e) {
+    console.error(e);
+    pic = { ...pic, busy: false, reading: '', state: picSet ? 'ok' : 'none', unread: [...pic.unread, { name: 'the ATS folder', day: null, why: `looking for the pictures failed (${describe(e).message})` }] };
+  }
+  // A load that didn't finish: the newest report's read in the worker isn't taken over by anything, so it ends.
+  function picDrop() {
+    if (picPend) { picPend.job.cancel(); picPend = null; }
+    if (!picRun) { picsDue = false; if (pic.busy) pic = { ...pic, busy: false }; }
+  }
+  // Cancel on the ATS chip: the download or the worker stops; the pictures in use stay as they are.
+  function picCancel() {
+    if (picCtl) picCtl.abort();
+    if (picPend) picPend.job.cancel();
+  }
+  // Progress on the ATS chip: the pictures line changed in place (so its Cancel isn't redrawn under the pointer every few
+  // pictures), else the chips drawn again. quiet: kept for the next drawing.
+  function picShow(x, quiet) {
+    pic = { ...pic, busy: true, ...x };
+    if (quiet) return;
+    const el = document.querySelector('#chip-ats small.pl'), l = picLine();
+    if (el && l && l.busy && document.querySelector('#chip-ats button[data-pics]')) el.textContent = l.text;
+    else renderChips();
+  }
+  async function picturesStep(today) {
+    const list = atsList, pend = picPend, BIG = window.InvErpPictures.BIG_REPORT;
+    picPend = null;
+    pic = { ...pic, busy: true, what: pend ? pend.job.step : 'cache', n: pend ? pend.job.n : 0, m: pend ? pend.job.m : 0, report: pend ? pend.x : null, unread: [], skipped: 0, stop: '' };
+    // The ATS folder wasn't listed this load: the pictures in use stay as they are.
+    if (!list) { if (pend) pend.job.cancel(); pic = { ...pic, busy: false }; return; }
+    const ctl = new AbortController(), signal = ctl.signal;
+    picCtl = ctl;
+    const unread = [], skipped = [], said = x => ({ name: x.name, day: x.day });
+    let found = null, used = false, downloads = atsBigLoads;
+    const UNDRAWN = 'none of its pictures could be drawn in this browser';
+    // One big report's pictures: { set } · { none } (it has none) · { skip } (the download limit) · { why, mark, tried }
+    // (not read: mark 'visit', not read again this visit; 'day', the file itself: not downloaded again today in this
+    // browser; tried, the report was read, so a copy kept with pictures that couldn't be drawn isn't read once more).
+    const readOne = async (x, key, kept) => {
+      const known = picBad.get(key) || picBadToday(key, today);
+      if (known) return { why: known };
+      if (picNoReader) return { why: picNoReader };
+      let job;
+      if (pend && pend.key === key) { job = pend.job; used = true; }
+      else {
+        if (downloads >= PICS_DOWNLOADS) return { skip: true };
+        downloads++;
+        picShow({ what: 'downloading', n: 0, m: 0, report: x });
+        let buf;
+        try {
+          const meta = await gj(`/drives/${list.driveId}/items/${x.id}`, { signal });   // with its download link
+          buf = await download(meta, timed(signal, PICS_DL_MS));
+        } catch (e) {
+          if (signal.aborted) throw abortErr();
+          if (cycleError(e)) throw e;
+          console.error(e);
+          return { why: e && e.name === 'TimeoutError' ? `it took more than ${PICS_DL_MS / 60000} minutes to download, so it was given up` : `it couldn't be downloaded (${describe(e).message})` };
+        }
+        job = workerRead(buf, x.name, today);
+        if (!job) { picNoReader = "this browser can't read a report's pictures in the background"; return { why: picNoReader }; }
+      }
+      pic.reading = key;
+      job.onProgress = j => picShow({ what: j.step, n: j.n, m: j.m, report: x });
+      picShow({ what: job.step, n: job.n, m: job.m, report: x });
+      const stop = () => job.cancel();
+      signal.addEventListener('abort', stop, { once: true });
+      let a;
+      try { a = await job.done; } finally { signal.removeEventListener('abort', stop); pic.reading = ''; }
+      if (signal.aborted || a.cancelled) throw abortErr();
+      if (!a.ok) {
+        const why = a.error || 'not known why';
+        // The reader can't run (nothing about the file): no other report is downloaded for it this visit. It stopped on
+        // the report (out of memory, no answer): not again this visit. The file itself: not again today.
+        if (a.noReader) { picNoReader = why; return { why }; }
+        return a.crashed ? { why, mark: 'visit' } : { why, mark: 'day', tried: true };
+      }
+      const k = a.counts || {};
+      if (!Array.isArray(a.pictures) || !a.pictures.length) {
+        // It has pictures, but this browser couldn't draw any (perhaps passing): said, and read again next visit.
+        if (k.undrawn) return { why: UNDRAWN, mark: 'visit', tried: true };
+        // It has pictures, but none could be had from the file: said, and not downloaded again today.
+        const lost = [[k.damaged, 'damaged'], [k.missing, 'missing from the file'], [k.tooBig, 'far bigger than an ERP picture']].filter(([n]) => n > 0);
+        if (lost.length) return { why: `none of its pictures could be read (${lost.map(([n, w]) => `${fmtN(n)} ${w}`).join(', ')})`, mark: 'day', tried: true };
+        return { none: true };
+      }
+      const set = await picSetOf(x, a, signal);
+      if (!set.styles.size) return { why: UNDRAWN, mark: 'visit', tried: true };
+      // Some couldn't be drawn: kept, and read once more on a later visit (not again after that).
+      set.redo = !kept && (set.counts.undrawn || 0) > 0;
+      set.cached = await picCacheSave(set);
+      return { set };
+    };
+    try {
+      const cache = await picCacheLoad();
+      await picCacheTidy(list);
+      for (const x of list.reports) {
+        if (x.size == null || x.size < BIG) continue;   // a report without pictures is ~160 KB
+        const key = picKey(x.id, x.eTag);
+        if (picSet && picSet.key === key) { found = picSet; break; }
+        const kept = cache.set && cache.set.key === key ? cache.set : null;
+        if (kept && !kept.redo) { found = kept; break; }
+        if (picNone.has(key) || cache.none.has(key)) continue;
+        const r = await readOne(x, key, kept);
+        if (r.set) { found = r.set; break; }
+        if (r.none) { picNone.add(key); await picCacheNone(key); continue; }
+        // The copy kept stays in use when the report couldn't be read once more (and once it was read, isn't again).
+        if (kept) {
+          if (r.tried) { kept.redo = false; kept.cached = await picCacheSave(kept); }
+          found = kept;
+          break;
+        }
+        if (r.skip) { skipped.push(x); continue; }
+        if (r.mark) picBad.set(key, r.why);
+        if (r.mark === 'day') await picCacheBad(key, r.why, today);
+        // The reader can't run this visit: said once; reports this browser has a copy of are still used.
+        if (r.why === picNoReader && unread.some(u => u.why === picNoReader)) continue;
+        unread.push({ ...said(x), why: r.why });
+      }
+    } catch (e) {
+      if (pend && !used) pend.job.cancel();
+      if (isAbort(e)) { pic = { ...pic, busy: false, reading: '', stop: 'cancelled', unread, skipped: skipped.length }; return; }
+      if (e && e.stop) { pic = { ...pic, busy: false, reading: '' }; stopNow(); return; }
+      throw e;
+    } finally { if (picCtl === ctl) picCtl = null; }
+    if (pend && !used) pend.job.cancel();
+    picUse(found);
+    pic = { state: found ? 'ok' : 'none', busy: false, what: '', n: 0, m: 0, report: null, reading: '', unread, skipped: skipped.length, stop: '' };
+  }
+  // The worker's answer as a set: each picture's Blob (made small here, a few at a time, when this browser can't draw in
+  // a worker) and the worker's hash of its bytes in the report (the sales sheet's fingerprint: the same in any browser,
+  // where the small copy's bytes can differ between browsers, so two people's pages never take turns saving the sheet).
+  async function picSetOf(x, a, signal) {
+    const styles = new Map(), list = a.pictures, counts = { ...(a.counts || {}) };
+    for (let i = 0; i < list.length; i++) {
+      const [k, raw, b, w, h, hash] = list[i];
+      let blob = b, pw = w, ph = h;
+      if (!a.scaled) {
+        if (signal.aborted) throw abortErr();
+        try { const s = await smallPhoto(b); blob = new Blob([s.data], { type: 'image/jpeg' }); pw = s.width; ph = s.height; }
+        catch (e) { counts.undrawn = (counts.undrawn || 0) + 1; continue; }   // the browser can't draw it: left out
+        if (i % 25 === 24) { picShow({ what: 'scaling', n: i + 1, m: list.length, report: x }); await yieldUi(); }
+      }
+      if (!k || !(blob instanceof Blob) || !blob.size) continue;
+      styles.set(String(k), { styleRaw: String(raw || k), blob, w: numOr(pw) || PHOTO_PX, h: numOr(ph) || PHOTO_PX, hash: typeof hash === 'string' ? hash : '', orig: b, url: '', file: null });
+    }
+    // A worker that gave no hash (never, today): the report's own picture is hashed here.
+    await each([...styles.values()].filter(e => !e.hash), 8, async e => { e.hash = await blobHash(e.orig); });
+    for (const e of styles.values()) delete e.orig;
+    if (signal.aborted) throw abortErr();
+    counts.pictures = styles.size;
+    return { key: picKey(x.id, x.eTag), itemId: x.id, eTag: x.eTag, fileName: x.name, reportDay: x.day, styles, counts,
+      differs: (a.differs || []).map(d => ({ style: String(d.style || ''), styleRaw: String(d.styleRaw || d.style || ''), rows: (d.rows || []).filter(Number.isFinite) })), cached: false };
+  }
+  // A picture's bytes, hashed as the worker hashes them: SHA-256 (hex), or, where the browser has no SubtleCrypto, FNV-1a
+  // with the size.
+  async function blobHash(blob) {
+    const b = await blob.arrayBuffer();
+    if (window.crypto && crypto.subtle) return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', b)), x => x.toString(16).padStart(2, '0')).join('');
+    const u = new Uint8Array(b);
+    let h = 0x811c9dc5;
+    for (let i = 0; i < u.length; i++) { h ^= u[i]; h = Math.imul(h, 0x01000193); }
+    return `${(h >>> 0).toString(16)}-${u.length}`;
+  }
+  // A new set in use: the old one's object URLs are let go (the rows draw new ones).
+  function picUse(set) {
+    if (picSet === set) return;
+    if (picSet) for (const e of picSet.styles.values()) if (e.url) { URL.revokeObjectURL(e.url); e.url = ''; }
+    picSet = set;
+  }
+
+  // ---- what the page says about them
+  // The ATS chip's pictures line: { text, busy (Cancel shown), amber, tip }, or null before they're looked for.
+  function picLine() {
+    if (pic.busy) {
+      const r = reportWords(pic.report);
+      const text = pic.what === 'downloading' ? `downloading ${r} for its pictures…`
+        : pic.what === 'reading' && pic.m ? `reading pictures… ${fmtN(pic.n)} of ${fmtN(pic.m)}`
+          : pic.what === 'scaling' && pic.m ? `making pictures small… ${fmtN(pic.n)} of ${fmtN(pic.m)}`
+            : pic.what === 'cache' ? 'looking for pictures…' : 'reading pictures…';
+      return { text, busy: true, amber: false, tip: `Pictures: ${text} (${pic.report ? pic.report.name : 'the ATS folder'}). Cancel stops it; the photos stay as they are.` };
+    }
+    const bad = pic.unread.length ? `${reportWords(pic.unread[0])}'s pictures couldn't be read${pic.unread.length > 1 ? ` (and ${fmtN(pic.unread.length - 1)} more)` : ''}` : '';
+    const tipBad = pic.unread.map(u => `${u.name}: its pictures couldn't be read (${u.why}).`);
+    const tipSkip = pic.skipped ? [`${plural(pic.skipped, 'more big report')} not looked in this time (at most 2 are downloaded per load).`] : [];
+    const quote = photoOn() ? ': photos from Quote Images' : '';
+    if (pic.stop) {
+      return { text: `pictures not read (cancelled)${picSet ? `: still ${reportWords({ day: picSet.reportDay })}'s` : quote}`, busy: false, amber: false,
+        tip: ['Pictures: reading them was cancelled. The next load reads them again; until then the sales sheet isn\'t saved by itself (Save anyway on its status saves it).', ...tipBad].join('\n') };
+    }
+    if (picSet) {
+      return { text: `pictures from ${reportWords({ day: picSet.reportDay })} (${fmtN(picSet.styles.size)})${bad ? ` · ${bad}` : ''}`, busy: false, amber: !!bad,
+        tip: [`Pictures: from ${picSet.fileName}${picSet.reportDay != null ? ` (report date ${fmtD(picSet.reportDay)})` : ''}, ${plural(picSet.styles.size, 'style')}; Quote Images for the styles it doesn't cover.`,
+          picSet.cached ? 'Kept in this browser, so the report isn\'t downloaded again.' : '',
+          picSet.lost ? `${plural(picSet.lost, 'picture')} couldn't be read back from this browser's copy: Quote Images for ${picSet.lost === 1 ? 'that style' : 'those styles'}, and the report is read again next visit.` : '',
+          ...tipBad, ...tipSkip].filter(Boolean).join('\n') };
+    }
+    if (!pic.state) return null;
+    return bad ? { text: `${bad}${quote}`, busy: false, amber: true, tip: ['Pictures: none in use.', ...tipBad, ...tipSkip].join('\n') }
+      : { text: `no report with pictures${quote}`, busy: false, amber: false,
+        tip: [`Pictures: no report in the ATS folder has them${photoOn() ? ', so every photo comes from Quote Images' : ''}. Save the report from the ERP with its pictures now and then to update them.`, ...tipSkip].join('\n') };
+  }
+  // The ATS card's rows about the pictures.
+  function picCardRows() {
+    if (!pic.state && !picSet && !pic.busy && !pic.stop) return [];
+    const rows = [{ h: 'Pictures (Available to sell and the sales sheet)' }];
+    if (picSet) {
+      const k = picSet.counts || {};
+      rows.push(['From', `${picSet.fileName}${picSet.reportDay != null ? ` (${fmtD(picSet.reportDay)})` : ''}`], ['Styles with a picture', picSet.styles.size],
+        ['Linked outside the file (skipped, never opened)', k.external || 0], ["Kinds the browser can't draw (skipped)", (k.unsupported || 0) + (k.undrawn || 0)],
+        ['On rows with no style (skipped)', k.noStyleRow || 0], ["Styles with different pictures on their rows (the first used)", k.differs || 0],
+        ['Kept in this browser', picSet.cached ? 'yes: not downloaded again' : 'no: read again next visit']);
+      if (picSet.lost) rows.push(["Pictures this browser's copy couldn't give back (Quote Images used; the report is read again next visit)", picSet.lost]);
+    } else rows.push(['From', pic.busy ? 'being read' : pic.stop ? 'not read (cancelled)' : 'no report with pictures']);
+    for (const u of pic.unread) rows.push([`${u.name}: pictures not read`, u.why]);
+    if (pic.skipped) rows.push(['Big reports not looked in this time', pic.skipped]);
+    return rows;
+  }
+  // Problems lines (under "Sales sheet"): a report whose pictures couldn't be read, styles whose rows have different
+  // pictures, big reports not looked in. Amber matters, never red: the numbers aren't affected.
+  function picIssues() {
+    const out = [];
+    for (const u of pic.unread) {
+      const instead = picSet ? `The pictures of ${reportWords({ day: picSet.reportDay })} are used instead${photoOn() ? ', Quote Images for the styles they don\'t cover' : ''}.`
+        : photoOn() ? 'Photos come from Quote Images until a report with pictures can be read.' : 'No style has a picture until a report with pictures can be read.';
+      out.push({ code: 'erp-pictures-unread', message: `The pictures in ${u.name}${u.day != null ? ` (the ATS report of ${fmtD(u.day)})` : ''} couldn't be read: ${String(u.why).replace(/\.?$/, '.')} ${instead} The numbers aren't affected.` });
+    }
+    const d = picSet ? picSet.differs : [];
+    if (d.length) {
+      out.push({ code: 'erp-pictures-differ', message: `${plural(d.length, 'style')} ${d.length === 1 ? 'has' : 'have'} different pictures on ${d.length === 1 ? 'its' : 'their'} rows in ${reportWords({ day: picSet.reportDay })} (the first by row is used): ` +
+        `${d.slice(0, 40).map(x => `${x.styleRaw || x.style} (rows ${(x.rows || []).join(', ')})`).join(', ')}${d.length > 40 ? `, and ${fmtN(d.length - 40)} more` : ''}.` });
+    }
+    if (pic.skipped) {
+      out.push({ code: 'erp-pictures-skipped', message: `${plural(pic.skipped, 'more report')} of 2 MB or more in the ATS folder ${pic.skipped === 1 ? "wasn't" : "weren't"} looked in for pictures this time: at most 2 big reports are downloaded per load. The next load looks further.` });
+    }
+    return out;
+  }
 
   // ---------- the sales sheet (core/salesSheet.js): saved into Shalam Sales tool, and the Download button ----------
   // What a salesperson may see of Available to sell, one Excel file with a photo per style (Saul, Nov 2). After a clean
@@ -3163,25 +3741,28 @@
     }
     return sheetMemo.sheet;
   }
-  // On Problems, under "Sales sheet": one line for the styles on it with no photo (once all of them were looked up), one
-  // for photos that couldn't be read, and saving's own failure.
+  // On Problems, under "Sales sheet": one line for the styles on it with no picture anywhere (once all of them were
+  // looked up), one for photos that couldn't be read, the ERP report's pictures (a report whose pictures couldn't be
+  // read, styles with different pictures on their rows, reports not looked in), and saving's own failure.
   let photosChecked = null;   // the sheet whose photos were all looked up in this load cycle
   function salesIssues() {
     const out = [], sheet = salesSheetNow();
     const add = (code, message) => out.push(normIssue(SALES.name, { code, message }));
     const names = list => `${list.slice(0, 40).map(r => r.style).join(', ')}${list.length > 40 ? `, and ${fmtN(list.length - 40)} more` : ''}`;
-    if (photoOn() && sheet.ok) {
-      if (photoErr) add('photo-error', `The photos couldn't be read from Quote Images, so the sales sheet isn't saved with them: ${photoErr}`);
-      else if (photosChecked === sheet) {
-        const none = sheet.rows.filter(r => (photos.get(r.photoKey) || {}).has === false);
-        const bad = sheet.rows.filter(r => { const p = photos.get(r.photoKey); return !!p && (p.has === null || p.bad); });
-        if (none.length) add('no-photo', `${plural(none.length, 'style')} on the sales sheet ${none.length === 1 ? 'has' : 'have'} no photo in Quote Images: ${names(none)}.`);
+    if ((photoOn() || picSet) && sheet.ok && !picsDue) {
+      if (photoOn() && photoErr) add('photo-error', `The photos couldn't be read from Quote Images, so the sales sheet isn't saved with them: ${photoErr}`);
+      else if (!photoOn() || photosChecked === sheet) {
+        const none = sheet.rows.filter(r => !erpOfRow(r) && (!photoOn() || (photos.get(r.photoKey) || {}).has === false));
+        const bad = photoOn() ? sheet.rows.filter(r => { const p = !erpOfRow(r) && photos.get(r.photoKey); return !!p && (p.has === null || p.bad); }) : [];
+        const where = photoOn() ? "not in the ERP report's pictures, not in Quote Images" : "not in the ERP report's pictures; photos in config.js is blank, so Quote Images isn't looked in";
+        if (none.length) add('no-photo', `${plural(none.length, 'style')} on the sales sheet ${none.length === 1 ? 'has' : 'have'} no picture (${where}): ${names(none)}.`);
         if (bad.length) {
           const why = [...new Set(bad.map(r => photos.get(r.photoKey).why || "the picture wouldn't open"))].slice(0, 3).join('; ');
           add('photo-error', `${plural(bad.length, 'style')} on the sales sheet ${bad.length === 1 ? 'has a photo' : 'have photos'} in Quote Images that couldn't be read (${why}), so the sheet goes without: ${names(bad)}.`);
         }
       }
     }
+    out.push(...picIssues().map(i => normIssue(SALES.name, i)));
     if (sales.state === 'err') add('not-saved', sales.message);
     return out;
   }
@@ -3225,18 +3806,33 @@
         : null;
     if (off) setSales(off);
     try {
+      // The ERP report's pictures first (read after the load, behind the main view): the sheet's photos depend on them.
+      if (sheet.ok && picRun) {
+        if (!off) setSales({ state: 'load', label: 'checking…', short: "the ATS report's pictures", busy: true }, 'chip');
+        await picturesSettled(signal);
+      }
+      // The pictures this save keeps to, from here to the end (see erpIn).
+      const pics = picSet;
+      // Then Quote Images, only for the styles with no ERP picture.
       if (sheet.ok && photoOn()) {
         if (!off) setSales({ state: 'load', label: 'checking…', short: 'its photos', busy: true }, 'chip');
         try {
-          await lookupPhotos(sheet.rows.map(r => r.photoKey), { fresh: true, signal });
+          await lookupPhotos(sheet.rows.filter(r => !erpIn(pics, r)).map(r => r.photoKey), { fresh: true, signal });
           photosChecked = sheet;
         } catch (e) { if (cycleError(e)) throw e; photoFailed(e); }
         finally { photosRedraw(); }
-        renderIssues();
       }
+      renderIssues();
       if (off) return;
       if (!sheet.ok) { setSales({ state: 'warn', label: 'not saved', short: sheet.reason, message: `Not saved: ${sheet.reason} ${keep}` }); return; }
       if (dirty && !force) { setSales({ state: 'warn', label: 'not saved', short: dirty, message: `Not saved: ${dirty}. ${keep}`, can: 'anyway' }); return; }
+      // Reading the report's pictures was cancelled: which photos the sheet has isn't known, so the file keeps its own.
+      // Save anyway saves it with the pictures as they are (Quote Images for any style the ERP report's didn't cover).
+      if (pic.stop && !force) {
+        const why = "reading the ATS report's pictures was cancelled";
+        setSales({ state: 'warn', label: 'not saved', short: why, message: `Not saved: ${why}, so the sheet's photos aren't known. ${keep}`, can: 'anyway' });
+        return;
+      }
       // The photo store couldn't be read (moved, renamed, or photos in config.js wrong): not saved, so the file keeps its
       // photos. Red and emailed as a red source is, since saving stops until it's fixed; said, not red, when the account
       // just can't open it (401/403). Save anyway saves the sheet without photos.
@@ -3246,7 +3842,7 @@
         salesRed({ short: why, message: `Not saved: ${why}. ${keep}`, can: 'anyway', mailProblem: "photos can't be read", why: 'photos' });
         return;
       }
-      await saveSheet(sheet, signal);
+      await saveSheet(sheet, signal, pics);
     } catch (e) { salesFailed(e, keep); }
     finally { if (salesCtl === ctl) salesCtl = null; }
   }
@@ -3254,13 +3850,20 @@
   // This browser's mark of its last save, or of the last file it found already up to date: the file's eTag, and the
   // fingerprint of what it holds.
   const salesMark = () => { try { const j = JSON.parse(store.get('sales') || 'null'); return j && typeof j === 'object' ? j : null; } catch (e) { return null; } };
-  // A fingerprint of what the file holds: its dates, rows and schedule, and which styles have a photo (with its size, so
-  // a replaced photo is saved again). It is written into the file too (its keywords), so whoever looks at the file
-  // later can tell what it holds.
-  const salesKeys = sheet => (photoOn() && !photoErr ? sheet.rows.map(r => r.photoKey) : []);
-  async function sheetPrint(sheet, keys) {
-    const pics = keys.filter(k => (photos.get(k) || {}).has === true).map(k => [k, photos.get(k).size ?? null]);
-    const text = JSON.stringify({ asOf: sheet.asOf, reportDay: sheet.reportDay, rows: sheet.rows, byDate: sheet.byDate, photos: pics });
+  // A fingerprint of what the file holds: its dates, rows and schedule, the ERP report its pictures come from (its id and
+  // eTag), and each style's picture by where it comes from: the ERP report's (a hash of its bytes in the report: the same
+  // in every browser) or Quote Images' (its size there, so a replaced photo is saved again). A new picture report, or a style's
+  // picture changing, saves the file again. It is written into the file too (its keywords), so whoever looks at the file
+  // later can tell what it holds. pics: the ERP report's pictures the save keeps to (see erpIn).
+  const salesPics = (sheet, pics) => sheet.rows.map(r => {
+    const e = erpIn(pics, r);
+    if (e) return ['erp', e.hash];
+    const p = photoOn() && !photoErr ? photos.get(r.photoKey) : null;
+    return p && p.has === true ? ['quote', p.size ?? null] : null;
+  });
+  async function sheetPrint(sheet, pics) {
+    const text = JSON.stringify({ asOf: sheet.asOf, reportDay: sheet.reportDay, rows: sheet.rows, byDate: sheet.byDate,
+      pictures: pics ? `${pics.itemId}|${pics.eTag}` : '', photos: salesPics(sheet, pics) });
     return window.crypto && crypto.subtle ? sha256Hex(text) : hash(text);
   }
   // The file in the library, with its download link (used at once, never kept), or null when it isn't there yet.
@@ -3278,7 +3881,7 @@
       return { fp: String(props.Keywords || '').trim(), pics };
     } catch (e) { if (cycleError(e)) throw e; console.error(e); return { fp: '', pics: 0 }; }
   }
-  async function saveSheet(sheet, signal) {
+  async function saveSheet(sheet, signal, pics) {
     const file = salesFileName(), where = `${String(CFG.salesLibrary).trim()}|${file}`;
     // busy: Cancel on the chip, until the file in the library is replaced.
     const say = (label, short, busy = true) => setSales({ state: 'load', label, short, busy }, 'chip');
@@ -3288,7 +3891,7 @@
     // Nothing changed: the file in the library already holds this sheet (the same data and photos), whoever saved it.
     // The file this browser saved (or found up to date) last is known by its eTag; any other, saved from another browser
     // or changed by SharePoint since, is read once for the fingerprint written in it.
-    const fp = await sheetPrint(sheet, salesKeys(sheet)), meta = await salesFileMeta(drive, signal);
+    const fp = await sheetPrint(sheet, pics), meta = await salesFileMeta(drive, signal);
     if (meta && meta.eTag) {
       const kept = salesMark(), mine = !!kept && kept.where === where && kept.eTag === meta.eTag;
       let holds = mine ? { fp: kept.fp, pics: kept.pics || 0 } : null;
@@ -3301,7 +3904,7 @@
       }
     }
     say('saving…', 'making the file');
-    const made = await buildSalesFile(sheet, signal, msg => say('saving…', msg));
+    const made = await buildSalesFile(sheet, signal, msg => say('saving…', msg), pics);
     const bad = salesFileWrong(made.bytes, sheet);
     if (bad) throw problem("can't make the file", `The sales sheet wasn't saved: ${bad}.`);
     // Into the library, replacing the file: in parts through an upload session, with no sign-in token on its address.
@@ -3344,8 +3947,10 @@
     store.set('sales', JSON.stringify({ where, eTag: saved.eTag, fp: made.print, at: saved.lastModifiedDateTime || '', pics: made.photos }));
     const mb = `${(total / 1048576).toFixed(1)} MB`;
     setSales({ ...savedFields(saved), state: 'ok', label: `saved ${fmtSaved(saved.lastModifiedDateTime)}`, short: `${plural(sheet.rows.length, 'style')}, ${plural(made.photos, 'photo')}`,
-      styles: sheet.rows.length, pics: made.photos, message: `Saved ${fmtLong(saved.lastModifiedDateTime)}: ${plural(sheet.rows.length, 'style')}, ${plural(made.photos, 'photo')}, ${mb}.` });
+      styles: sheet.rows.length, pics: made.photos, message: `Saved ${fmtLong(saved.lastModifiedDateTime)}: ${plural(sheet.rows.length, 'style')}, ${plural(made.photos, 'photo')}${erpWords(made, pics)}, ${mb}.` });
   }
+  // How many of the file's photos are the ERP report's pictures, in words (the rest are Quote Images').
+  const erpWords = (made, pics) => (made.erp && pics ? ` (${fmtN(made.erp)} from the ${fmtD(pics.reportDay)} ATS report's pictures)` : '');
   // An empty or half-built file is never uploaded (and one read back after the upload must be whole): a sensible size,
   // and it opens with both tabs and every style, in order. Answers what's wrong with it ('' when nothing is).
   function salesFileWrong(bytes, sheet) {
@@ -3364,34 +3969,49 @@
     if (at >= 0) return `its row ${fmtN(at + 3)} holds ${styleAt(at) || 'no style'}, not ${sheet.rows[at].style}`;
     return '';
   }
-  // The file: the photos (downloaded where need be, made small), the workbook (ExcelJS, loaded the first time) with the
-  // fingerprint of what it holds, its bytes. A photo store that can't be read leaves the photos out (Problems says why).
-  // say(text): where it's got to.
-  async function buildSalesFile(sheet, signal, say) {
+  // The file: each style's photo (the ERP report's picture, already small; else Quote Images', downloaded where need be
+  // and made small), the workbook (ExcelJS, loaded the first time) with the fingerprint of what it holds, its bytes. A
+  // photo store that can't be read leaves its photos out (Problems says why). say(text): where it's got to. set: the ERP
+  // report's pictures the save keeps to (see erpIn); one this browser's copy can't give back is let go (picLost), so the
+  // style takes Quote Images' photo, and the fingerprint (worked out after) says what the file really holds.
+  async function buildSalesFile(sheet, signal, say, set) {
     const SS = window.InvSalesSheet;
     say('loading the Excel library');
     const ExcelJS = await loadExcelJS();
-    const pics = new Map();
+    const pics = sheet.rows.map(() => null);   // in the rows' order: a style's own picture, whatever its photo key
+    let erpN = 0, lost = 0;
+    for (let i = 0; i < sheet.rows.length; i++) {
+      const e = erpIn(set, sheet.rows[i]);
+      if (!e) continue;
+      if (!e.file) {
+        try { e.file = { data: new Uint8Array(await e.blob.arrayBuffer()), width: e.w, height: e.h, extension: 'jpeg' }; }
+        catch (x) { console.error(x); await picLost(set, window.InvCommon.normStyle(sheet.rows[i].style)); lost++; continue; }
+      }
+      pics[i] = e.file; erpN++;
+      if (erpN % 200 === 0) { if (signal && signal.aborted) throw abortErr(); say(`pictures ${fmtN(erpN)}`); await yieldUi(); }
+    }
+    if (lost) { renderChips(); renderCards(); if (vtSell) renderSell(); }
     if (photoOn()) {
-      const keys = sheet.rows.map(r => r.photoKey);
+      const rest = sheet.rows.map((r, i) => i).filter(i => !pics[i]);
+      const keys = rest.map(i => sheet.rows[i].photoKey);
       try { await lookupPhotos(keys, { bytes: true, signal, progress: (n, m) => say(`photos ${fmtN(n)} of ${fmtN(m)}`) }); }
       catch (e) { if (cycleError(e)) throw e; photoFailed(e); }
       finally { photosRedraw(); }
-      const have = keys.filter(k => { const p = photos.get(k); return !!p && p.has === true && !!p.blob; });
-      for (let i = 0; i < have.length; i++) {
+      const have = rest.filter(i => { const p = photos.get(sheet.rows[i].photoKey); return !!p && p.has === true && !!p.blob; });
+      for (let j = 0; j < have.length; j++) {
         if (signal && signal.aborted) throw abortErr();
-        const p = photos.get(have[i]);
+        const p = photos.get(sheet.rows[have[j]].photoKey);
         if (!p.small && !p.bad) { try { p.small = await smallPhoto(p.blob); } catch (e) { console.error(e); p.bad = true; p.why = "the picture wouldn't open"; } }
-        if (p.small) pics.set(have[i], p.small);
-        if (i % 25 === 24) { say(`fitting photos ${fmtN(i + 1)} of ${fmtN(have.length)}`); await yieldUi(); }
+        if (p.small) pics[have[j]] = p.small;
+        if (j % 25 === 24) { say(`fitting photos ${fmtN(j + 1)} of ${fmtN(have.length)}`); await yieldUi(); }
       }
     }
     if (signal && signal.aborted) throw abortErr();
     say('writing the file'); await yieldUi();
-    const print = await sheetPrint(sheet, salesKeys(sheet));
+    const print = await sheetPrint(sheet, set);
     const bytes = await SS.workbookBytes(SS.buildWorkbook(ExcelJS, sheet, pics, { print }));
     if (signal && signal.aborted) throw abortErr();
-    return { bytes, photos: pics.size, print };
+    return { bytes, photos: pics.filter(Boolean).length, erp: erpN, print };
   }
   // Saving failed. Cancel, a sign-in to renew, or no right to save (401/403, or the library not even visible to the
   // account): said, not red. Anything else: red, on Problems, and the error email as for a red source.
@@ -3435,7 +4055,9 @@
     dl = { ctl, msg: 'starting' };
     renderDl();
     try {
-      const made = await buildSalesFile(sheet, ctl.signal, msg => { if (dl) { dl.msg = msg; renderDl(); } });
+      // The ATS report's pictures first, when they're still being read (the file's photos depend on them).
+      if (picRun) { dl.msg = "waiting for the ATS report's pictures"; renderDl(); await picturesSettled(ctl.signal); }
+      const made = await buildSalesFile(sheet, ctl.signal, msg => { if (dl) { dl.msg = msg; renderDl(); } }, picSet);
       const url = URL.createObjectURL(new Blob([made.bytes], { type: XLSX_TYPE }));
       const a = document.createElement('a');
       a.href = url; a.download = salesFileName() || 'Available to sell.xlsx';
@@ -3583,7 +4205,10 @@
     $('btnCancelBusy').onclick = $('btnCancelLoad').onclick = () => { if (loading) loading.abort(); };
     $('banners').addEventListener('click', e => { if (e.target.closest('[data-act="signin"]')) reSignIn(); });
     // The sales sheet: Cancel while it saves, Save anyway / Save now when it didn't; the Download button and its Cancel.
+    // The ATS chip: Cancel while the report's pictures are read.
     $('chips').addEventListener('click', e => {
+      const p = e.target.closest('button[data-pics]');
+      if (p) { e.preventDefault(); picCancel(); return; }
       const b = e.target.closest('button[data-sales]');
       if (!b) return;
       e.preventDefault();
@@ -3626,7 +4251,7 @@
     startBg();
     const parts = [['InvCommon', 'core/common.js'], ['PoBookCore', 'core/pobook.js'], ['InvUpc', 'core/upc.js'], ['InvCT', 'core/ct.js'],
       ['InvShipping', 'core/shipping.js'], ['InvStages', 'core/stages.js'], ['InvAts', 'core/ats.js'], ['InvSell', 'core/sell.js'],
-      ['InvSalesSheet', 'core/salesSheet.js'], ['XLSX', 'vendor/xlsx-js-style/xlsx.bundle.js']];
+      ['InvSalesSheet', 'core/salesSheet.js'], ['InvErpPictures', 'core/erpPictures.js'], ['XLSX', 'vendor/xlsx-js-style/xlsx.bundle.js']];
     const missing = parts.filter(([name]) => !window[name]).map(p => p[1]);
     if (missing.length) { showSignin(`Part of the page didn't load (${missing.join(', ')}). Reload the page; if it keeps happening, tell Saul.`, true); return; }
     initAuth();

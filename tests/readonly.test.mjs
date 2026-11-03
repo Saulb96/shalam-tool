@@ -9,7 +9,7 @@ import { root } from './load.mjs';
 
 const text = p => readFileSync(root(p), 'utf8');
 const app = text('app.js');
-const pageFiles = ['app.js', 'index.html', 'config.js', ...readdirSync(root('core')).filter(f => f.endsWith('.js')).map(f => 'core/' + f)];
+const pageFiles = ['app.js', 'index.html', 'config.js', 'picturesWorker.js', ...readdirSync(root('core')).filter(f => f.endsWith('.js')).map(f => 'core/' + f)];
 const GRAPH = 'https://graph.microsoft.com/v1.0';
 // A piece of app.js, from `from` up to (not including) the next `to` after it.
 function slice(from, to) {
@@ -33,8 +33,28 @@ test('every request leaves through g() or fetchRetry(), and both check it with t
     assert.doesNotMatch(text(f), /XMLHttpRequest|sendBeacon|<form\b|:\/content\b/, `${f} has another way to write`);
     if (f !== 'app.js') assert.doesNotMatch(text(f), /\bPUT\b|conflictBehavior/, `${f} names a write`);
   }
-  // Only app.js talks to the network; the parsers and the sales sheet never do.
-  for (const f of pageFiles.filter(x => x.startsWith('core/'))) assert.doesNotMatch(text(f), /\bfetch\s*\(/, f);
+  // Only app.js talks to the network; the parsers, the sales sheet and the pictures worker never do.
+  for (const f of pageFiles.filter(x => x.startsWith('core/') || x === 'picturesWorker.js')) assert.doesNotMatch(text(f), /\bfetch\s*\(/, f);
+});
+
+test('the pictures worker loads only the page\'s own files and makes no network request', () => {
+  const w = text('picturesWorker.js');
+  // No way out of it: no fetch, XMLHttpRequest, WebSocket, EventSource or beacon, no module or worker loaded, no address.
+  assert.doesNotMatch(w, /\bfetch\s*\(|XMLHttpRequest|WebSocket|EventSource|sendBeacon|\bimport\s*\(|\bimport\s|Worker\s*\(|https?:|wss?:|\/\/\S/);
+  // One importScripts, of the page's own files by their place in the repo (never a URL, never worked out at run time).
+  const calls = [...w.matchAll(/\bimportScripts\s*\(([^)]*)\)/g)];
+  assert.equal(calls.length, 1, 'one importScripts');
+  assert.equal((w.match(/importScripts/g) || []).length, 1, 'importScripts named once');
+  assert.match(calls[0][1], /^\s*'[^'\\]*'(\s*,\s*'[^'\\]*')*\s*$/, 'only plain file names');
+  const files = [...calls[0][1].matchAll(/'([^']*)'/g)].map(m => m[1]);
+  assert.deepEqual(files, ['vendor/xlsx-js-style/xlsx.bundle.js', 'core/common.js', 'core/ats.js', 'core/erpPictures.js']);
+  // None of them makes a request either (the spreadsheet library included: it only reads and writes bytes).
+  for (const f of files) {
+    assert.doesNotMatch(f, /:|\/\/|^\/|\.\./, f);
+    assert.doesNotMatch(text(f), /\bfetch\s*\(|XMLHttpRequest|WebSocket|EventSource|sendBeacon|importScripts\s*\(/, f);
+  }
+  // It answers only the page that started it: postMessage on its own scope, never on another window.
+  for (const m of w.matchAll(/postMessage\(/g)) assert.doesNotMatch(w.slice(Math.max(0, m.index - 12), m.index), /\.\s*$/, 'postMessage on something else');
 });
 
 test('the methods the page names: the email, the sales sheet\'s upload session, batches of reads, and PUTs to the upload address', () => {

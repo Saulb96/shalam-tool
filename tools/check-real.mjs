@@ -24,6 +24,11 @@
 // case pack, its sums against Available to sell, and that no factory, customer, PO, container, section or ERP warehouse
 // name is a value in it. --sales-out <file.xlsx>: also writes it, without photos, to that file (never inside this repo:
 // the real numbers stay out of it).
+// The report's pictures (core/erpPictures.js, as the page's pictures worker reads a report of 2 MB or more): from
+// --pictures <ERP report.xlsx>, else from the --ats report. Its counts (pictures, linked outside the file, kinds the
+// browser can't draw, on rows with no style, differing on a style's rows), the read time against the whole-file read,
+// whether its numbers are exactly the whole-file read's (a failure if not), and how many styles on the sales sheet have
+// an ERP picture. Counts only: never a style code or a link.
 // --no-reports: the stages without the forwarder and drayage reports, as the page shows them when both are missing;
 // --no-forwarder / --no-drayage: without that one report only (as when it is too old, or fails to read).
 // The Container Tracking section lists come from config.js (run with a stand-in window), as the page passes them;
@@ -33,16 +38,17 @@
 // printed, never a failure.
 import { readFileSync, writeFileSync, existsSync, statSync, realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { join, resolve, basename, dirname, relative, isAbsolute, sep } from 'node:path';
 import { loadXLSX, loadExcelJS, core, root } from '../tests/load.mjs';
 
 const XOPT = { type: 'array', cellFormula: false, cellHTML: false, cellStyles: false };   // as app.js reads files
 const FILES = { msl: 'Master Sheet Live.xlsx', tracker: 'PO Status Tracker.xlsx', ct: 'Container Tracking Sheet.xlsx',
   forwarder: 'Forwarder.xlsx', drayage: 'Drayage.csv' };
-const USAGE = 'Usage: node tools/check-real.mjs <folder> [po-book index.html] [--lists <lists.json>] [--ats <ERP report.xlsx>] [--sales-out <file.xlsx>] [--today yyyy-mm-dd] [--no-reports | --no-forwarder | --no-drayage] [--no-sections]';
+const USAGE = 'Usage: node tools/check-real.mjs <folder> [po-book index.html] [--lists <lists.json>] [--ats <ERP report.xlsx>] [--pictures <ERP report.xlsx>] [--sales-out <file.xlsx>] [--today yyyy-mm-dd] [--no-reports | --no-forwarder | --no-drayage] [--no-sections]';
 
 // Options take their value after "=" or as the next argument (--ats <file>); the rest are the two paths.
-const VALUED = ['today', 'lists', 'ats', 'sales-out'], FLAGS = ['no-reports', 'no-forwarder', 'no-drayage', 'no-sections', 'help'];
+const VALUED = ['today', 'lists', 'ats', 'pictures', 'sales-out'], FLAGS = ['no-reports', 'no-forwarder', 'no-drayage', 'no-sections', 'help'];
 const opt = {}, pos = [];
 for (let i = 2, a = process.argv; i < a.length; i++) {
   if (!a[i].startsWith('--')) { pos.push(a[i]); continue; }
@@ -68,6 +74,7 @@ const today = opt.today ? C.dayFromIso(opt.today) : C.todayNY(Date.now());
 if (today == null) { console.log(`--today ${opt.today} isn't a yyyy-mm-dd date.`); process.exit(2); }
 const listsPath = opt.lists ? resolve(opt.lists) : existsSync(join(folder, 'lists.json')) ? join(folder, 'lists.json') : null;
 const atsPath = opt.ats ? resolve(opt.ats) : null;
+const picturesPath = opt.pictures ? resolve(opt.pictures) : atsPath;
 // The sample sales sheet holds real numbers: never written inside this repo (it is public). The real folders are
 // compared, not the paths as typed, so a short (8.3) name, a junction, a link or a mapped drive into the repo is
 // refused too; the folder it goes in must already be there.
@@ -430,6 +437,7 @@ if (R) {
 
 // ---------------- the ATS report, read as the page reads it (core/ats.js)
 let atsR = null, atsDayUsed = null;   // the report, and its day (file name, else saved) as the page takes it
+let atsWhole = null;                  // its parse from the whole file, ok or not, and the time it took
 let sellWithAts = null;               // Available to sell with the report, for the sales sheet
 if (atsPath) {
   head(`ATS report (core/ats.js, ${basename(atsPath)})`);
@@ -440,7 +448,8 @@ if (atsPath) {
       const buf = readFileSync(atsPath);
       const wb = readBook(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
       const r = ATS.parseAts(XLSX, wb, basename(atsPath), today);
-      console.log(`  sheet "${r.sheet || '(none)'}" of ${wb.SheetNames.length}; read in ${secs(t0)}`);
+      atsWhole = { r, took: secs(t0) };
+      console.log(`  sheet "${r.sheet || '(none)'}" of ${wb.SheetNames.length}; read in ${atsWhole.took}`);
       if (r.headerRow) console.log(`  header row ${r.headerRow}: ${headerLine(C.sheetRows(XLSX, wb.Sheets[r.sheet])[r.headerRow - 1])}`);
       // Its date: from the file name, else the day the file was saved, as on the page (amber after 8 days, an email after 10).
       const saved = C.todayNY(statSync(atsPath).mtimeMs), day = r.reportDay ?? saved, age = today - day;
@@ -463,6 +472,49 @@ if (atsPath) {
       if (!r.ok) fails(r.error || "the ATS report couldn't be read");
       else { console.log('  result: ok'); atsR = r; }
     } catch (e) { fails(`can't read it: ${e.message}`); }
+  }
+}
+
+// ---------------- the report's pictures (core/erpPictures.js), read as the page's pictures worker reads a big report
+let erpPics = null;   // its pictures, when the page would take them (a report of 2 MB or more), for the sales sheet
+if (picturesPath) {
+  const EP = core('erpPictures');
+  head(`The report's pictures (core/erpPictures.js, ${basename(picturesPath)})`);
+  if (!existsSync(picturesPath)) fails(`${picturesPath} isn't there`);
+  else {
+    try {
+      const buf = readFileSync(picturesPath), bytes = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+      const big = bytes.length >= EP.BIG_REPORT;
+      const t0 = performance.now();
+      const r = await EP.readPictures({ XLSX, InvAts: ATS, bytes, fileName: basename(picturesPath), today });
+      const took = secs(t0);
+      // The whole-file read to compare with: the ATS report's above, or this file's here.
+      let whole = picturesPath === atsPath ? atsWhole : null;
+      if (!whole) { const t1 = performance.now(); const w = ATS.parseAts(XLSX, readBook(bytes), basename(picturesPath), today); whole = { r: w, took: secs(t1) }; }
+      console.log(`  ${n(bytes.length)} bytes: ${big ? 'a big report (2 MB or more): the page reads it in its pictures worker' : 'under 2 MB: the page reads it as before and takes no pictures from it'} · read here in ${took} (the whole file: ${whole.took})`);
+      if (!r.ok) fails(`its pictures can't be read: ${r.error}`);
+      else {
+        const k = r.counts, kinds = {};
+        for (const p of r.pictures.values()) kinds[p.ext] = (kinds[p.ext] || 0) + 1;
+        console.log(`  pictures ${n(k.pictures)} (styles with one) · drawing anchors ${n(k.anchors)} · linked outside the file ${n(k.external)} (skipped, never opened) · kinds the browser can't draw ${n(k.unsupported)} · on rows with no style ${n(k.noStyleRow)}`);
+        console.log(`  styles whose rows have different pictures ${n(k.differs)} (the first by row kept) · anchored to no row ${n(k.absolute)} · not a picture ${n(k.notPicture)} · missing ${n(k.missing)} · damaged ${n(k.damaged)} · far too big ${n(k.tooBig)}`);
+        console.log(`  kinds: ${Object.entries(kinds).map(([e, c]) => `${e} ${n(c)}`).join(' · ') || 'none'} · ${n(k.bytesIn)} bytes of pictures`);
+        if (big) erpPics = r;
+      }
+      const same = r.numbers != null && whole.r != null && isDeepStrictEqual(r.numbers, whole.r);
+      console.log(`  its numbers are exactly the whole-file read's (every style, count and issue): ${same ? 'yes' : 'NO'}`);
+      if (!same) fails('the numbers read with the pictures differ from the whole-file read');
+      // The numbers' part the page keeps in the browser for the newest report, so it isn't downloaded on every visit:
+      // read again as the page reads it, the same numbers; none of its parts names a person or is a picture.
+      if (r.slim) {
+        const names = EP.zipEntries(r.slim).map(e => e.name), plain = !names.some(x => /^docProps\/|drawings\/|media\//.test(x));
+        const again = await EP.readPictures({ XLSX, InvAts: ATS, bytes: r.slim, fileName: basename(picturesPath), today, numbersOnly: true });
+        const same2 = again.ok && whole.r != null && isDeepStrictEqual(again.numbers, whole.r);
+        console.log(`  the numbers' part on its own (the page keeps it for a big report): ${n(r.slim.length)} bytes (${(r.slim.length / bytes.length * 100).toFixed(1)}% of the file), ${n(names.length)} parts, no file properties, drawing or picture among them: ${plain ? 'yes' : 'NO'} · read again, its numbers are the whole-file read's: ${same2 ? 'yes' : 'NO'}`);
+        if (!plain) fails("the numbers' part the page keeps holds the file's properties, a drawing or a picture");
+        if (!same2) fails("the numbers read again from the part the page keeps differ from the whole-file read");
+      } else if (r.numbers) console.log("  the numbers' part isn't kept by the page (an address is left in it, or the file isn't an .xlsx): the page downloads the report for its numbers on every visit");
+    } catch (e) { fails(`can't read its pictures: ${e.message}`); }
   }
 }
 
@@ -526,6 +578,11 @@ async function salesReport(S, R) {
   const odd = rows.filter(r => Object.keys(r).join() !== KEYS).length + sheet.byDate.filter(r => Object.keys(r).join() !== 'style,desc,when,estimate,where,units,cases').length;
   console.log(`  every row holds only the sheet's fields: ${odd ? 'NO' : 'yes'}`);
   if (odd) fails(`${n(odd)} rows of the sales sheet hold other fields`);
+  // Photos: the ERP report's picture first (the style's key, as its numbers match), Quote Images for the rest.
+  if (erpPics) {
+    const have = rows.filter(r => erpPics.pictures.has(C.normStyle(r.style))).length;
+    console.log(`  styles on the sheet with a picture in the ERP report: ${n(have)} of ${n(rows.length)} (the other ${n(rows.length - have)} look in Quote Images)`);
+  } else console.log('  no ERP report with pictures here: every photo would come from Quote Images');
   // No name that stays inside is a whole value in it (factories, customers, POs, containers, sections, the ERP's warehouses).
   const inside = new Map();
   const put = (kind, v) => { const t = C.S(v).toLowerCase(); if (t.length > 1 && !inside.has(t)) inside.set(t, kind); };
