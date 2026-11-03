@@ -1373,8 +1373,9 @@ const PICS = { cfg: { photos: PHOTO_LOC }, photos: k => SELL_PICS[k] || null };
 // Names, numbers and words in the invented files that must never be in the sales sheet (factory, customer, PO,
 // container, round, section, person, file, place, the ERP's warehouses, brand, and what Available to sell says inside).
 const MARKS_SELL = ['Factory S', 'Customer', 'Brand S', 'Test Saver', 'Test User', 'test.user', 'example', 'Saul', 'GGGU1111111', 'FFFU5555555', 'EEEU3333333',
-  'Round 3', 'Planning A', 'Hidden Rows', 'China Pickup', 'Cosmetics', 'Master Sheet', 'PO Status', 'Container Tracking', 'Inventory Report', 'sharepoint', 'contoso',
+  'Round 3', 'Planning A', 'Hidden Rows', 'China Pickup', 'Master Sheet', 'PO Status', 'Container Tracking', 'Inventory Report', 'sharepoint', 'contoso',
   'Photo Store', 'oversold', 'Oversold', 'In WH', 'warehouse', '>LA<', '>NJ<', 'Sold', 'flag'];
+// Category (Cosmetics on the invented lines) is on the sheet: a tab per category (Saul, Nov 3).
 const MARKS_PO = Array.from({ length: 13 }, (_, i) => String(900500 + i));
 // An Excel file the page made, opened here as Excel would read it (ExcelJS) and as a zip: its tabs, rows, pictures,
 // and any marker found in its text (every XML part; the PO numbers in the cell text and values).
@@ -1393,10 +1394,14 @@ async function openSheet(bytes, marks) {
   const coreXml = (xml.find(([p]) => p === 'docProps/core.xml') || [])[1] || '';
   // Each picture's style row (0 for the first) and its shape: the ERP report's invented pictures are 3 wide by 1 high.
   const imgs = ws ? ws.getImages().map(x => ({ i: x.range.tl.nativeRow - 2, ratio: x.range.ext && x.range.ext.height ? x.range.ext.width / x.range.ext.height : 0 })) : [];
-  return { tabs: wb.worksheets.map(x => x.name), rows: ws ? ws.rowCount : 0, dateRows: wd ? wd.rowCount : 0, images: ws ? ws.getImages().length : 0, imgs,
+  return { tabs: wb.worksheets.map(x => x.name), tabRows: wb.worksheets.map(x => x.rowCount), rows: ws ? ws.rowCount : 0, dateRows: wd ? wd.rowCount : 0, images: ws ? ws.getImages().length : 0, imgs,
     media: [...parts.keys()].filter(p => /^xl\/media\//.test(p)).length, styles, found, creator: (/<dc:creator>([^<]*)</.exec(coreXml) || [])[1] || '',
     keywords: (/<cp:keywords>([^<]*)</.exec(coreXml) || [])[1] || '', title: ws ? String(ws.getCell('A1').value) : '', sub: ws ? String(ws.getCell('D1').value) : '' };
 }
+// The tabs the file should have, and their rows (title and header rows, then a row per style; By date: header, then
+// the schedule): Available to sell, one per category, By date.
+const tabsFor = want => [SS.TABS.sell, ...SS.categoryTabs(want.rows).map(t => t.name), SS.TABS.byDate];
+const tabRowsFor = want => [want.rows.length + 2, ...SS.categoryTabs(want.rows).map(t => t.rows.length + 2), want.byDate.length + 1];
 // How many styles the sales sheet holds, from the selling engine's answer.
 const want0 = (S, today) => (S && S.ok ? SS.salesRows(S, { today }).rows.length : 0);
 // The sheet's rows as the page should make them: the selling engine here, then core/salesSheet.js.
@@ -1418,9 +1423,9 @@ async function savedChecks(c, t, w, want, o = {}) {
   c('the whole file arrived (bytes received = the size in the Content-Range)', !!f && ranges.length > 0 && f.sent.length === +ranges[0][3], f ? `${f.sent.length} bytes` : 'no file');
   const got = f ? await openSheet(f.sent, MARKS_SELL) : null;
   if (got) {
-    c(`the saved file opens: tabs "${SS.TABS.sell}" and "${SS.TABS.byDate}", the title, ${want.rows.length} style rows, ${want.byDate.length} schedule rows`,
-      got.tabs.join('|') === `${SS.TABS.sell}|${SS.TABS.byDate}` && got.title === SS.TITLE && got.rows === want.rows.length + 2 && got.dateRows === want.byDate.length + 1 &&
-      got.styles.join() === want.rows.map(r => r.style).join(), JSON.stringify({ tabs: got.tabs, title: got.title, rows: got.rows, dateRows: got.dateRows }));
+    c(`the saved file opens: tabs ${tabsFor(want).map(x => `"${x}"`).join(', ')}, the title, ${want.rows.length} style rows, ${want.byDate.length} schedule rows`,
+      JSON.stringify(got.tabs) === JSON.stringify(tabsFor(want)) && got.tabRows.join() === tabRowsFor(want).join() && got.title === SS.TITLE && got.rows === want.rows.length + 2 && got.dateRows === want.byDate.length + 1 &&
+      got.styles.join() === want.rows.map(r => r.style).join(), JSON.stringify({ tabs: got.tabs, tabRows: got.tabRows, title: got.title, rows: got.rows, dateRows: got.dateRows }));
     c(`it has the photos: ${fmtN(o.pics)} pictures, one per style with a photo`, got.images === o.pics && got.media === o.pics, `${got.images} images, ${got.media} media files`);
     c('none of the names, numbers or words that stay inside are in any part of it; made by "Shalam Tool", never a person', !got.found.length && got.creator === 'Shalam Tool', got.found.slice(0, 8).join('; ') || got.creator);
   }
@@ -3104,9 +3109,9 @@ const SCENARIOS = [
       p = await sa(t);
       const bytes = Buffer.from(await t.eval('window.__headless.savedFile(0)'), 'base64');
       const got = await openSheet(bytes, MARKS_SELL);
-      c(`the downloaded ${SALES_FILE} opens: both tabs, ${want.rows.length} style rows, ${want.byDate.length} schedule rows`, p.saved[0].name === SALES_FILE &&
-        got.tabs.join('|') === `${SS.TABS.sell}|${SS.TABS.byDate}` && got.rows === want.rows.length + 2 && got.dateRows === want.byDate.length + 1 && got.styles.join() === want.rows.map(r => r.style).join(),
-        JSON.stringify({ name: p.saved[0].name, tabs: got.tabs, rows: got.rows, dateRows: got.dateRows }));
+      c(`the downloaded ${SALES_FILE} opens: tabs ${tabsFor(want).join(', ')}, ${want.rows.length} style rows, ${want.byDate.length} schedule rows`, p.saved[0].name === SALES_FILE &&
+        JSON.stringify(got.tabs) === JSON.stringify(tabsFor(want)) && got.tabRows.join() === tabRowsFor(want).join() && got.rows === want.rows.length + 2 && got.dateRows === want.byDate.length + 1 && got.styles.join() === want.rows.map(r => r.style).join(),
+        JSON.stringify({ name: p.saved[0].name, tabs: got.tabs, tabRows: got.tabRows, rows: got.rows, dateRows: got.dateRows }));
       c(`it has ${pics} pictures`, got.images === pics && got.media === pics, `${got.images} images, ${got.media} media`);
       c('none of the names, numbers or words that stay inside are in it', !got.found.length && got.creator === 'Shalam Tool', got.found.slice(0, 8).join('; ') || got.creator);
       c('the toast says what it holds; the button is back', p.toast === `Sales sheet downloaded: ${want.rows.length} styles, ${pics} photos.` && !p.dl.disabled && !p.dl.cancel && !p.dl.msg, JSON.stringify({ toast: p.toast, dl: p.dl }));

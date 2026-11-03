@@ -1,15 +1,17 @@
 // The sales sheet (Saul, Nov 2): what a salesperson may see of Available to sell, for the Excel file saved into the one
-// library they can open. It holds only what's listed here, per style: style, UPCs, description, case pack, units and
-// full cases available now, from China, arriving and in total, the first dates, a photo; and a schedule by date. Never
+// library they can open. It holds only what's listed here, per style: style, UPCs, description, category and sub
+// category (Saul, Nov 3: a tab per category; the ATS report's, else UPC_MASTER's, the pair from one place), case pack, units and full cases available now, from China, arriving and
+// in total, the first dates, a photo; and a schedule by date. Never
 // a factory, customer, PO, PO type, section, container, round, person, file name, SharePoint link, ERP warehouse, In
 // WH, customer orders, sold, oversold, flag or problem: every field is copied by name (an allow-list), never by
 // spreading an object of Available to sell.
 // - salesRows(sell, { today }): the rows and the schedule from InvSell.buildSell's result; none (ok false, with the
 //   reason in plain words) when "Available now" would be wrong: no usable ATS report, Available to sell not worked out,
 //   or its units don't add up.
-// - buildWorkbook(ExcelJS, sheet, photos, { print }): the Excel file (ExcelJS 4.4.0, vendor/exceljs), two tabs:
-//   Available to sell (a photo per style, fitted in its cell the way Quote Tracker does it) and By date; the page's
-//   fingerprint of it in its keywords.
+// - buildWorkbook(ExcelJS, sheet, photos, { print }): the Excel file (ExcelJS 4.4.0, vendor/exceljs): Available to
+//   sell (every style, a photo per style fitted in its cell the way Quote Tracker does it), then a tab per category
+//   (categoryTabs: A to Z, named as the ERP has them, never joined), then By date; the page's fingerprint of it in its
+//   keywords. Each picture is stored once in the file, however many tabs show it.
 // Pure: no network, no DOM; today (a day number) is passed in. Loads in the page (window.InvSalesSheet, after
 // core/common.js) and in Node (module.exports).
 (function (root, factory) {
@@ -35,6 +37,8 @@
   // "X-F" to "X").
   const photoKey = s => String(s ?? '').toUpperCase().replace(/[^A-Z0-9_-]/g, '');
   const byStyle = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+  // Categories and sub categories A to Z (Cosmetics1 before Cosmetics2, case aside), a blank one last.
+  const byName = (a, b) => (!a) - (!b) || a.localeCompare(b, 'en', { sensitivity: 'base', numeric: true }) || byStyle(a, b);
   // A schedule row's date: now first, then by day, no date last.
   const whenRank = w => (w === 'now' ? -Infinity : isDay(w) ? w : Infinity);
 
@@ -74,11 +78,16 @@
     if (why) return { ok: false, reason: why, asOf: today, reportDay, rows: [], byDate: [], counts };
 
     const rows = [], byDate = [];
-    for (const s of sell.styles.slice().sort((a, b) => byStyle(a.style, b.style))) {
+    // A style's category and sub category: the ATS report's (Saul, Nov 3), else the page's (UPC_MASTER, then Master
+    // Sheet Live); both from the same place, never one from each. By category, sub category, then style: each
+    // category's tab and the By date tab keep the same order.
+    const catOf = s => (S(s.atsCategory) ? [S(s.atsCategory), S(s.atsSub)] : [S(s.category), S(s.sub)]);
+    const order = (a, b) => { const x = catOf(a), y = catOf(b); return byName(x[0], y[0]) || byName(x[1], y[1]) || byStyle(a.style, b.style); };
+    for (const s of sell.styles.slice().sort(order)) {
       const now = units(s.now), fromChina = units(s.fromChina), arriving = units(s.arriving);
       const total = now + fromChina + arriving;
       if (!(total > 0)) { counts.leftOff++; continue; }
-      const style = S(s.styleRaw || s.style), desc = S(s.desc);
+      const style = S(s.styleRaw || s.style), desc = S(s.desc), [category, sub] = catOf(s);
       const casePack = isDay(s.casePack) && s.casePack > 0 ? s.casePack : s.casePack === 'mixed' ? 'mixed' : null;
       const pack = typeof casePack === 'number' ? casePack : null;
       // A column's cases: core/sell.js's own count, when the style's case pack is one number and every unit in the
@@ -115,12 +124,12 @@
       const sched = [...groups.values()].sort((a, b) => whenRank(a.when) - whenRank(b.when) || WHERE.indexOf(a.where) - WHERE.indexOf(b.where));
       for (const g of sched) {
         const one = g.masters.size === 1 && [...g.masters][0] != null;
-        byDate.push({ style, desc, when: g.when, estimate: g.estimate, where: g.where, units: g.units, cases: one ? g.cases : null });
+        byDate.push({ style, desc, category, when: g.when, estimate: g.estimate, where: g.where, units: g.units, cases: one ? g.cases : null });
       }
 
       const totalCases = cases('total');
       rows.push({
-        style, upc: (Array.isArray(s.upcs) ? s.upcs : []).map(S).filter(Boolean).join(', '), desc, casePack,
+        style, upc: (Array.isArray(s.upcs) ? s.upcs : []).map(S).filter(Boolean).join(', '), desc, category, sub, casePack,
         now, nowCases: cases('now'), fromChina, fromChinaCases: cases('fromChina'),
         firstFromChina: first ? { date: first.date, now: first.now, estimate: first.estimate } : { date: null, now: false, estimate: false },
         arriving, arrivingCases: cases('arriving'), firstArrival,
@@ -140,6 +149,8 @@
     { h: 'Style', w: 16, k: 'style' },
     { h: 'UPC', w: 16, k: 'upc', wrap: true },
     { h: 'Description', w: 34, k: 'desc', wrap: true },
+    { h: 'Category', w: 14, k: 'category', wrap: true },
+    { h: 'Sub category', w: 16, k: 'sub', wrap: true },
     { h: 'Case pack', w: 9, k: 'casePack', n: true },
     { h: 'Available now (units)', w: 11, k: 'now', n: true },
     { h: 'Available now (cases)', w: 11, k: 'nowCases', n: true },
@@ -153,7 +164,7 @@
     { h: 'Total available (cases)', w: 12, k: 'totalCases', n: true },
   ];
   const DATE_COLS = [
-    { h: 'Style', w: 16 }, { h: 'Description', w: 34 }, { h: 'Available from', w: 16 }, { h: 'Where', w: 12 },
+    { h: 'Style', w: 16 }, { h: 'Description', w: 34 }, { h: 'Category', w: 14 }, { h: 'Available from', w: 16 }, { h: 'Where', w: 12 },
     { h: 'Units', w: 11 }, { h: 'Cases', w: 11 },
   ];
   const NUM = '#,##0', DATE = 'm/d/yyyy';
@@ -182,6 +193,30 @@
   const photoOf = (photos, key, n) => (!photos ? null : Array.isArray(photos) ? photos[n] || null : !key ? null : photos instanceof Map ? photos.get(key)
     : Object.prototype.hasOwnProperty.call(photos, key) ? photos[key] : null);
 
+  // The category tabs, A to Z with no category last: { name (the tab's name), category (as the ERP has it; '' for
+  // none), rows (their places in sheet.rows, in its order) }. A name is the category with what Excel won't take in a
+  // tab's name ([ ] : * ? / \) made a space, at most 31 characters, never "History" (Excel keeps that one) and never
+  // the same as another tab's (case aside: a second one gets " (2)"). Categories are never joined: Cosmetics1 and
+  // cosmetics1 are two tabs.
+  const NO_CAT = 'No category';
+  function categoryTabs(rows) {
+    const groups = new Map();
+    (rows || []).forEach((r, n) => {
+      const c = S(r && r.category);
+      (groups.get(c) || groups.set(c, []).get(c)).push(n);
+    });
+    const used = new Set(Object.values(TABS).map(t => t.toLowerCase()));
+    return [...groups.keys()].sort(byName).map(category => {
+      let base = category.replace(/[[\]:*?/\\]/g, ' ').replace(/\s+/g, ' ').trim().replace(/^'+|'+$/g, '').trim() || NO_CAT;
+      if (base.toLowerCase() === 'history') base += ' (category)';
+      base = base.slice(0, 31).trim();
+      let name = base;
+      for (let k = 2; used.has(name.toLowerCase()); k++) { const tag = ` (${k})`; name = base.slice(0, 31 - tag.length).trim() + tag; }
+      used.add(name.toLowerCase());
+      return { name, category, rows: groups.get(category) };
+    });
+  }
+
   // ExcelJS: the library (window.ExcelJS, or require('vendor/exceljs/exceljs.min.js') in Node). sheet: salesRows's
   // answer (ok, with rows). photos: a Map (or object) of photoKey -> { data (the image's bytes: ArrayBuffer or
   // Uint8Array), width, height (pixels), extension ('jpeg' when not given) }, or a list of those in the rows' order (null
@@ -199,49 +234,62 @@
     wb.creator = 'Shalam Tool'; wb.lastModifiedBy = 'Shalam Tool';
     if (print) wb.keywords = print;
 
-    // 1. Available to sell: the title row, the header row, a row per style.
-    const ws = wb.addWorksheet(TABS.sell);
-    ws.columns = COLS.map(c => ({ width: c.w }));
-    const title = ws.getRow(1);
-    title.getCell(1).value = TITLE; title.getCell(1).font = { ...FONT, size: 14, bold: true };
-    title.getCell(4).value = `as of ${fmt(sheet.asOf)} · stock from the ERP report of ${isDay(sheet.reportDay) ? fmt(sheet.reportDay) : '(date not known)'}`;
-    title.getCell(4).font = { ...FONT, color: { argb: 'FF55606E' } };
-    title.height = 24;
-    const head = ws.getRow(2);
-    COLS.forEach((c, i) => {
-      const cell = head.getCell(i + 1);
-      cell.value = c.h; cell.font = { ...FONT, bold: true }; cell.fill = HEAD_FILL; cell.border = BOX;
-      cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
-    });
-    head.height = 45;
+    // A tab of styles: the title row, the header row, a row per style (rowIdx: their places in sheet.rows). Each
+    // picture goes into the file once (ids), however many tabs show it.
     const withPhotos = !!photos && (Array.isArray(photos) ? photos.some(Boolean) : photos instanceof Map ? photos.size > 0 : Object.keys(photos).length > 0);
     const picCol = COLS.findIndex(c => c.photo);
-    sheet.rows.forEach((r, n) => {
-      const row = ws.getRow(n + 3);
+    const ids = new Map();
+    const imageOf = n => {
+      if (ids.has(n)) return ids.get(n);
+      const p = photoOf(photos, sheet.rows[n].photoKey, n);
+      const img = !p || !p.data ? null : { id: wb.addImage({ buffer: p.data, extension: p.extension || 'jpeg' }),
+        d: isDay(p.width) && p.width > 0 && isDay(p.height) && p.height > 0 ? { w: p.width, h: p.height } : { w: 160, h: 160 } };
+      ids.set(n, img);
+      return img;
+    };
+    const styleTab = (name, heading, rowIdx) => {
+      const ws = wb.addWorksheet(name);
+      ws.columns = COLS.map(c => ({ width: c.w }));
+      const title = ws.getRow(1);
+      title.getCell(1).value = heading; title.getCell(1).font = { ...FONT, size: 14, bold: true };
+      title.getCell(4).value = `as of ${fmt(sheet.asOf)} · stock from the ERP report of ${isDay(sheet.reportDay) ? fmt(sheet.reportDay) : '(date not known)'}`;
+      title.getCell(4).font = { ...FONT, color: { argb: 'FF55606E' } };
+      title.height = 24;
+      const head = ws.getRow(2);
       COLS.forEach((c, i) => {
-        const cell = row.getCell(i + 1);
-        cell.font = FONT; cell.border = BOX;
-        cell.alignment = { vertical: 'middle', wrapText: !!c.wrap, ...(c.n ? { horizontal: 'right' } : c.first || c.date ? { horizontal: 'center' } : {}) };
-        if (c.photo) return;
-        if (c.first) { const f = r.firstFromChina || {}; cell.value = whenCell(f.now ? 'now' : f.date, f.estimate, r.fromChina > 0); }
-        else if (c.date) cell.value = whenCell(r[c.k], false, r.arriving > 0);
-        else if (c.n) cell.value = c.k === 'casePack' && r.casePack === 'mixed' ? 'mixed' : blankIfNone(r[c.k]);
-        else cell.value = S(r[c.k]) || null;
-        if (c.n) cell.numFmt = NUM;
-        if ((c.first || c.date) && cell.value instanceof Date) cell.numFmt = DATE;
+        const cell = head.getCell(i + 1);
+        cell.value = c.h; cell.font = { ...FONT, bold: true }; cell.fill = HEAD_FILL; cell.border = BOX;
+        cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
       });
-      if (withPhotos) row.height = PHOTO_ROW_PT;
-      const p = photoOf(photos, r.photoKey, n);
-      if (!p || !p.data) return;
-      const id = wb.addImage({ buffer: p.data, extension: p.extension || 'jpeg' });
-      const d = isDay(p.width) && p.width > 0 && isDay(p.height) && p.height > 0 ? { w: p.width, h: p.height } : { w: 160, h: 160 };
-      ws.addImage(id, fitPhoto(picCol, COLS[picCol].w, PHOTO_ROW_PT, n + 2, d));
-    });
-    ws.views = [{ state: 'frozen', xSplit: 2, ySplit: 2, topLeftCell: 'C3' }];
-    ws.autoFilter = { from: { row: 2, column: 1 }, to: { row: 2, column: COLS.length } };
-    ws.pageSetup = { orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0, printTitlesRow: '2:2' };
+      head.height = 45;
+      rowIdx.forEach((at, n) => {
+        const r = sheet.rows[at], row = ws.getRow(n + 3);
+        COLS.forEach((c, i) => {
+          const cell = row.getCell(i + 1);
+          cell.font = FONT; cell.border = BOX;
+          cell.alignment = { vertical: 'middle', wrapText: !!c.wrap, ...(c.n ? { horizontal: 'right' } : c.first || c.date ? { horizontal: 'center' } : {}) };
+          if (c.photo) return;
+          if (c.first) { const f = r.firstFromChina || {}; cell.value = whenCell(f.now ? 'now' : f.date, f.estimate, r.fromChina > 0); }
+          else if (c.date) cell.value = whenCell(r[c.k], false, r.arriving > 0);
+          else if (c.n) cell.value = c.k === 'casePack' && r.casePack === 'mixed' ? 'mixed' : blankIfNone(r[c.k]);
+          else cell.value = S(r[c.k]) || null;
+          if (c.n) cell.numFmt = NUM;
+          if ((c.first || c.date) && cell.value instanceof Date) cell.numFmt = DATE;
+        });
+        if (withPhotos) row.height = PHOTO_ROW_PT;
+        const img = imageOf(at);
+        if (img) ws.addImage(img.id, fitPhoto(picCol, COLS[picCol].w, PHOTO_ROW_PT, n + 2, img.d));
+      });
+      ws.views = [{ state: 'frozen', xSplit: 2, ySplit: 2, topLeftCell: 'C3' }];
+      ws.autoFilter = { from: { row: 2, column: 1 }, to: { row: 2, column: COLS.length } };
+      ws.pageSetup = { orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0, printTitlesRow: '2:2' };
+    };
 
-    // 2. By date: the schedule.
+    // 1. Available to sell: every style. 2. A tab per category.
+    styleTab(TABS.sell, TITLE, sheet.rows.map((r, n) => n));
+    for (const t of categoryTabs(sheet.rows)) styleTab(t.name, `${TITLE} · ${t.category || NO_CAT}`, t.rows);
+
+    // 3. By date: the schedule.
     const wd = wb.addWorksheet(TABS.byDate);
     wd.columns = DATE_COLS.map(c => ({ width: c.w }));
     const dh = wd.getRow(1);
@@ -252,12 +300,12 @@
     });
     (sheet.byDate || []).forEach((r, n) => {
       const row = wd.getRow(n + 2);
-      const vals = [S(r.style) || null, S(r.desc) || null, whenCell(r.when, r.estimate, true), S(r.where) || null, blankIfNone(r.units), blankIfNone(r.cases)];
+      const vals = [S(r.style) || null, S(r.desc) || null, S(r.category) || null, whenCell(r.when, r.estimate, true), S(r.where) || null, blankIfNone(r.units), blankIfNone(r.cases)];
       vals.forEach((v, i) => {
         const cell = row.getCell(i + 1);
         cell.value = v; cell.font = FONT; cell.border = BOX;
-        cell.alignment = { vertical: 'middle', wrapText: i === 1, ...(i >= 4 ? { horizontal: 'right' } : i === 2 ? { horizontal: 'center' } : {}) };
-        if (i >= 4) cell.numFmt = NUM;
+        cell.alignment = { vertical: 'middle', wrapText: i === 1 || i === 2, ...(i >= 5 ? { horizontal: 'right' } : i === 3 ? { horizontal: 'center' } : {}) };
+        if (i >= 5) cell.numFmt = NUM;
         if (v instanceof Date) cell.numFmt = DATE;
       });
     });
@@ -272,5 +320,5 @@
     return b instanceof Uint8Array ? new Uint8Array(b.buffer, b.byteOffset, b.byteLength) : new Uint8Array(b);
   }
 
-  return { salesRows, buildWorkbook, workbookBytes, photoKey, fitPhoto, TITLE, TABS, WHERE, COLS, DATE_COLS, PHOTO_ROW_PT, PHOTO_INSET };
+  return { salesRows, categoryTabs, buildWorkbook, workbookBytes, photoKey, fitPhoto, TITLE, TABS, NO_CAT, WHERE, COLS, DATE_COLS, PHOTO_ROW_PT, PHOTO_INSET };
 });

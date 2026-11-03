@@ -574,10 +574,16 @@ async function salesReport(S, R) {
   console.log(`  rows with cases: now ${n(cases('nowCases'))} · from China ${n(cases('fromChinaCases'))} · arriving ${n(cases('arrivingCases'))} · total ${n(cases('totalCases'))} (blank, never guessed, where the case pack is unknown or mixed)`);
   console.log(`  first date from China: now ${n(rows.filter(r => r.firstFromChina.now).length)} · about (an estimate) ${n(rows.filter(r => r.firstFromChina.estimate).length)} · a date ${n(rows.filter(r => r.firstFromChina.date != null && !r.firstFromChina.now && !r.firstFromChina.estimate).length)}`);
   // Only the fields the sheet may hold, on every row.
-  const KEYS = 'style,upc,desc,casePack,now,nowCases,fromChina,fromChinaCases,firstFromChina,arriving,arrivingCases,firstArrival,total,totalCases,photoKey';
-  const odd = rows.filter(r => Object.keys(r).join() !== KEYS).length + sheet.byDate.filter(r => Object.keys(r).join() !== 'style,desc,when,estimate,where,units,cases').length;
+  const KEYS = 'style,upc,desc,category,sub,casePack,now,nowCases,fromChina,fromChinaCases,firstFromChina,arriving,arrivingCases,firstArrival,total,totalCases,photoKey';
+  const odd = rows.filter(r => Object.keys(r).join() !== KEYS).length + sheet.byDate.filter(r => Object.keys(r).join() !== 'style,desc,category,when,estimate,where,units,cases').length;
   console.log(`  every row holds only the sheet's fields: ${odd ? 'NO' : 'yes'}`);
   if (odd) fails(`${n(odd)} rows of the sales sheet hold other fields`);
+  // A tab per category (Saul, Nov 3): every style on exactly one, as Available to sell has them.
+  const tabs = SS.categoryTabs(rows), onTabs = tabs.flatMap(t => t.rows);
+  const tabsOk = onTabs.length === rows.length && new Set(onTabs).size === rows.length && tabs.every(t => t.rows.every(i => C.S(rows[i].category) === t.category));
+  console.log(`  category tabs ${n(tabs.length)} (${n(tabs.filter(t => !t.category).length)} for no category), ${n(onTabs.length)} styles on them, each on its category's tab once: ${tabsOk ? 'yes' : 'NO'}` +
+    ` · with a sub category ${n(rows.filter(r => C.S(r.sub)).length)} of ${n(rows.length)}`);
+  if (!tabsOk) fails("the sales sheet's category tabs don't hold every style once");
   // Photos: the ERP report's picture first (the style's key, as its numbers match), Quote Images for the rest.
   if (erpPics) {
     const have = rows.filter(r => erpPics.pictures.has(C.normStyle(r.style))).length;
@@ -589,21 +595,24 @@ async function salesReport(S, R) {
   for (const a of R.allocs) { put('factory', a.factory); put('customer', a.customer); put('PO', a.po); put('PO', a.poShown); put('section', a.section); for (const x of [].concat(a.containers || [])) put('container', x); }
   for (const l of S.lots) { put('factory', l.factory); put('customer', l.customer); put('PO', l.po); put('ERP warehouse', l.warehouse); }
   if (atsR) for (const e of atsR.styles.values()) for (const w of e.warehouses || []) put('ERP warehouse', w);
-  const texts = [...rows.flatMap(r => [r.style, r.upc, r.desc, ...r.upc.split(', ')]), ...sheet.byDate.flatMap(r => [r.style, r.desc, r.where])].map(v => C.S(v).toLowerCase());
+  const texts = [...rows.flatMap(r => [r.style, r.upc, r.desc, r.category, r.sub, ...r.upc.split(', ')]), ...sheet.byDate.flatMap(r => [r.style, r.desc, r.category, r.where])].map(v => C.S(v).toLowerCase());
   const hits = {};
   for (const t of texts) if (inside.has(t)) hits[inside.get(t)] = (hits[inside.get(t)] || 0) + 1;
   console.log(`  no factory, customer, PO, container, section or ERP warehouse name is a value in it (${n(texts.length)} text values against ${n(inside.size)} names): ${Object.keys(hits).length ? 'NO' : 'yes'}`);
   if (Object.keys(hits).length) fails(`the sales sheet holds names that stay inside: ${Object.entries(hits).map(([kd, c]) => `${kd} ${c}`).join(', ')}`);
   if (!salesOut) { console.log('  (no --sales-out: no sample file written)'); return; }
-  // The sample, without photos, read back as Excel reads it: both tabs, every row, no picture, made by Shalam Tool.
+  // The sample, without photos, read back as Excel reads it: every tab, every row, no picture, made by Shalam Tool.
   const t0 = performance.now();
   const bytes = await SS.workbookBytes(SS.buildWorkbook(loadExcelJS(), sheet, null));
   writeFileSync(salesOut, bytes);
   const back = readBook(new Uint8Array(readFileSync(salesOut)), {});
   const ws = back.Sheets[SS.TABS.sell], wd = back.Sheets[SS.TABS.byDate];
   const nRows = ws && ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']).e.r + 1 : 0, nDates = wd && wd['!ref'] ? XLSX.utils.decode_range(wd['!ref']).e.r + 1 : 0;
-  const whole = back.SheetNames.join('|') === `${SS.TABS.sell}|${SS.TABS.byDate}` && nRows === rows.length + 2 && nDates === sheet.byDate.length + 1;
-  console.log(`  sample written without photos: ${salesOut} · ${n(bytes.length)} bytes in ${secs(t0)} · read back: tabs ${back.SheetNames.join(', ')}, ${n(nRows - 2)} style rows, ${n(nDates - 1)} by-date rows: ${whole ? 'yes' : 'NO'}`);
+  const rowsOf = name => { const x = back.Sheets[name]; return x && x['!ref'] ? XLSX.utils.decode_range(x['!ref']).e.r + 1 : 0; };
+  const wantTabs = [SS.TABS.sell, ...tabs.map(t => t.name), SS.TABS.byDate];
+  const whole = JSON.stringify(back.SheetNames) === JSON.stringify(wantTabs) && nRows === rows.length + 2 && nDates === sheet.byDate.length + 1 &&
+    tabs.every(t => rowsOf(t.name) === t.rows.length + 2);
+  console.log(`  sample written without photos: ${salesOut} · ${n(bytes.length)} bytes in ${secs(t0)} · read back: ${n(back.SheetNames.length)} tabs (Available to sell, ${n(tabs.length)} categories, By date), ${n(nRows - 2)} style rows, ${n(nDates - 1)} by-date rows: ${whole ? 'yes' : 'NO'}`);
   if (!whole) fails('the sample sales sheet did not read back whole');
 }
 

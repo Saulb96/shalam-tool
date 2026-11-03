@@ -291,14 +291,14 @@ test('a style whose stock on the report cannot be read is not 0: its lots in ful
 });
 
 test('erp-only: styles on the ATS report and nowhere else are one summary line (UPC_MASTER counts as somewhere)', () => {
-  const upc = { byStyle: new Map([['AB402', [{ upc: '000111222444', desc: 'From UPC_MASTER', category: 'Eye' }]]]) };
+  const upc = { byStyle: new Map([['AB402', [{ upc: '000111222444', desc: 'From UPC_MASTER', category: 'Eye', sub: 'Liner' }]]]) };
   const r = sell([alloc()], atsOf({ AB100: [0, 0], AB401: [10, 0], AB402: [5, 0], AB403: [0, 0] }), { upc });
   const e = r.issues.filter(i => i.code === 'erp-only');
   assert.equal(e.length, 1);
   assert.match(e[0].message, /^2 styles are on the ATS report but on no Master Sheet Live or Container Tracking line and not in UPC_MASTER \(1 with stock or orders\).*AB401, AB403/);
   assert.ok(styleOf(r, 'AB401').flags.includes('erp-only'));
   const u = styleOf(r, 'AB402');
-  assert.deepEqual([u.desc, u.category, u.upcs], ['From UPC_MASTER', 'Eye', ['000111222444']]);
+  assert.deepEqual([u.desc, u.category, u.sub, u.upcs], ['From UPC_MASTER', 'Eye', 'Liner', ['000111222444']]);
   assert.equal(styleOf(r, 'AB401').desc, 'ERP AB401', 'the report\'s description when nothing else has one');
 });
 

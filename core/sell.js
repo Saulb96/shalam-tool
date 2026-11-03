@@ -632,11 +632,15 @@
       const first = pulls.reduce((m, l) => (!m || l.pullFrom < m.pullFrom ? l : m), null);
       const arr = ls.filter(l => !l.inChina && l.available > 0 && l.arrival != null);
       const umDesc = um.find(u => u.desc), umCat = um.find(u => u.category);
+      const catFrom = st && st.category ? st : umCat || (e && e.category ? e : null);
       const upcs = uniq([...(st ? st.upcs.map(u => u.upc) : []), ...ls.map(l => l.upc), ...um.map(u => u.upc)]);
       styles.push({
         style, styleRaw,
         desc: (st && st.desc) || (umDesc && umDesc.desc) || (e && e.desc) || '',
-        category: (st && st.category) || (umCat && umCat.category) || (e && e.category) || '',
+        // The sub category from where the category came, never one from each.
+        category: catFrom ? catFrom.category : '', sub: (catFrom && catFrom.sub) || '',
+        // The ATS report's own category and sub category (the sales sheet's tabs: Saul, Nov 3), '' when it has none.
+        atsCategory: (e && e.category) || '', atsSub: (e && e.category && e.sub) || '',
         factory: (st && st.factory) || '', factories: st ? st.factories.slice() : [],
         upcs, casePack, onReport: atsOk ? !!e : null,
         // orders: the ERP's Total Customer Orders as they are; ordersShipChina of them ship from China with goods sold

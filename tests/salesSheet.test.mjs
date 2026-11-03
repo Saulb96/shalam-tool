@@ -60,7 +60,7 @@ function mainSell() {
   ];
   return sellOf(as, atsOf({ SS100: [500, 20], SS200: [50, 0], SS300: [10, 10], SS400: [0, 0] }));
 }
-const ROW_KEYS = ['style', 'upc', 'desc', 'casePack', 'now', 'nowCases', 'fromChina', 'fromChinaCases', 'firstFromChina', 'arriving',
+const ROW_KEYS = ['style', 'upc', 'desc', 'category', 'sub', 'casePack', 'now', 'nowCases', 'fromChina', 'fromChinaCases', 'firstFromChina', 'arriving',
   'arrivingCases', 'firstArrival', 'total', 'totalCases', 'photoKey'];
 
 // ---------- refusals
@@ -107,7 +107,7 @@ test('one row per style with something available, by style; only the listed fiel
     assert.equal(r.total, r.now + r.fromChina + r.arriving, r.style);
     assert.ok(r.total > 0);
   }
-  for (const b of sh.byDate) assert.deepEqual(Object.keys(b), ['style', 'desc', 'when', 'estimate', 'where', 'units', 'cases']);
+  for (const b of sh.byDate) assert.deepEqual(Object.keys(b), ['style', 'desc', 'category', 'when', 'estimate', 'where', 'units', 'cases']);
   assert.deepEqual(sh.counts, { styles: 4, leftOff: 1, byDateRows: sh.byDate.length, noCasePack: 1, mixedCasePack: 1 });
   // The same units as the page's Available to sell.
   for (const r of sh.rows) {
@@ -215,10 +215,10 @@ test('by date: the ATS report\'s In Trans shipments are Arriving on their ETA, i
 
 // Distinctive marker strings in every field the salesperson must never see: factory, customer, PO, PO type, section,
 // container, round, people's names, file names, links, ERP warehouse, and the numbers for In WH, customer orders, sold
-// and oversold.
+// and oversold. Category and sub category are shown (Saul, Nov 3: a tab per category).
 const MARK = { factory: 'Factory QXLEAKFAC', customer: 'Customer QXLEAKCUST', po: '987650-QXLEAKPO', poShown: 'PO QXLEAKSHOWN', ptype: 'QXLEAKPTYPE',
   section: 'Section QXLEAKSECT', round: 'Round QXLEAKROUND', container: 'QXLC1234567', person: 'Pat QXLEAKPERSON', file: 'QXLEAKFILE.xlsx',
-  link: 'https://contoso.sharepoint.example/sites/QXLEAKSITE/QXLEAKLINK', warehouse: 'WH QXLEAKWH', erpPo: '987651-QXLEAKERPPO', category: 'QXLEAKCAT',
+  link: 'https://contoso.sharepoint.example/sites/QXLEAKSITE/QXLEAKLINK', warehouse: 'WH QXLEAKWH', erpPo: '987651-QXLEAKERPPO',
   inWh: '77791', orders: '4321', sold: '31415', oversold: '27182', issue: 'QXLEAKISSUE' };
 function leakySell() {
   const tag = { factory: MARK.factory, customer: MARK.customer, po: MARK.po, poShown: MARK.poShown, ptype: MARK.ptype, section: MARK.section,
@@ -238,7 +238,7 @@ function leakySell() {
       inTransBad: [], etaParts: k === 'SS700' ? [D(11, 28)] : [], eta: [], backlog: null, backlogList: [], poParts: k === 'SS700' ? [MARK.erpPo] : [] }];
   }
   Object.assign(ats, { columns: ['style', 'inWh', 'orders', 'inTrans', 'eta', 'po'], fileName: MARK.file, savedBy: MARK.person });
-  const sell = SELL.buildSell({ stages: stagesOf(as, { category: MARK.category }), ats, today: TODAY });
+  const sell = SELL.buildSell({ stages: stagesOf(as), ats, today: TODAY });
   // Whatever the page or a later engine might hang on the result: none of it may be copied.
   Object.assign(sell, { atsFile: MARK.file, savedBy: MARK.person, webUrl: MARK.link });
   for (const x of [...sell.styles, ...sell.lots]) Object.assign(x, { savedBy: MARK.person, fileName: MARK.file, webUrl: MARK.link, warehouse: MARK.warehouse, note: MARK.issue });
@@ -256,7 +256,7 @@ test('NO LEAK: the rows and the schedule hold none of the names, numbers, flags 
   const sell = leakySell();
   // The markers are really in what the sheet is made from.
   const src = allText(sell);
-  for (const m of [MARK.factory, MARK.customer, MARK.po, MARK.section, MARK.round, MARK.container, MARK.person, MARK.file, MARK.link, MARK.warehouse, MARK.erpPo, MARK.category, MARK.issue]) assert.ok(src.includes(m), m);
+  for (const m of [MARK.factory, MARK.customer, MARK.po, MARK.section, MARK.round, MARK.container, MARK.person, MARK.file, MARK.link, MARK.warehouse, MARK.erpPo, MARK.issue]) assert.ok(src.includes(m), m);
   const s1 = sell.styles.find(s => s.style === 'SS100');
   assert.deepEqual([s1.inWh, s1.orders, s1.soldChina], [77791, 4321, 31415]);
   assert.equal(sell.styles.find(s => s.style === 'SS799').oversold, 27182);
@@ -295,35 +295,36 @@ test('the vendored ExcelJS is 4.4.0 as published (the hash in its VERSION.txt), 
   assert.equal(typeof E.Workbook, 'function');
 });
 
-test('the workbook: two tabs, the title with its dates, frozen photo and style, a filter, numbers and dates as Excel keeps them', async () => {
+test('the workbook: every style, a tab per category, By date; the title with its dates, frozen photo and style, a filter, numbers and dates as Excel keeps them', async () => {
   const sh = SS.salesRows(mainSell(), { today: TODAY });
   const photos = new Map([['SS100', { data: PNG1, width: 1, height: 1, extension: 'png' }], ['SS300', { data: PNG2.buffer.slice(0), width: 2, height: 1, extension: 'png' }]]);
   const wb = SS.buildWorkbook(loadExcelJS(), sh, photos);
   const bytes = await SS.workbookBytes(wb);
   assert.ok(bytes instanceof Uint8Array && bytes.length > 5000, `${bytes.length} bytes`);
   const book = readBack(bytes);
-  assert.deepEqual(book.SheetNames, ['Available to sell', 'By date']);
+  assert.deepEqual(book.SheetNames, ['Available to sell', 'Lip', 'By date']);
   const ws = book.Sheets['Available to sell'], v = a => (ws[a] ? ws[a].v : undefined);
   assert.equal(v('A1'), 'M1S · Available to sell');
   assert.equal(v('D1'), 'as of 11/2/2026 · stock from the ERP report of 10/31/2026');
-  assert.deepEqual('ABCDEFGHIJKLMNO'.split('').map(c => v(c + '2')), SS.COLS.map(c => c.h));
-  assert.deepEqual(SS.COLS.map(c => c.h), ['Photo', 'Style', 'UPC', 'Description', 'Case pack', 'Available now (units)', 'Available now (cases)',
+  assert.deepEqual('ABCDEFGHIJKLMNOPQ'.split('').map(c => v(c + '2')), SS.COLS.map(c => c.h));
+  assert.deepEqual(SS.COLS.map(c => c.h), ['Photo', 'Style', 'UPC', 'Description', 'Category', 'Sub category', 'Case pack', 'Available now (units)', 'Available now (cases)',
     'Available from China (units)', 'Available from China (cases)', 'First date from China', 'Arriving (units)', 'Arriving (cases)', 'First arrival',
     'Total available (units)', 'Total available (cases)']);
   // Row 3 SS050 (an estimate, nothing now), row 4 SS100.
-  assert.deepEqual(['B3', 'E3', 'F3', 'G3', 'H3', 'I3', 'J3', 'K3', 'M3', 'N3', 'O3'].map(v), ['SS050', 24, undefined, undefined, 96, 4, `about ${C.fmtDay(D(10, 1) + 75)}`, undefined, undefined, 96, 4]);
-  assert.deepEqual(['B4', 'C4', 'D4', 'E4', 'F4', 'G4', 'H4', 'I4', 'J4', 'K4', 'L4', 'M4', 'N4', 'O4'].map(v),
-    ['SS100', '000111222333', 'Item SS100', 24, 480, 20, 940, 39, 'now', 300, 12, serial(D(11, 20)), 1720, 71]);
+  assert.deepEqual(['B3', 'G3', 'H3', 'I3', 'J3', 'K3', 'L3', 'M3', 'O3', 'P3', 'Q3'].map(v), ['SS050', 24, undefined, undefined, 96, 4, `about ${C.fmtDay(D(10, 1) + 75)}`, undefined, undefined, 96, 4]);
+  assert.deepEqual(['B4', 'C4', 'D4', 'E4', 'F4', 'G4', 'H4', 'I4', 'J4', 'K4', 'L4', 'M4', 'N4', 'O4', 'P4', 'Q4'].map(v),
+    ['SS100', '000111222333', 'Item SS100', 'Lip', undefined, 24, 480, 20, 940, 39, 'now', 300, 12, serial(D(11, 20)), 1720, 71]);
   assert.equal(ws.C4.t, 's', 'UPCs stay text');
-  assert.equal(ws.F4.z, '#,##0');
-  assert.equal(ws.M4.z, 'm/d/yyyy');
-  assert.deepEqual(['B5', 'E5', 'G5', 'J5', 'O5'].map(v), ['SS200', undefined, undefined, serial(D(12, 1)), undefined]);
-  assert.deepEqual(['B6', 'E6', 'I6'].map(v), ['SS300', 'mixed', undefined]);
+  assert.equal(ws.H4.z, '#,##0');
+  assert.equal(ws.O4.z, 'm/d/yyyy');
+  assert.deepEqual(['B5', 'G5', 'I5', 'L5', 'Q5'].map(v), ['SS200', undefined, undefined, serial(D(12, 1)), undefined]);
+  assert.deepEqual(['B6', 'G6', 'K6'].map(v), ['SS300', 'mixed', undefined]);
   assert.equal(v('B7'), undefined, 'four styles, no more');
   const wd = book.Sheets['By date'], w = a => (wd[a] ? wd[a].v : undefined);
-  assert.deepEqual(['A1', 'B1', 'C1', 'D1', 'E1', 'F1'].map(w), ['Style', 'Description', 'Available from', 'Where', 'Units', 'Cases']);
+  assert.deepEqual(['A1', 'B1', 'C1', 'D1', 'E1', 'F1', 'G1'].map(w), ['Style', 'Description', 'Category', 'Available from', 'Where', 'Units', 'Cases']);
+  assert.equal(w('C2'), 'Lip');
   const sched = [];
-  for (let r = 2; w('A' + r) !== undefined; r++) sched.push(['A', 'C', 'D', 'E', 'F'].map(c => w(c + r)));
+  for (let r = 2; w('A' + r) !== undefined; r++) sched.push(['A', 'D', 'E', 'F', 'G'].map(c => w(c + r)));
   assert.equal(sched.length, sh.byDate.length);
   assert.deepEqual(sched.filter(x => x[0] === 'SS100'), [['SS100', 'now', 'In stock', 480, 20], ['SS100', 'now', 'From China', 240, 10],
     ['SS100', serial(D(11, 20)), 'Arriving', 300, 12], ['SS100', serial(D(12, 1)), 'From China', 600, 25],
@@ -331,14 +332,15 @@ test('the workbook: two tabs, the title with its dates, frozen photo and style, 
   assert.deepEqual(sched.filter(x => x[0] === 'SS300'), [['SS300', serial(D(12, 1)), 'From China', 84, undefined], ['SS300', serial(D(12, 20)), 'From China', 30, 2]]);
 
   const parts = xlsxParts(bytes);
-  const sheet1 = Buffer.from(parts.get('xl/worksheets/sheet1.xml')).toString('utf8'), sheet2 = Buffer.from(parts.get('xl/worksheets/sheet2.xml')).toString('utf8');
+  const sheet1 = Buffer.from(parts.get('xl/worksheets/sheet1.xml')).toString('utf8'), sheet2 = Buffer.from(parts.get('xl/worksheets/sheet3.xml')).toString('utf8');
   assert.match(sheet1, /<pane xSplit="2" ySplit="2" topLeftCell="C3" activePane="bottomRight" state="frozen"\/>/);
-  assert.match(sheet1, /<autoFilter ref="A2:O2"\/>/);
+  assert.match(sheet1, /<autoFilter ref="A2:Q2"\/>/);
   assert.match(sheet2, /<pane xSplit="1" ySplit="1" topLeftCell="B2" activePane="bottomRight" state="frozen"\/>/);
-  assert.match(sheet2, /<autoFilter ref="A1:F1"\/>/);
+  assert.match(sheet2, /<autoFilter ref="A1:G1"\/>/);
   // Two photos, in the Photo column on their styles' rows (SS100 on row 4, SS300 on row 6: 0-based 3 and 5), fitted
-  // inside the cell; every style row has the photo row height.
+  // inside the cell; every style row has the photo row height. The Lip tab shows them too, from the same two pictures.
   assert.equal([...parts.keys()].filter(p => /^xl\/media\//.test(p)).length, 2);
+  assert.equal(Buffer.from(parts.get('xl/drawings/drawing2.xml')).toString('utf8').match(/<xdr:pic>/g).length, 2);
   const drawing = Buffer.from(parts.get('xl/drawings/drawing1.xml')).toString('utf8');
   const anchors = [...drawing.matchAll(/<xdr:from><xdr:col>(\d+)<\/xdr:col><xdr:colOff>(\d+)<\/xdr:colOff><xdr:row>(\d+)<\/xdr:row><xdr:rowOff>(\d+)<\/xdr:rowOff><\/xdr:from><xdr:ext cx="(\d+)" cy="(\d+)"\/>/g)]
     .map(m => m.slice(1).map(Number));
@@ -349,6 +351,95 @@ test('the workbook: two tabs, the title with its dates, frozen photo and style, 
     assert.ok(colOff > 0 && rowOff > 0, 'centred, not hugging the corner');
   }
   for (let r = 3; r <= 6; r++) assert.match(sheet1, new RegExp(`<row r="${r}"[^>]* ht="${SS.PHOTO_ROW_PT}"`));
+});
+
+test('a tab per category: A to Z, no category last, rows by sub category then style, the same numbers; each picture stored once', async () => {
+  const sell = mainSell();
+  const cat = { SS050: ['Bath', 'Poufs'], SS100: ['Cosmetics2', 'Lip Balm'], SS200: ['', ''], SS300: ['Bath', 'Gloves'] };
+  // The page's categories only (none from the ATS report).
+  for (const s of sell.styles) if (cat[s.style]) { [s.category, s.sub] = cat[s.style]; s.atsCategory = s.atsSub = ''; }
+  const sh = SS.salesRows(sell, { today: TODAY });
+  assert.deepEqual(sh.rows.map(r => [r.style, r.category, r.sub]), [['SS300', 'Bath', 'Gloves'], ['SS050', 'Bath', 'Poufs'], ['SS100', 'Cosmetics2', 'Lip Balm'], ['SS200', '', '']]);
+  // The schedule in the same order, with each style's category.
+  assert.deepEqual([...new Set(sh.byDate.map(b => b.style))], ['SS300', 'SS050', 'SS100', 'SS200']);
+  for (const b of sh.byDate) assert.equal(b.category, cat[b.style][0], b.style);
+  assert.deepEqual(SS.categoryTabs(sh.rows).map(t => [t.name, t.category, t.rows]), [['Bath', 'Bath', [0, 1]], ['Cosmetics2', 'Cosmetics2', [2]], ['No category', '', [3]]]);
+
+  const photos = new Map([['SS050', { data: PNG1, width: 1, height: 1, extension: 'png' }], ['SS100', { data: PNG2, width: 2, height: 1, extension: 'png' }]]);
+  const bytes = await SS.workbookBytes(SS.buildWorkbook(loadExcelJS(), sh, photos));
+  const book = readBack(bytes);
+  assert.deepEqual(book.SheetNames, ['Available to sell', 'Bath', 'Cosmetics2', 'No category', 'By date']);
+  const cell = (tab, a) => (book.Sheets[tab][a] ? book.Sheets[tab][a].v : undefined);
+  assert.equal(cell('Bath', 'A1'), 'M1S · Available to sell · Bath');
+  assert.equal(cell('Bath', 'D1'), 'as of 11/2/2026 · stock from the ERP report of 10/31/2026');
+  assert.equal(cell('No category', 'A1'), 'M1S · Available to sell · No category');
+  assert.deepEqual('ABCDEFGHIJKLMNOPQ'.split('').map(c => cell('Cosmetics2', c + '2')), SS.COLS.map(c => c.h));
+  assert.deepEqual(['B3', 'E3', 'F3', 'B4', 'E4', 'F4', 'B5'].map(a => cell('Bath', a)), ['SS300', 'Bath', 'Gloves', 'SS050', 'Bath', 'Poufs', undefined]);
+  assert.deepEqual(['B3', 'E3', 'F3', 'B4'].map(a => cell('No category', a)), ['SS200', undefined, undefined, undefined]);
+  // Every category tab's cells are the all-styles tab's, row for row, and together they hold every style once.
+  const tabs = SS.categoryTabs(sh.rows);
+  assert.deepEqual(tabs.flatMap(t => t.rows).sort(), sh.rows.map((r, n) => n));
+  for (const t of tabs) {
+    t.rows.forEach((at, n) => {
+      for (const c of 'BCDEFGHIJKLMNOPQ') assert.deepEqual(cell(t.name, c + (n + 3)), cell('Available to sell', c + (at + 3)), `${t.name} ${c}${n + 3}`);
+    });
+    assert.equal(cell(t.name, 'B' + (t.rows.length + 3)), undefined, `${t.name}: no more rows`);
+  }
+  // Two pictures in the file, each shown twice: SS050 on the all-styles tab (row 4) and Bath (row 4), SS100 on the
+  // all-styles tab (row 5) and Cosmetics2 (row 3).
+  const parts = xlsxParts(bytes);
+  const media = [...parts.keys()].filter(p => /^xl\/media\//.test(p));
+  assert.equal(media.length, 2);
+  const shown = [];
+  for (const [p, b] of parts) {
+    const m = /^xl\/drawings\/(drawing\d+)\.xml$/.exec(p);
+    if (!m) continue;
+    const rels = Buffer.from(parts.get(`xl/drawings/_rels/${m[1]}.xml.rels`)).toString('utf8');
+    const target = Object.fromEntries([...rels.matchAll(/<Relationship [^>]*>/g)].map(r => [/Id="([^"]+)"/.exec(r[0])[1], /Target="\.\.\/media\/([^"]+)"/.exec(r[0])[1]]));
+    for (const a of Buffer.from(b).toString('utf8').matchAll(/<xdr:row>(\d+)<\/xdr:row>[^]*?r:embed="([^"]+)"/g)) shown.push(`${m[1]} row ${a[1]} ${target[a[2]]}`);
+  }
+  assert.equal(shown.length, 4, shown.join('; '));
+  assert.equal(new Set(shown.map(s => s.split(' ').pop())).size, 2, 'the same two pictures on every tab');
+});
+
+test("a style's category and sub category: the ATS report's, else the page's (UPC_MASTER), the pair from one place", () => {
+  const sell = mainSell();
+  const set = { SS050: ['', '', 'Nails', 'Polish'], SS100: ['Cosmetics1', 'Lip Balm', 'Cosmetics', 'Balm'], SS200: ['Bath', '', 'Body', 'Gloves'], SS300: ['', 'Stray', '', ''] };
+  for (const s of sell.styles) if (set[s.style]) [s.atsCategory, s.atsSub, s.category, s.sub] = set[s.style];
+  const sh = SS.salesRows(sell, { today: TODAY });
+  assert.deepEqual(sh.rows.map(r => [r.style, r.category, r.sub]), [['SS200', 'Bath', ''], ['SS100', 'Cosmetics1', 'Lip Balm'], ['SS050', 'Nails', 'Polish'], ['SS300', '', '']]);
+  // As the selling engine gives them: the ATS report's category with its own sub category (never UPC_MASTER's).
+  const s1 = sellOf([alloc({ dates: { factoryCrd: D(12, 6) } })], atsOf({ SS100: [10, 0] }));
+  assert.deepEqual([s1.styles[0].category, s1.styles[0].atsCategory, s1.styles[0].atsSub], ['Lip', 'Lip', '']);
+  const ats = atsOf({ SS100: [10, 0] });
+  ats.styles.get('SS100').sub = 'Gloss';
+  const s2 = sellOf([alloc({ dates: { factoryCrd: D(12, 6) } })], ats);
+  assert.deepEqual([s2.styles[0].atsCategory, s2.styles[0].atsSub], ['Lip', 'Gloss']);
+  ats.styles.get('SS100').category = '';
+  const s3 = sellOf([alloc({ dates: { factoryCrd: D(12, 6) } })], ats);
+  assert.deepEqual([s3.styles[0].atsCategory, s3.styles[0].atsSub], ['', ''], 'a sub category with no category is not the pair from the report');
+  assert.deepEqual(SS.salesRows(s3, { today: TODAY }).rows.map(r => [r.category, r.sub]), [['Lip', '']]);
+});
+
+test("category tab names: what Excel won't take made a space, at most 31 characters, never History or another tab's name; never joined", () => {
+  const cats = ['Hair/Nails', 'Cosmetics1', 'cosmetics1', 'Cosmetics10', 'Cosmetics2', 'By Date', 'history', 'A category name far longer than Excel allows', '[Lip]: *?', '  ', "'Quoted'"];
+  const tabs = SS.categoryTabs(cats.map(category => ({ category: category.trim() })));
+  const name = Object.fromEntries(tabs.map(t => [t.category, t.name]));
+  assert.deepEqual(name, { 'Hair/Nails': 'Hair Nails', Cosmetics1: 'Cosmetics1', cosmetics1: 'cosmetics1 (2)', Cosmetics10: 'Cosmetics10', Cosmetics2: 'Cosmetics2',
+    'By Date': 'By Date (2)', history: 'history (category)', 'A category name far longer than Excel allows': 'A category name far longer than',
+    '[Lip]: *?': 'Lip', '': 'No category', "'Quoted'": 'Quoted' });
+  for (const t of tabs) {
+    assert.ok(t.name.length >= 1 && t.name.length <= 31, t.name);
+    assert.doesNotMatch(t.name, /[[\]:*?/\\]|^'|'$/, t.name);
+  }
+  assert.equal(new Set(tabs.map(t => t.name.toLowerCase()).concat(['available to sell', 'by date'])).size, tabs.length + 2, 'every tab name differs');
+  const order = tabs.map(t => t.category);
+  assert.ok(order.indexOf('Cosmetics1') < order.indexOf('Cosmetics2') && order.indexOf('Cosmetics2') < order.indexOf('Cosmetics10'), order.join(' | '));
+  assert.equal(order[order.length - 1], '', 'no category last');
+  // A long name that's taken keeps its tag inside 31 characters.
+  const long = SS.categoryTabs(['x'.repeat(40), 'X'.repeat(40)].map(category => ({ category })));
+  assert.deepEqual(long.map(t => t.name), ['X'.repeat(31), 'x'.repeat(27) + ' (2)']);
+  assert.deepEqual(SS.categoryTabs([]), []);
 });
 
 test('the workbook without photos: no pictures, ordinary rows; never an empty sheet', async () => {

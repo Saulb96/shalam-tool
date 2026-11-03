@@ -3935,7 +3935,7 @@
     if (!saved || !saved.eTag) throw problem('not saved whole', `SharePoint didn't say what it holds as ${file} after the upload, so the sheet may not have been saved whole.`);
     // Its size must be the bytes sent, in the last answer and in SharePoint's own. SharePoint can write its own
     // properties into an Office file as it stores it, which changes the size: then the file is read back, and must open
-    // with both tabs and every style in order.
+    // with all its tabs and every style in order.
     if (item.size !== total || saved.size !== total) {
       const was = `SharePoint says ${file} is ${fmtN(saved.size !== total ? saved.size : item.size)} bytes, not the ${fmtN(total)} sent`;
       let back;
@@ -3952,7 +3952,8 @@
   // How many of the file's photos are the ERP report's pictures, in words (the rest are Quote Images').
   const erpWords = (made, pics) => (made.erp && pics ? ` (${fmtN(made.erp)} from the ${fmtD(pics.reportDay)} ATS report's pictures)` : '');
   // An empty or half-built file is never uploaded (and one read back after the upload must be whole): a sensible size,
-  // and it opens with both tabs and every style, in order. Answers what's wrong with it ('' when nothing is).
+  // and it opens with all its tabs (Available to sell, one per category, By date, in that order) and every style, in
+  // order. Answers what's wrong with it ('' when nothing is).
   function salesFileWrong(bytes, sheet) {
     const SS = window.InvSalesSheet;
     if (!sheet.rows.length) return 'it has no rows';
@@ -3961,7 +3962,10 @@
     let wb;
     try { wb = XLSX.read(bytes, { type: 'array', sheets: [SS.TABS.sell] }); }
     catch (e) { return `it didn't open after it was written (${e.message})`; }
-    if (!(wb.SheetNames || []).includes(SS.TABS.byDate)) return `it has no "${SS.TABS.byDate}" tab`;
+    const tabs = [SS.TABS.sell, ...SS.categoryTabs(sheet.rows).map(t => t.name), SS.TABS.byDate];
+    const missing = tabs.find(t => !(wb.SheetNames || []).includes(t));
+    if (missing) return `it has no "${missing}" tab`;
+    if (JSON.stringify(wb.SheetNames) !== JSON.stringify(tabs)) return `its tabs aren't the ones it should have, in order (${fmtN(wb.SheetNames.length)} of them, not ${fmtN(tabs.length)})`;
     const ws = wb.Sheets[SS.TABS.sell], ref = ws && ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']) : null;
     if (!ref || ref.e.r + 1 !== sheet.rows.length + 2) return `it holds ${ref ? fmtN(ref.e.r - 1) : 'no'} style rows, not ${fmtN(sheet.rows.length)}`;
     const col = SS.COLS.findIndex(c => c.k === 'style'), styleAt = i => { const c = ws[XLSX.utils.encode_cell({ r: i + 2, c: col })]; return c && c.v != null ? String(c.v) : ''; };
