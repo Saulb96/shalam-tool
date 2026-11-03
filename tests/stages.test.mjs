@@ -100,6 +100,16 @@ test('Master Sheet columns missing: that fact is blank and one issue each, nothi
   assert.equal(r.styles[0].category, 'Lip');
 });
 
+test('Inner: read from the same Master Sheet line as the Master (the sales sheets\' Master/Inner); no Inner column is no issue', () => {
+  const a = line({ master: 48, qty: 960 }), b = line({ sty: 'AB200', po: '900102', master: null, qty: 100 });
+  const rows = mrowsFor([a, b]).map((r, i) => [...r, i === 0 ? 'Inner' : i === a.row - 1 ? 12 : i === b.row - 1 ? 6 : null]);
+  const r = ST.build({ po: { lines: [a, b] }, mrows: rows, ct: ctOf([]), today: TODAY });
+  assert.deepEqual(r.allocs.map(x => [x.style, x.master, x.inner]), [['AB100', 48, 12], ['AB200', null, null]], 'an Inner with no Master is never kept');
+  const none = run([line({ master: 48, qty: 960 })], ctOf([]));
+  assert.equal(none.allocs[0].inner, null);
+  assert.ok(!none.issues.some(i => i.code === 'missing-column'));
+});
+
 // ---------- keys and matching
 
 test('style is exact: inner spaces and -F are different items, listed as near-misses, never matched', () => {

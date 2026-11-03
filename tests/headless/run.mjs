@@ -49,6 +49,8 @@ const TEST_SECTIONS = { pullFromChina: ['Customer Direct'], planning: ['Planning
 // the fake fetch sends it to the download host on 127.0.0.1.
 const SALES_LIB = '/sites/TestReports/Sales Test Library', SALES_FILE = 'Sales Test.xlsx', SALES_DRV = 'drv-sales';
 const SESSION_PATH = `/drives/${SALES_DRV}/root:/${SALES_FILE}:/createUploadSession`;
+// The Pull from China sheet (Saul, Nov 3), saved next to it when a scenario sets chinaFile.
+const CHINA_FILE = 'China Test.xlsx', CHINA_SESSION = `/drives/${SALES_DRV}/root:/${CHINA_FILE}:/createUploadSession`;
 const PHOTO_LOC = '/sites/TestSite/Shared Documents/Photo Store';
 const UP_HOST = 'https://contoso-test.sharepoint.com';
 const TEST_CONFIG = { tenantId: '00000000-0000-4000-8000-000000000000', clientId: '11111111-1111-4111-8111-111111111111',
@@ -277,6 +279,8 @@ function buildFixtures(today) {
     for (let i = 0; i < 2400; i += 3) rows.push(ar('ST' + String(i).padStart(4, '0'), (i % 5) * 100, (i % 4) * 400));
     rows.push(ar('ERP-1', 500, 0), ar('ERP-2', 0, 240), ar('ERP-3', 1200, 1200));
     bytes.set('ats-big.xlsx', atsBook(rows));
+    // Every big-set style in stock (the sales sheet goes by the ATS report: sales-chunks needs a big file).
+    bytes.set('ats-big-all.xlsx', atsBook(Array.from({ length: 2400 }, (_, i) => ar('ST' + String(i).padStart(4, '0'), 100 + (i % 7) * 50, 0))));
   }
 
   // The PO Book page, served at /po-book/index.html: its CORE block as copied into core/pobook.js, or changed.
@@ -536,7 +540,7 @@ function newWorld(fx, o = {}) {
     // Graph answers held back (o.slow: { path: ms }) and not given yet.
     slowNow: 0,
     // The sales library: its file once saved, the upload sessions made, every PUT the upload host got, and photo lookups.
-    sales: { file: null, version: 0, made: 0, sessions: {}, bodies: [], urls: [], puts: [], preflights: 0, aborted: 0 }, photoLookups: [] };
+    sales: { file: null, china: null, chinaMade: 0, version: 0, made: 0, sessions: {}, bodies: [], urls: [], puts: [], preflights: 0, aborted: 0 }, photoLookups: [] };
 }
 // The world's photos: o.photos(key) names the invented JPEG for a style's photo key, or null (no photo).
 const photoFile = (w, key) => (typeof w.o.photos === 'function' ? w.o.photos(key) : null);
@@ -595,6 +599,8 @@ function graph(w, method, path, q, body) {
     // The sales sheet in its library (the invented one): there once saved.
     if (path === `/drives/${SALES_DRV}/root:/${SALES_FILE}`) return w.sales.file ? J(200, salesItem(w.sales.file)) : notFound();
     if (w.sales.file && path === `/drives/${SALES_DRV}/items/${w.sales.file.id}`) return J(200, salesItem(w.sales.file));
+    if (path === `/drives/${SALES_DRV}/root:/${CHINA_FILE}`) return w.sales.china ? J(200, salesItem(w.sales.china)) : notFound();
+    if (w.sales.china && path === `/drives/${SALES_DRV}/items/${w.sales.china.id}`) return J(200, salesItem(w.sales.china));
     // The photo store: its thumb folder, and a photo by key (o.photos names the invented JPEG; none: 404). "Moved Photos"
     // has no thumb folder (the photo store moved away).
     if (path === `/drives/${SRC}/root:/Photo Store/thumb`) return J(200, folderMeta('itm-thumb', 'thumb'));
@@ -689,11 +695,12 @@ function graph(w, method, path, q, body) {
     }) });
   }
   // The sales sheet's upload session (o.salesSession: the status refusing it, as when the library isn't opened to the app).
-  if (method === 'POST' && path === SESSION_PATH) {
-    w.sales.bodies.push(body);
+  if (method === 'POST' && (path === SESSION_PATH || path === CHINA_SESSION)) {
+    const china = path === CHINA_SESSION;
+    if (!china) w.sales.bodies.push(body);
     if (o.salesSession) return J(o.salesSession, { error: { code: 'accessDenied', message: 'Access denied.' } });
-    const id = 'sess' + (++w.sales.made), url = `${UP_HOST}/_up/${id}?tempauth=invented-${id}`;
-    w.sales.sessions[id] = { got: 0, parts: [], total: null };
+    const id = china ? 'csess' + (++w.sales.chinaMade) : 'sess' + (++w.sales.made), url = `${UP_HOST}/_up/${id}?tempauth=invented-${id}`;
+    w.sales.sessions[id] = { got: 0, parts: [], total: null, china, body };
     w.sales.urls.push(url);
     return J(200, { uploadUrl: url, expirationDateTime: new Date(Date.now() + 864e5).toISOString(), nextExpectedRanges: ['0-'] });
   }
@@ -776,6 +783,10 @@ function uploadPart(req, res, w) {
       if (s.got < total) return send(202, { expirationDateTime: new Date(Date.now() + 864e5).toISOString(), nextExpectedRanges: [`${s.got}-`] });
       const sent = Buffer.concat(s.parts);
       const bytes = w.o.salesResized ? spResized(sent) : w.o.salesBadSize ? sent.subarray(0, Math.floor(sent.length / 2)) : sent;
+      if (s.china) {
+        w.sales.china = { id: 'itm-china', name: CHINA_FILE, size: sent.length, bytes: sent, sent, eTag: `"{C41A5000-0000-4000-8000-00000000000${w.sales.chinaMade}},1"`, at: new Date().toISOString() };
+        return send(201, salesItem(w.sales.china));
+      }
       w.sales.file = { id: 'itm-sales', name: SALES_FILE, size: bytes.length, bytes, sent, eTag: `"{5A1E5000-0000-4000-8000-00000000000${++w.sales.version}},1"`, at: new Date().toISOString() };
       send(201, salesItem(w.sales.file));
     };
@@ -796,8 +807,8 @@ function downloadServer() {
     const cors = { 'Access-Control-Allow-Origin': '*' };
     // The sales sheet the library holds, through its download link (logged as "sales file").
     if (world && req.url.startsWith('/sales/')) {
-      const w = world, f = w.sales.file;
-      w.downloads.push({ name: 'sales file', method: req.method, auth: !!req.headers.authorization });
+      const w = world, china = req.url.startsWith('/sales/itm-china'), f = china ? w.sales.china : w.sales.file;
+      w.downloads.push({ name: china ? 'china file' : 'sales file', method: req.method, auth: !!req.headers.authorization });
       if (req.method === 'OPTIONS') { res.writeHead(204, cors); res.end(); return; }
       if (!f || req.method !== 'GET' || req.url.split('?')[0] !== `/sales/${f.id}`) { res.writeHead(404, cors); res.end(); return; }
       res.writeHead(200, { ...cors, 'Content-Type': 'application/octet-stream', 'Content-Length': f.bytes.length });
@@ -1153,15 +1164,17 @@ const mailText = c => (c && c.body && c.body.message) || {};
 const mailKey = (today, k) => `inv:mailed:${C.isoDay(today)}:${k}`;
 // The read-only rule, three ways: as the page asked (the fake fetch), as Edge sent it, and as the stand-in got it. Allowed:
 // any GET; the email POST; a POST /$batch whose requests are all GETs with no body; the sales sheet's upload session in
-// its library (exactly SESSION_PATH); PUTs to an upload address, never with a sign-in token (and the browser's CORS
-// preflight for them). Every PUT is also checked against the addresses the sessions gave (putsOk).
+// its library (exactly SESSION_PATH, or CHINA_SESSION for the Pull from China sheet); PUTs to an upload address, never
+// with a sign-in token (and the browser's CORS preflight for them). Every PUT is also checked against the addresses the
+// sessions gave (putsOk).
 const SESSION_ENC = SESSION_PATH.split('/').map(encodeURIComponent).join('/').replace(/%3A/g, ':');
-const okPage = r => r.method === 'GET' || (r.method === 'POST' && [GRAPH + '/me/sendMail', GRAPH + '/$batch', GRAPH + SESSION_ENC].includes(r.url)) ||
+const CHINA_ENC = CHINA_SESSION.split('/').map(encodeURIComponent).join('/').replace(/%3A/g, ':');
+const okPage = r => r.method === 'GET' || (r.method === 'POST' && [GRAPH + '/me/sendMail', GRAPH + '/$batch', GRAPH + SESSION_ENC, GRAPH + CHINA_ENC].includes(r.url)) ||
   (r.method === 'PUT' && r.url.startsWith(UP_HOST + '/_up/') && !r.auth);
-const okNet = origin => r => r.method === 'GET' || (r.method === 'POST' && [`${origin}/__graph/me/sendMail`, `${origin}/__graph/$batch`, `${origin}/__graph${SESSION_ENC}`].includes(r.url)) ||
+const okNet = origin => r => r.method === 'GET' || (r.method === 'POST' && [`${origin}/__graph/me/sendMail`, `${origin}/__graph/$batch`, `${origin}/__graph${SESSION_ENC}`, `${origin}/__graph${CHINA_ENC}`].includes(r.url)) ||
   ((r.method === 'PUT' || r.method === 'OPTIONS') && r.url.startsWith(`${DL}/up/`));
 const batchOfGets = b => !!b && Array.isArray(b.requests) && b.requests.length > 0 && b.requests.length <= 20 && b.requests.every(x => x && x.method === 'GET' && x.body == null);
-const okCall = x => x.method === 'GET' || (x.method === 'POST' && (x.path === '/me/sendMail' || x.path === SESSION_PATH || (x.path === '/$batch' && batchOfGets(x.body))));
+const okCall = x => x.method === 'GET' || (x.method === 'POST' && (x.path === '/me/sendMail' || x.path === SESSION_PATH || x.path === CHINA_SESSION || (x.path === '/$batch' && batchOfGets(x.body))));
 // Every PUT the upload host got: to an address a session gave, as a PUT, with no Authorization header.
 const putsOk = w => w.sales.puts.every(p => p.method === 'PUT' && !p.auth && !!w.sales.sessions[p.id] && w.sales.urls.some(u => u.includes(`/_up/${p.id}?tempauth=${p.tempauth}`)));
 
@@ -1338,7 +1351,7 @@ const SA = `(() => {
     chip: ch ? { state: ch.dataset.state, text: txt(ch), title: ch.getAttribute('title') || '', em: txt(ch.querySelector('em')), small: txt(ch.querySelector('small')),
       buttons: [...ch.querySelectorAll('button')].map(txt), link: (ch.querySelector('a') || {}).href || '' } : null,
     row: txt(row), rowPill: txt(row && row.querySelector('.pill')),
-    dl: { shown: !!dl && !dl.hidden && !dl.closest('[hidden]'), disabled: q('#btnSalesDl').disabled, title: dl ? dl.title : '', msg: txt(q('#salesDlMsg')), cancel: !q('#btnSalesDlX').hidden },
+    dl: { shown: !!dl && !dl.hidden && !dl.closest('[hidden]'), disabled: q('#btnSalesDl').disabled, chinaDisabled: q('#btnChinaDl').disabled, chinaText: txt(q('#btnChinaDl')), title: dl ? dl.title : '', msg: txt(q('#salesDlMsg')), cancel: !q('#btnSalesDlX').hidden },
     picsClass: q('#sellTable').classList.contains('pics'),
     pics: [...document.querySelectorAll('#sellTable tbody tr.r')].map(tr => { const p = tr.querySelector('.pic');
       return { style: txt(tr.querySelector('button.sb')), img: !!p && p.tagName === 'IMG' && /^blob:/.test(p.src) && p.naturalWidth > 0, none: !!p && p.classList.contains('none'), text: txt(p), upc: txt(tr.querySelector('td .u')),
@@ -1379,10 +1392,10 @@ const MARKS_SELL = ['Factory S', 'Customer', 'Brand S', 'Test Saver', 'Test User
 const MARKS_PO = Array.from({ length: 13 }, (_, i) => String(900500 + i));
 // An Excel file the page made, opened here as Excel would read it (ExcelJS) and as a zip: its tabs, rows, pictures,
 // and any marker found in its text (every XML part; the PO numbers in the cell text and values).
-async function openSheet(bytes, marks) {
+async function openSheet(bytes, marks, kind = 'sales') {
   const EX = loadExcelJS(), wb = new EX.Workbook();
   await wb.xlsx.load(Buffer.from(bytes));
-  const ws = wb.getWorksheet(SS.TABS.sell), wd = wb.getWorksheet(SS.TABS.byDate), parts = xlsxParts(new Uint8Array(bytes));
+  const ws = wb.getWorksheet(SS.KINDS[kind].tab), wd = wb.getWorksheet(SS.TABS.byDate), parts = xlsxParts(new Uint8Array(bytes));
   const xml = [...parts].filter(([p]) => /\.(xml|rels)$/i.test(p)).map(([p, b]) => [p, Buffer.from(b).toString('utf8')]);
   const found = [];
   for (const [p, text] of xml) {
@@ -1399,13 +1412,14 @@ async function openSheet(bytes, marks) {
     keywords: (/<cp:keywords>([^<]*)</.exec(coreXml) || [])[1] || '', title: ws ? String(ws.getCell('A1').value) : '', sub: ws ? String(ws.getCell('D1').value) : '' };
 }
 // The tabs the file should have, and their rows (title and header rows, then a row per style; By date: header, then
-// the schedule): Available to sell, one per category, By date.
-const tabsFor = want => [SS.TABS.sell, ...SS.categoryTabs(want.rows).map(t => t.name), SS.TABS.byDate];
-const tabRowsFor = want => [want.rows.length + 2, ...SS.categoryTabs(want.rows).map(t => t.rows.length + 2), want.byDate.length + 1];
+// the schedule): its first tab, one per category, By date (Available to sell's only).
+const tabsFor = want => SS.tabsOf(want);
+const tabRowsFor = want => [want.rows.length + 2, ...SS.categoryTabs(want.rows).map(t => t.rows.length + 2), ...(SS.kindOf(want).byDate ? [want.byDate.length + 1] : [])];
 // How many styles the sales sheet holds, from the selling engine's answer.
 const want0 = (S, today) => (S && S.ok ? SS.salesRows(S, { today }).rows.length : 0);
 // The sheet's rows as the page should make them: the selling engine here, then core/salesSheet.js.
 const sheetFor = (fx, today, f) => { const { S } = sellFor(fx, today, f); return S && S.ok ? SS.salesRows(S, { today }) : null; };
+const chinaFor = (fx, today, f) => { const { S } = sellFor(fx, today, f); return S && S.ok ? SS.chinaRows(S, { today }) : null; };
 // What every saving scenario checks once the sheet is saved: one session (replacing the file), every part in order with
 // no token, the file whole in the library and as the page's sheet, the page's mark of it, and the chip.
 async function savedChecks(c, t, w, want, o = {}) {
@@ -1435,7 +1449,7 @@ async function savedChecks(c, t, w, want, o = {}) {
     mark.where === `${SALES_LIB}|${SALES_FILE}` && !!got && got.keywords === mark.fp, `${JSON.stringify(mark)} · keywords ${got && got.keywords}`);
   const p = await sa(t);
   c('the chip: "Sales sheet saved m/d h:mm AM", styles and photos, no name', p.chip.state === 'ok' && /^saved \d{1,2}\/\d{1,2} \d{1,2}:\d{2} [AP]M$/.test(p.chip.em) &&
-    p.chip.small === `${fmtN(want.rows.length)} style${want.rows.length === 1 ? '' : 's'}, ${fmtN(o.pics)} photo${o.pics === 1 ? '' : 's'}` && !/Test (User|Saver)/.test(p.chip.text + p.chip.title), JSON.stringify(p.chip));
+    p.chip.small === `${fmtN(want.rows.length)} style${want.rows.length === 1 ? '' : 's'}, ${fmtN(o.pics)} photo${o.pics === 1 ? '' : 's'}${o.tail || ''}` && !/Test (User|Saver)/.test(p.chip.text + p.chip.title), JSON.stringify(p.chip));
   return { got, p };
 }
 
@@ -2935,6 +2949,42 @@ const SCENARIOS = [
     },
   },
   {
+    name: 'sales-china', title: 'with chinaFile set: the Pull from China sheet saved next to it (its own session, the same library, parts with no token), one status for both; then both "up to date"',
+    world: { ...SELLW, ats: SELL_ATS, ...PICS, cfg: { ...PICS.cfg, chinaFile: CHINA_FILE } }, init: { scp: SAVE_SCP }, photos: true, saves: true,
+    async run({ t, w, c, today }) {
+      const files = { ...SELL_FILES, ats: SELL_ATS }, want = sheetFor(w.fx, today, files), china = chinaFor(w.fx, today, files);
+      const pics = want.rows.filter(r => SELL_PICS[r.photoKey]).length, cpics = china.rows.filter(r => SELL_PICS[r.photoKey]).length;
+      const cmedia = new Set(china.rows.filter(r => SELL_PICS[r.photoKey]).map(r => r.photoKey)).size;
+      c('both sheets worked out here from the same files have rows', want.rows.length > 5 && china.rows.length > 0, JSON.stringify({ sales: want.counts, china: china.counts }));
+      await t.waitFor(chipIs('ok'), 'both files to be saved', 40000);
+      const tail = ` · Pull from China ${fmtN(china.rows.length)} row${china.rows.length === 1 ? '' : 's'}`;
+      await savedChecks(c, t, w, want, { pics, tail });
+      const sess = w.calls.filter(x => x.method === 'POST' && x.path === CHINA_SESSION), cs = Object.values(w.sales.sessions).filter(x => x.china);
+      c('the Pull from China sheet: one upload session of its own in the same library, replacing the file', sess.length === 1 && cs.length === 1 && cs[0].body && cs[0].body.item && cs[0].body.item['@microsoft.graph.conflictBehavior'] === 'replace',
+        `${sess.length} sessions`);
+      const cputs = w.sales.puts.filter(p => p.id.startsWith('csess'));
+      c('its parts PUT with no Authorization header, to the address its session gave', cputs.length > 0 && cputs.every(p => p.method === 'PUT' && !p.auth), cputs.map(p => `${p.range}${p.auth ? ' TOKEN' : ''}`).join('; '));
+      const f = w.sales.china, got = f ? await openSheet(f.sent, MARKS_SELL, 'china') : null;
+      c(`it opens: tabs ${tabsFor(china).map(x => `"${x}"`).join(', ')}, the title, ${china.rows.length} rows, ${cpics} photos (${cmedia} pictures in the file), nothing that stays inside`, !!got &&
+        JSON.stringify(got.tabs) === JSON.stringify(tabsFor(china)) && got.tabRows.join() === tabRowsFor(china).join() && got.title === 'M1S · Pull from China' &&
+        got.styles.join() === china.rows.map(r => r.style).join() && got.images === cpics && got.media === cmedia && !got.found.length && got.creator === 'Shalam Tool',
+        JSON.stringify(got && { tabs: got.tabs, tabRows: got.tabRows, title: got.title, images: got.images, media: got.media, found: got.found.slice(0, 5) }));
+      let s = await t.snap();
+      const mark = s.store && JSON.parse(s.store['inv:sales-china'] || 'null');
+      c("this browser keeps its own mark of it: the file's eTag and the fingerprint written in it", !!mark && !!f && mark.eTag === f.eTag && mark.where === `${SALES_LIB}|${CHINA_FILE}` && !!got && got.keywords === mark.fp &&
+        /^[0-9a-f]{64}$/.test(mark.fp || '') && mark.fp !== JSON.parse(s.store['inv:sales'] || '{}').fp, JSON.stringify(mark));
+      let p = await sa(t);
+      c('the status says how both went: Available to sell, then Pull from China saved, its rows and photos', /^Saved .*: \d+ styles, \d+ photos.*\. Pull from China: saved .*: \d+ rows?, \d+ photos?/.test(p.chip.title.split('\n').find(l => /^Saved /.test(l)) || ''), p.chip.title);
+      // The next load: nothing changed, so both "up to date": no new session for either.
+      const made = w.sales.made, cmade = w.sales.chinaMade;
+      await runRefresh(t, w);
+      await t.waitFor(chipIs('ok'), 'the sales sheets check', 30000);
+      p = await sa(t);
+      c('the 5-minute refresh: both "up to date", no new session for either', p.chip.em === 'up to date' && w.sales.made === made && w.sales.chinaMade === cmade &&
+        /Pull from China: nothing in it has changed since it was saved/.test(p.chip.title), `${JSON.stringify(p.chip)} · ${w.sales.made}/${w.sales.chinaMade} sessions`);
+    },
+  },
+  {
     name: 'sales-resized', title: 'SharePoint stores the sales sheet with its own properties written in (another size): read back and checked, saved; no Cancel once the file is replaced',
     world: { ...SELLW, ats: SELL_ATS, ...PICS, salesResized: true, slow: { [`/drives/${SALES_DRV}/items/itm-sales`]: 4000 } }, init: { scp: SAVE_SCP }, photos: true, saves: true, wait: 'sales',
     async run({ t, w, c, today }) {
@@ -2974,26 +3024,31 @@ const SCENARIOS = [
       c('the next load finished while the first one\'s photos were still looked up', fired === 1 && w.slowNow > 0 && !w.sales.made, `fired ${fired}, slow ${w.slowNow}, sessions ${w.sales.made}`);
       await t.waitFor(chipIs('ok'), 'the sales sheet to be saved', 60000);
       await sleep(1500);
-      const got = await openSheet(w.sales.file.sent, MARKS_SELL), p = await sa(t);
-      c("one upload: the clean load's sheet; the first load's (from the old report) never saved", w.sales.made === 1 && got.sub.endsWith(`stock from the ERP report of ${C.fmtDay(TODAY - 2)}`) &&
-        /^saved /.test(p.chip.em), `${w.sales.made} sessions · ${got.sub} · ${p.chip.em}`);
+      const got = await openSheet(w.sales.file.sent, MARKS_SELL), p = await sa(t), mark = JSON.parse((await t.snap()).store['inv:sales'] || 'null');
+      c("one upload: the clean load's sheet (the fingerprint this browser keeps for it); the first load's (from the old report) never saved", w.sales.made === 1 && !!mark &&
+        got.keywords === mark.fp && mark.eTag === w.sales.file.eTag && /^saved /.test(p.chip.em), `${w.sales.made} sessions · ${got.keywords} · ${JSON.stringify(mark)} · ${p.chip.em}`);
     },
   },
   {
     name: 'sales-view', title: 'rows of Available to sell shown while the sales sheet\'s photos are looked up get their photos when that lookup ends',
     world: { ...SELLW, ats: SELL_ATS, ...PICS, slow: { '/$batch': 5000 } }, init: { tab: 'inv' }, photos: true, wait: 'sales',
-    async run({ t, w, c }) {
+    async run({ t, w, c, today }) {
       // The page opens on Where it is: no row of Available to sell is drawn when the sources are in, and the sales
       // sheet's own lookup of every style's photo is under way.
       const end = Date.now() + 45000;
       while (!w.slowNow && Date.now() < end) await sleep(50);
-      // Only styles with something available, so every row shown is on the sales sheet (each one's photo in that lookup).
+      // Only styles with something available. The sales sheet holds only those on the ATS report with stock or In Trans
+      // (Saul, Nov 3), so the rows shown that it doesn't hold get a lookup of their own; never one again for its rows.
       const before = await t.eval(`(() => { const el = document.getElementById('fAvail'); el.checked = true; el.dispatchEvent(new Event('change', { bubbles: true }));
         return document.querySelector('#tabs .tab.on').dataset.tab; })()`);
       await t.click('#tabs .tab[data-tab="sell"]');
       await sleep(500);
-      const batches = w.calls.filter(x => x.path === '/$batch').length;
-      c('Available to sell shown (only styles with something available) while the photo lookup runs; no other lookup for its rows', before === 'inv' && w.slowNow === 1 && batches === 1, `${before}, ${w.slowNow} waiting, ${batches} batches`);
+      const on = new Set(sheetFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS }).rows.map(r => r.photoKey));
+      const keysOf = b => b.body.requests.map(r => (/\/thumb\/([A-Z0-9_-]+)\.jpg/.exec(r.url) || [])[1]);
+      const bs = w.calls.filter(x => x.path === '/$batch'), first = bs.length ? keysOf(bs[0]) : [], later = bs.slice(1).flatMap(keysOf);
+      c("Available to sell shown (only styles with something available) while the photo lookup runs; the sheet's rows looked up once, the others on their own",
+        before === 'inv' && w.slowNow >= 1 && bs.length >= 1 && first.length === on.size && first.every(k => on.has(k)) && later.every(k => k && !on.has(k)),
+        `${before}, ${w.slowNow} waiting, ${bs.length} batches · first ${first.join(',')} · later ${later.join(',')}`);
       await t.waitFor(PICS_DRAWN, 'the photos on the rows', 30000);
       const p = await sa(t);
       c('every row in view has its photo, or "no photo"', p.pics.length > 5 && p.pics.every(x => x.img || (x.none && x.text === 'no photo')) && p.pics.some(x => x.img), JSON.stringify(p.pics.map(x => `${x.style}:${x.img ? 'img' : x.text}`)));
@@ -3058,10 +3113,10 @@ const SCENARIOS = [
   },
   {
     name: 'sales-chunks', title: 'the sales sheet on 2,400 styles with photos: uploaded in 10 × 320 KiB parts, every byte arrives',
-    world: { ...BIG, ats: { age: 1, file: 'ats-big.xlsx' }, cfg: { photos: PHOTO_LOC }, photos: k => { const m = /^ST(\d{4})$/.exec(k); return m && +m[1] % 4 === 0 ? `photo-${(+m[1] / 4) % 4 + 1}.jpg` : null; } },
+    world: { ...BIG, ats: { age: 1, file: 'ats-big-all.xlsx' }, cfg: { photos: PHOTO_LOC }, photos: k => { const m = /^ST(\d{4})$/.exec(k); return m && +m[1] % 4 === 0 ? `photo-${(+m[1] / 4) % 4 + 1}.jpg` : null; } },
     init: { scp: SAVE_SCP }, photos: true, saves: true, readyMs: 150000,
     async run({ t, w, c, today }) {
-      const want = sheetFor(w.fx, today, { ...BIG_FILES, ats: { age: 1, file: 'ats-big.xlsx' } }), pics = want ? want.rows.filter(r => photoFile(w, r.photoKey)).length : 0;
+      const want = sheetFor(w.fx, today, { ...BIG_FILES, ats: { age: 1, file: 'ats-big-all.xlsx' } }), pics = want ? want.rows.filter(r => photoFile(w, r.photoKey)).length : 0;
       c('the sheet worked out here has many rows and photos', !!want && want.rows.length > 1000 && pics > 150, JSON.stringify(want && want.counts));
       await t.waitFor(chipIs('ok'), 'the sales sheet to be saved', 60000);
       const { got } = await savedChecks(c, t, w, want, { pics, parts: 2 });
@@ -3101,7 +3156,8 @@ const SCENARIOS = [
       c('nothing asked of the sales library, no email', !w.calls.some(x => x.path.includes(SALES_DRV)) && !sendMails(w.calls).length);
       c('photos still on the rows (read access)', p.pics.filter(x => x.img).length === p.pics.filter(x => SELL_PICS[x.style]).length && p.pics.some(x => x.img), JSON.stringify(p.pics.map(x => `${x.style}:${x.img ? 'img' : x.text}`)));
       c('the Problems line is there too', p.iss.some(x => x.code === 'no-photo'), JSON.stringify(p.iss));
-      c('the Download button "Sales sheet" is on Available to sell, ready', p.dl.shown && !p.dl.disabled && /^Download Sales Test\.xlsx/.test(p.dl.title), JSON.stringify(p.dl));
+      c('the Download buttons "Sales sheet" and "Pull from China sheet" are on Available to sell, ready', p.dl.shown && !p.dl.disabled && !p.dl.chinaDisabled && p.dl.chinaText === 'Pull from China sheet' &&
+        /^Available to sell: on hand and in transit, by the ATS report/.test(p.dl.title) && /\nPull from China: our goods in China not sold yet/.test(p.dl.title), JSON.stringify(p.dl));
       // Clicked: progress and Cancel show at once; the file is handed over to save.
       const first = await t.eval(`(() => { document.getElementById('btnSalesDl').click(); return { msg: document.getElementById('salesDlMsg').textContent, cancel: !document.getElementById('btnSalesDlX').hidden, disabled: document.getElementById('btnSalesDl').disabled }; })()`);
       c('while it is made: progress, Cancel, the button off', !!first.msg && first.cancel && first.disabled, JSON.stringify(first));
@@ -3114,13 +3170,23 @@ const SCENARIOS = [
         JSON.stringify({ name: p.saved[0].name, tabs: got.tabs, tabRows: got.tabRows, rows: got.rows, dateRows: got.dateRows }));
       c(`it has ${pics} pictures`, got.images === pics && got.media === pics, `${got.images} images, ${got.media} media`);
       c('none of the names, numbers or words that stay inside are in it', !got.found.length && got.creator === 'Shalam Tool', got.found.slice(0, 8).join('; ') || got.creator);
-      c('the toast says what it holds; the button is back', p.toast === `Sales sheet downloaded: ${want.rows.length} styles, ${pics} photos.` && !p.dl.disabled && !p.dl.cancel && !p.dl.msg, JSON.stringify({ toast: p.toast, dl: p.dl }));
+      c('the toast says what it holds; the button is back', p.toast === `Available to sell downloaded: ${want.rows.length} styles, ${pics} photos.` && !p.dl.disabled && !p.dl.cancel && !p.dl.msg, JSON.stringify({ toast: p.toast, dl: p.dl }));
+      // The Pull from China sheet: its own file, named so as config.js names none here.
+      const china = chinaFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS });
+      await t.eval(`document.getElementById('btnChinaDl').click()`);
+      await t.waitFor('window.__headless.saved.length === 2', 'the Pull from China download', 30000);
+      p = await sa(t);
+      const cgot = await openSheet(Buffer.from(await t.eval('window.__headless.savedFile(1)'), 'base64'), MARKS_SELL, 'china');
+      c(`the downloaded Pull from China.xlsx opens: tabs ${tabsFor(china).join(', ')}, ${china.rows.length} rows`, china.rows.length > 0 && p.saved[1].name === 'Pull from China.xlsx' &&
+        JSON.stringify(cgot.tabs) === JSON.stringify(tabsFor(china)) && cgot.tabRows.join() === tabRowsFor(china).join() && cgot.title === 'M1S · Pull from China' && cgot.styles.join() === china.rows.map(r => r.style).join() &&
+        !cgot.found.length && cgot.creator === 'Shalam Tool', JSON.stringify({ name: p.saved[1].name, tabs: cgot.tabs, tabRows: cgot.tabRows, title: cgot.title, found: cgot.found.slice(0, 5) }));
+      c('its toast', p.toast === `Pull from China downloaded: ${china.rows.length} row${china.rows.length === 1 ? '' : 's'}, ${cgot.images} photo${cgot.images === 1 ? '' : 's'}.`, p.toast);
       // Cancel while it's made: nothing handed over.
       await t.eval(`(() => { document.getElementById('btnSalesDl').click(); document.getElementById('btnSalesDlX').click(); })()`);
       await t.waitFor(`/download cancelled/.test(document.getElementById('toast').textContent)`, 'the cancel', 15000);
       await sleep(300);
       p = await sa(t);
-      c('Cancel stops it: no second file, the button back', p.saved.length === 1 && !p.dl.disabled && !p.dl.cancel, JSON.stringify({ saved: p.saved.length, dl: p.dl }));
+      c('Cancel stops it: no third file, the button back', p.saved.length === 2 && !p.dl.disabled && !p.dl.cancel, JSON.stringify({ saved: p.saved.length, dl: p.dl }));
       t.shots.push(await t.shot('sales-noscope'));
     },
   },
@@ -3877,7 +3943,7 @@ async function main() {
             wnet.filter(x => !workerOk(ORIGIN)(x)).map(x => `${x.method} ${x.url}`).join('; ') || 'no worker requests seen');
         }
         // The sales sheet is saved only with the saving permission in the token, and only in the scenarios that expect it.
-        const sessions = calls.filter(x => x.method === 'POST' && x.path === SESSION_PATH);
+        const sessions = calls.filter(x => x.method === 'POST' && (x.path === SESSION_PATH || x.path === CHINA_SESSION));
         c(s.saves ? 'the sales sheet\'s upload session was asked for' : 'no upload session, no PUT (nothing saved in this scenario)',
           s.saves ? sessions.length > 0 : !sessions.length && !w.sales.puts.length, `${sessions.length} sessions, ${w.sales.puts.length} PUTs`);
         c('every batch held only GETs with no body, at most 20', calls.filter(x => x.path === '/$batch').every(x => batchOfGets(x.body)),

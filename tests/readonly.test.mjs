@@ -71,11 +71,11 @@ test('the methods the page names: the email, the sales sheet\'s upload session, 
   }
   assert.ok(lines.some(([, l]) => /g\('\/me\/sendMail', \{ method: 'POST'/.test(l)), 'the error email');
   assert.equal((app.match(/conflictBehavior/g) || []).length, 1, 'one upload session');
-  assert.match(fnText('uploadSession'), /const path = sessionPath\(\);/);
+  assert.match(fnText('uploadSession'), /const path = \[salesFileName\(\), chinaFileName\(\)\]\.includes\(file\) \? sessionPath\(file\) : '';/);
 });
 
 // The guard, run in a sandbox on request shapes. state: what salesDrive() and uploadSession() would have set.
-function guard(state = {}, cfg = { salesFile: 'Sales Test.xlsx' }) {
+function guard(state = {}, cfg = { salesFile: 'Sales Test.xlsx', chinaFile: 'China Test.xlsx' }) {
   const ctx = vm.createContext({ CFG: cfg, GRAPH, URL });
   vm.runInContext(app.split('\n').find(l => /^  const encPath = /.test(l)), ctx);
   vm.runInContext(slice('  // ---------- what may leave the page ----------', "  // The sales sheet's library (config.js salesLibrary"), ctx);
@@ -114,7 +114,7 @@ test('the guard: any GET, the email, a batch of GETs; everything else refused', 
   refused(ok('PUT', 'https://contoso.sharepoint.com/upload', {}, false));
 });
 
-test('the guard: the one upload session for the sales sheet in its library, and PUTs only to the address it returned', () => {
+test('the guard: the upload sessions for the two sales sheets in their library, and PUTs only to the address it returned', () => {
   const UP = 'https://contoso.sharepoint.com/sites/Reports/_api/v2.0/drives/b!sales/items/up/uploadSession?guid=abc&tempauth=xyz';
   const ok = guard({ drive: 'b!sales', upload: UP });
   const SESSION = '/drives/b!sales/root:/Sales%20Test.xlsx:/createUploadSession';
@@ -123,6 +123,10 @@ test('the guard: the one upload session for the sales sheet in its library, and 
   refused(ok('POST', SESSION, { body: '{}' }, false));                                       // not without the sign-in token
   refused(ok('POST', '/drives/b!other/root:/Sales%20Test.xlsx:/createUploadSession', {}));   // another library
   refused(ok('POST', '/drives/b!sales/root:/Other.xlsx:/createUploadSession', {}));          // another file
+  // The Pull from China sheet (chinaFile, Saul, Nov 3): its own exact name, in the same library only.
+  assert.equal(ok('POST', '/drives/b!sales/root:/China%20Test.xlsx:/createUploadSession', { body: '{}' }), '');
+  refused(ok('POST', '/drives/b!other/root:/China%20Test.xlsx:/createUploadSession', {}));
+  refused(ok('POST', '/drives/b!sales/root:/China Test.xlsx:/createUploadSession', {}));
   refused(ok('POST', '/drives/b!sales/root:/Sales Test.xlsx:/createUploadSession', {}));     // the name not as encoded
   refused(ok('POST', '/drives/b!sales/root:/Folder/Sales%20Test.xlsx:/createUploadSession', {}));
   refused(ok('POST', SESSION + '?x=1', {}));
@@ -144,8 +148,10 @@ test('the guard: the one upload session for the sales sheet in its library, and 
   for (const u of ['https://contoso.example/upload', 'http://contoso.sharepoint.com/upload', 'https://contoso.sharepoint.com.example/upload', 'not a url']) {
     refused(guard({ drive: 'b!sales', upload: u })('PUT', u, {}, false));
   }
-  // A blank salesFile: no session at all.
+  // A blank salesFile or chinaFile: no session for it at all.
   refused(guard({ drive: 'b!sales' }, { salesFile: '  ' })('POST', '/drives/b!sales/root::/createUploadSession', {}));
+  refused(guard({ drive: 'b!sales' }, { salesFile: 'Sales Test.xlsx', chinaFile: '' })('POST', '/drives/b!sales/root::/createUploadSession', {}));
+  refused(guard({ drive: 'b!sales' }, { salesFile: 'Sales Test.xlsx' })('POST', '/drives/b!sales/root:/China%20Test.xlsx:/createUploadSession', {}));
 });
 
 test('only salesDrive() and uploadSession() set what the guard allows, and the upload address must be on SharePoint', () => {
@@ -227,6 +233,7 @@ test('config.js holds the sign-in, every source location, the sales sheet\'s lib
   assert.equal(c.salesLibrary, '/sites/Reports/Shalam Sales tool');
   assert.match(c.salesLibrary, /^\/sites\/[^/]+\/[^/]+$/);
   assert.equal(c.salesFile, 'Available to sell.xlsx');
+  assert.equal(c.chinaFile, 'Pull from China.xlsx');
   assert.match(c.salesFile, /^[^/\\:*?"<>|]+\.xlsx$/);
   assert.equal(c.photos, '/sites/Production/Shared Documents/Quote Sheets/Quote Images');
   assert.match(c.errorEmailTo, /^[^@\s]+@[^@\s]+\.[^@\s]+$/);

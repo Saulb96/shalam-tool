@@ -110,6 +110,14 @@
   // Cases a buyer can have: whole cases only (a part case is never offered as a case); the rest are loose units.
   const casesOf = (units, master) => (isDay(master) && master > 0 ? Math.max(0, Math.floor(units / master + 1e-9)) : null);
   const looseOf = (units, master) => { const c = casesOf(units, master); return c == null ? 0 : Math.max(0, units - c * master); };
+  // An allocation's Inner pack, only with its Master (the two from the same line), else null.
+  const innerOf = a => (isDay(a.master) && a.master > 0 && isDay(a.inner) && a.inner > 0 ? a.inner : null);
+  // A style's packs, Master and Inner as a pair ({ master, inner: a number or null }), each pair once, by Master then Inner.
+  const packsOf = list => {
+    const m = new Map();
+    for (const p of list) if (p && isDay(p.master) && p.master > 0) m.set(p.master + '/' + (p.inner ?? ''), { master: p.master, inner: isDay(p.inner) ? p.inner : null });
+    return [...m.values()].sort((a, b) => a.master - b.master || (a.inner ?? 0) - (b.inner ?? 0));
+  };
   // A source date more than a year ahead, or before 2015 (core/ct.js's "date-far" rule), isn't used as the ready date.
   const FLOOR = C.ymd(2015, 1, 1);
   const farDay = (d, today) => isDay(today) && (d > today + 366 || d < FLOOR);
@@ -197,7 +205,7 @@
 
     // ---------- lots, sold and unmatched units, from the allocations
     const lots = [], soldBy = new Map(), soldCasesBy = new Map(), soldNoPackBy = new Map(), unmatchedBy = new Map();
-    const latestMaster = new Map();   // style -> { row, master } of its latest Master Sheet line with a Master
+    const latestMaster = new Map();   // style -> { row, master, inner } of its latest Master Sheet line with a Master
     const knownStyles = new Set();    // every style on any Master Sheet Live or Container Tracking line
     // For placing the ERP's In Trans beyond our sailed goods: our Landed goods (not sold: { po, units, day, dayFrom }),
     // the PO bases Container Tracking shows sailed or landed, and sold units still in China before they're loaded (the
@@ -210,7 +218,7 @@
       knownStyles.add(a.style);
       if (a.sheetRow != null && isDay(a.master) && a.master > 0) {
         const p = latestMaster.get(a.style);
-        if (!p || a.sheetRow > p.row) latestMaster.set(a.style, { row: a.sheetRow, master: a.master });
+        if (!p || a.sheetRow > p.row) latestMaster.set(a.style, { row: a.sheetRow, master: a.master, inner: innerOf(a) });
       }
       // Container Tracking's own stage when the allocation has one (a line with no Container Tracking units has '').
       if (a.units > 0 && CT_GONE.includes(a.ctStage || a.stage) && base6(a.po)) (goneBasesBy.get(a.style) || goneBasesBy.set(a.style, new Set()).get(a.style)).add(base6(a.po));
@@ -238,7 +246,7 @@
         id: a.id, allocId: a.id, style: a.style, styleRaw: a.styleRaw, upc: a.upc || null, po: a.po, poShown: a.poShown || '',
         status: STATUS[a.bucket], bucket: a.bucket, source: 'ours', inChina, units: a.units,
         matched: 0, received: 0, inErpTransit: 0, erpTier: null, notOnErp: 0, taken: 0, available: a.units,
-        master: isDay(a.master) && a.master > 0 ? a.master : null, cases: null,
+        master: isDay(a.master) && a.master > 0 ? a.master : null, inner: innerOf(a), cases: null,
         readyDate: r.readyDate, readyFrom: r.readyFrom, readySources: r.sources, readySpread: r.spread,
         dates: Object.assign({ ctReady: null, ctRow: null, poBook: null, factoryCrd: null, crdExpected: null, shipBy: null, orderDate: null, original: null },
           dates || {}, { orderDate }),
@@ -608,7 +616,10 @@
       const casePack = masters.length > 1 ? 'mixed' : masters.length ? masters[0] : lm ? lm.master : null;
       if (masters.length > 1) flags.push('mixed-case-pack');
       const stockPack = isDay(casePack) ? casePack : lm ? lm.master : null;
-      for (const l of x.erpLots) l.master = stockPack;
+      // Master/Inner (the sales sheets, Saul, Nov 3): every pair on our lots, else the latest Master Sheet line's.
+      const packs = packsOf(ours.length && masters.length ? ours : lm ? [lm] : []);
+      const stockPair = packs.find(p => p.master === stockPack) || null;
+      for (const l of x.erpLots) { l.master = stockPack; l.inner = stockPair ? stockPair.inner : null; }
 
       const sum = (pred, f) => ls.filter(pred).reduce((s, l) => s + f(l), 0);
       const fromChina = sum(l => l.inChina, l => l.available), arriving = sum(l => !l.inChina, l => l.available);
@@ -642,7 +653,12 @@
         // The ATS report's own category and sub category (the sales sheet's tabs: Saul, Nov 3), '' when it has none.
         atsCategory: (e && e.category) || '', atsSub: (e && e.category && e.sub) || '',
         factory: (st && st.factory) || '', factories: st ? st.factories.slice() : [],
-        upcs, casePack, onReport: atsOk ? !!e : null,
+        upcs, casePack, packs, onReport: atsOk ? !!e : null,
+        // The ATS report's own figures, as it has them (the sales sheet goes by them: Saul, Nov 3): its "ATS from in WH"
+        // (null when it has none, or it can't be read), and its In Trans shipments ({ units, eta }, each quantity with its
+        // ETA; null when its In Trans isn't known for the style).
+        erpAts: e && isDay(e.erpAts) ? e.erpAts : null,
+        erpTransit: x.mode === 'erp' ? x.erpLots.map(l => ({ units: l.units, eta: l.eta })) : null,
         // orders: the ERP's Total Customer Orders as they are; ordersShipChina of them ship from China with goods sold
         // there (not loaded yet: soldNotLoaded, never on a style ending in -F), so ordersOffStock come off the stock:
         // stockNet = inWh − ordersOffStock.

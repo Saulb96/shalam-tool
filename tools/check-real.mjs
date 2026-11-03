@@ -549,71 +549,87 @@ if (!sellWithAts) {
   if (salesOut) fails('the sample sales sheet was not written: there is no sheet without the ATS report');
 } else await salesReport(sellWithAts, R);
 
-// The sheet's counts and sums against Available to sell, the fields each row holds, and no name that stays inside as a
-// value in it; with --sales-out, the file written without photos and read back. Numbers only.
+// The sales sheets' counts and sums worked out again from the ATS report on its own (Saul, Nov 3: its numbers are the
+// gold standard), the fields each row holds, and no name that stays inside as a value in them; with --sales-out, both
+// files written without photos and read back. Numbers only.
 async function salesReport(S, R) {
   const SS = core('salesSheet');
-  let sheet;
-  try { sheet = SS.salesRows(S, { today }); } catch (e) { fails(`the sales sheet stopped: ${e.message}`); return; }
+  let sheet, china;
+  try { sheet = SS.salesRows(S, { today }); china = SS.chinaRows(S, { today }); } catch (e) { fails(`the sales sheets stopped: ${e.message}`); return; }
   if (!sheet.ok) { fails(`no sales sheet: ${sheet.reason}`); return; }
+  if (!china.ok) { fails(`no Pull from China sheet: ${china.reason}`); return; }
   const k = sheet.counts, rows = sheet.rows, sum = (a, f) => a.reduce((p, x) => p + (f(x) || 0), 0);
-  console.log(`  styles on the sheet ${n(k.styles)} · left off (nothing available) ${n(k.leftOff)} · by-date rows ${n(k.byDateRows)} · no case pack ${n(k.noCasePack)} · mixed case pack ${n(k.mixedCasePack)}`);
-  sumLine('styles in Available to sell', S.styles.length, [['on the sheet', k.styles], ['left off', k.leftOff]]);
-  for (const [f, label] of [['now', 'Available now'], ['fromChina', 'Available from China'], ['arriving', 'Arriving'], ['total', 'Total available']]) {
-    const a = sum(rows, r => r[f]), b = S.totals[f];
-    console.log(`  ${label.padEnd(22)} ${n(a).padStart(12)} units on the sheet · ${n(b).padStart(12)} in Available to sell   same: ${a === b ? 'yes' : 'NO'}`);
-    if (a !== b) fails(`the sales sheet's ${label} (${n(a)}) isn't Available to sell's (${n(b)})`);
+  console.log(`  Available to sell: styles ${n(k.styles)} · left off (nothing available) ${n(k.leftOff)} · not on the ATS report ${n(k.notOnReport)} · no ATS figure ${n(k.stockUnknown)} · In Trans not readable ${n(k.transitUnknown)} · by-date rows ${n(k.byDateRows)} · no Master/Inner ${n(k.noPack)}`);
+  // The ATS report on its own: on hand = its ATS from in WH above 0; in transit = its In Trans less what's oversold.
+  let wantOn = 0, wantTr = 0;
+  for (const e of atsR.styles.values()) {
+    const ats = typeof e.erpAts === 'number' ? e.erpAts : typeof e.inWh === 'number' && typeof e.orders === 'number' ? e.inWh - e.orders : null;
+    if (ats == null) continue;
+    wantOn += Math.max(0, ats);
+    const bad = e.rows.some(x => (x.inTransBad || []).length || (x.inTransList || []).some(v => !(v >= 0)));
+    const it = bad ? 0 : e.rows.reduce((p, x) => p + (x.inTransList || []).reduce((q, v) => q + v, 0), 0);
+    wantTr += Math.max(0, it - Math.max(0, -ats));
   }
-  const byWhere = {};
-  for (const r of sheet.byDate) byWhere[r.where] = (byWhere[r.where] || 0) + r.units;
-  const schedOk = sum(rows, r => r.total) === sum(sheet.byDate, r => r.units);
-  console.log(`  by date: ${Object.entries(byWhere).map(([w, u]) => `${w} ${n(u)}`).join(' · ')} = ${n(sum(sheet.byDate, r => r.units))} units, the sheet's total: ${schedOk ? 'yes' : 'NO'}` +
-    ` · no date yet ${n(sheet.byDate.filter(r => r.when == null).length)} rows · estimates ${n(sheet.byDate.filter(r => r.estimate).length)} rows`);
-  if (!schedOk) fails("the sales sheet's schedule doesn't add up to its total");
-  const cases = f => rows.filter(r => r[f] != null).length;
-  console.log(`  rows with cases: now ${n(cases('nowCases'))} · from China ${n(cases('fromChinaCases'))} · arriving ${n(cases('arrivingCases'))} · total ${n(cases('totalCases'))} (blank, never guessed, where the case pack is unknown or mixed)`);
-  console.log(`  first date from China: now ${n(rows.filter(r => r.firstFromChina.now).length)} · about (an estimate) ${n(rows.filter(r => r.firstFromChina.estimate).length)} · a date ${n(rows.filter(r => r.firstFromChina.date != null && !r.firstFromChina.now && !r.firstFromChina.estimate).length)}`);
-  // Only the fields the sheet may hold, on every row.
-  const KEYS = 'style,upc,desc,category,sub,casePack,now,nowCases,fromChina,fromChinaCases,firstFromChina,arriving,arrivingCases,firstArrival,total,totalCases,photoKey';
-  const odd = rows.filter(r => Object.keys(r).join() !== KEYS).length + sheet.byDate.filter(r => Object.keys(r).join() !== 'style,desc,category,when,estimate,where,units,cases').length;
-  console.log(`  every row holds only the sheet's fields: ${odd ? 'NO' : 'yes'}`);
-  if (odd) fails(`${n(odd)} rows of the sales sheet hold other fields`);
-  // A tab per category (Saul, Nov 3): every style on exactly one, as Available to sell has them.
-  const tabs = SS.categoryTabs(rows), onTabs = tabs.flatMap(t => t.rows);
-  const tabsOk = onTabs.length === rows.length && new Set(onTabs).size === rows.length && tabs.every(t => t.rows.every(i => C.S(rows[i].category) === t.category));
-  console.log(`  category tabs ${n(tabs.length)} (${n(tabs.filter(t => !t.category).length)} for no category), ${n(onTabs.length)} styles on them, each on its category's tab once: ${tabsOk ? 'yes' : 'NO'}` +
-    ` · with a sub category ${n(rows.filter(r => C.S(r.sub)).length)} of ${n(rows.length)}`);
-  if (!tabsOk) fails("the sales sheet's category tabs don't hold every style once");
+  for (const [got, want, label] of [[sum(rows, r => r.onHand), wantOn, 'Available on hand'], [sum(rows, r => r.inTransit), wantTr, 'Available in transit']]) {
+    console.log(`  ${label.padEnd(22)} ${n(got).padStart(12)} units on the sheet · ${n(want).padStart(12)} from the ATS report on its own   same: ${got === want ? 'yes' : 'NO'}`);
+    if (got !== want) fails(`the sales sheet's ${label} (${n(got)}) isn't the ATS report's (${n(want)})`);
+  }
+  const sched = sum(sheet.byDate, r => r.units), schedOk = sum(rows, r => r.total) === sched && sum(rows, r => r.total) === sum(rows, r => r.onHand + r.inTransit);
+  console.log(`  total ${n(sum(rows, r => r.total))} = on hand + in transit = by date ${n(sched)}: ${schedOk ? 'yes' : 'NO'} · in transit available now ${n(sum(sheet.byDate.filter(r => r.where === 'In transit' && r.when === 'now'), r => r.units))} · no ETA ${n(sum(sheet.byDate.filter(r => r.when == null), r => r.units))} units`);
+  if (!schedOk) fails("the sales sheet's total isn't on hand + in transit, or its schedule doesn't add up to it");
+  console.log(`  Master/Inner: one pack ${n(rows.filter(r => r.pack && !r.pack.includes(' · ')).length)} · more than one ${n(rows.filter(r => r.pack.includes(' · ')).length)} · no Inner on one ${n(rows.filter(r => r.pack.includes('/–')).length)} · none ${n(rows.filter(r => !r.pack).length)}`);
+  const ck = china.counts, crow = china.rows;
+  console.log(`  Pull from China: rows ${n(ck.rows)} on ${n(ck.styles)} styles, ${n(china.totals.units)} units · taken by what's oversold ${n(ck.ordersOff)} · pull-from date passed (left off) ${n(ck.past)} · no date ${n(ck.noDate)} · styles with no ATS figure (left off) ${n(ck.stockUnknown)}`);
+  // Every unit of our lots in China (before orders) is on the sheet, taken by the oversold, or past its date.
+  const skip = new Set(S.styles.filter(s => s.onReport === true && typeof s.erpAts !== 'number' && !(typeof s.inWh === 'number' && typeof s.orders === 'number')).map(s => s.style));
+  const pre = sum(S.lots.filter(l => l.inChina && l.source !== 'erp' && !skip.has(l.style)), l => (l.available || 0) + (l.taken || 0));
+  const chinaOk = china.totals.units + ck.ordersOff + ck.past === pre && sum(crow, r => r.units) === china.totals.units && !crow.some(r => r.pullFrom != null && r.pullFrom < today);
+  console.log(`  our goods in China ${n(pre)} = on the sheet ${n(china.totals.units)} + taken by the oversold ${n(ck.ordersOff)} + past their date ${n(ck.past)}, no date before today: ${chinaOk ? 'yes' : 'NO'} · the engine's Available from China ${n(S.totals.fromChina)}`);
+  if (!chinaOk) fails("the Pull from China sheet doesn't add up to our goods in China");
+  console.log(`  pull-from dates: about (an estimate) ${n(crow.filter(r => r.estimate).length)} rows · no date ${n(crow.filter(r => r.pullFrom == null).length)} rows`);
+  // Only the fields the sheets may hold, on every row.
+  const odd = rows.filter(r => Object.keys(r).join() !== 'style,upc,desc,category,sub,pack,onHand,inTransit,transitFrom,total,photoKey').length +
+    sheet.byDate.filter(r => Object.keys(r).join() !== 'style,desc,category,when,where,units').length +
+    crow.filter(r => Object.keys(r).join() !== 'style,upc,desc,category,sub,pack,units,pullFrom,estimate,photoKey').length;
+  console.log(`  every row holds only the sheets' fields: ${odd ? 'NO' : 'yes'}`);
+  if (odd) fails(`${n(odd)} rows of the sales sheets hold other fields`);
+  // A tab per category (Saul, Nov 3): every row on exactly one.
+  const tabsFor = list => { const tabs = SS.categoryTabs(list), on = tabs.flatMap(t => t.rows); return { tabs, ok: on.length === list.length && new Set(on).size === list.length && tabs.every(t => t.rows.every(i => C.S(list[i].category) === t.category)) }; };
+  const T1 = tabsFor(rows), T2 = tabsFor(crow);
+  console.log(`  category tabs: Available to sell ${n(T1.tabs.length)} (${n(T1.tabs.filter(t => !t.category).length)} for no category), Pull from China ${n(T2.tabs.length)}; each row on its category's tab once: ${T1.ok && T2.ok ? 'yes' : 'NO'}`);
+  if (!T1.ok || !T2.ok) fails("the sales sheets' category tabs don't hold every row once");
   // Photos: the ERP report's picture first (the style's key, as its numbers match), Quote Images for the rest.
   if (erpPics) {
     const have = rows.filter(r => erpPics.pictures.has(C.normStyle(r.style))).length;
     console.log(`  styles on the sheet with a picture in the ERP report: ${n(have)} of ${n(rows.length)} (the other ${n(rows.length - have)} look in Quote Images)`);
   } else console.log('  no ERP report with pictures here: every photo would come from Quote Images');
-  // No name that stays inside is a whole value in it (factories, customers, POs, containers, sections, the ERP's warehouses).
+  // No name that stays inside is a whole value in them (factories, customers, POs, containers, sections, the ERP's warehouses).
   const inside = new Map();
   const put = (kind, v) => { const t = C.S(v).toLowerCase(); if (t.length > 1 && !inside.has(t)) inside.set(t, kind); };
   for (const a of R.allocs) { put('factory', a.factory); put('customer', a.customer); put('PO', a.po); put('PO', a.poShown); put('section', a.section); for (const x of [].concat(a.containers || [])) put('container', x); }
   for (const l of S.lots) { put('factory', l.factory); put('customer', l.customer); put('PO', l.po); put('ERP warehouse', l.warehouse); }
   if (atsR) for (const e of atsR.styles.values()) for (const w of e.warehouses || []) put('ERP warehouse', w);
-  const texts = [...rows.flatMap(r => [r.style, r.upc, r.desc, r.category, r.sub, ...r.upc.split(', ')]), ...sheet.byDate.flatMap(r => [r.style, r.desc, r.category, r.where])].map(v => C.S(v).toLowerCase());
+  const texts = [...rows, ...crow].flatMap(r => [r.style, r.upc, r.desc, r.category, r.sub, r.pack, ...r.upc.split(', ')])
+    .concat(sheet.byDate.flatMap(r => [r.style, r.desc, r.category, r.where])).map(v => C.S(v).toLowerCase());
   const hits = {};
   for (const t of texts) if (inside.has(t)) hits[inside.get(t)] = (hits[inside.get(t)] || 0) + 1;
-  console.log(`  no factory, customer, PO, container, section or ERP warehouse name is a value in it (${n(texts.length)} text values against ${n(inside.size)} names): ${Object.keys(hits).length ? 'NO' : 'yes'}`);
-  if (Object.keys(hits).length) fails(`the sales sheet holds names that stay inside: ${Object.entries(hits).map(([kd, c]) => `${kd} ${c}`).join(', ')}`);
-  if (!salesOut) { console.log('  (no --sales-out: no sample file written)'); return; }
-  // The sample, without photos, read back as Excel reads it: every tab, every row, no picture, made by Shalam Tool.
-  const t0 = performance.now();
-  const bytes = await SS.workbookBytes(SS.buildWorkbook(loadExcelJS(), sheet, null));
-  writeFileSync(salesOut, bytes);
-  const back = readBook(new Uint8Array(readFileSync(salesOut)), {});
-  const ws = back.Sheets[SS.TABS.sell], wd = back.Sheets[SS.TABS.byDate];
-  const nRows = ws && ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']).e.r + 1 : 0, nDates = wd && wd['!ref'] ? XLSX.utils.decode_range(wd['!ref']).e.r + 1 : 0;
-  const rowsOf = name => { const x = back.Sheets[name]; return x && x['!ref'] ? XLSX.utils.decode_range(x['!ref']).e.r + 1 : 0; };
-  const wantTabs = [SS.TABS.sell, ...tabs.map(t => t.name), SS.TABS.byDate];
-  const whole = JSON.stringify(back.SheetNames) === JSON.stringify(wantTabs) && nRows === rows.length + 2 && nDates === sheet.byDate.length + 1 &&
-    tabs.every(t => rowsOf(t.name) === t.rows.length + 2);
-  console.log(`  sample written without photos: ${salesOut} · ${n(bytes.length)} bytes in ${secs(t0)} · read back: ${n(back.SheetNames.length)} tabs (Available to sell, ${n(tabs.length)} categories, By date), ${n(nRows - 2)} style rows, ${n(nDates - 1)} by-date rows: ${whole ? 'yes' : 'NO'}`);
-  if (!whole) fails('the sample sales sheet did not read back whole');
+  console.log(`  no factory, customer, PO, container, section or ERP warehouse name is a value in them (${n(texts.length)} text values against ${n(inside.size)} names): ${Object.keys(hits).length ? 'NO' : 'yes'}`);
+  if (Object.keys(hits).length) fails(`the sales sheets hold names that stay inside: ${Object.entries(hits).map(([kd, c]) => `${kd} ${c}`).join(', ')}`);
+  if (!salesOut) { console.log('  (no --sales-out: no sample files written)'); return; }
+  // The samples, without photos, read back as Excel reads them: every tab and its rows. The Pull from China one goes
+  // next to the other, "(Pull from China)" added to its name.
+  for (const [sh, file, T] of [[sheet, salesOut, T1], [china, salesOut.replace(/\.xlsx$/i, ' (Pull from China).xlsx'), T2]]) {
+    const t0 = performance.now();
+    const bytes = await SS.workbookBytes(SS.buildWorkbook(loadExcelJS(), sh, null));
+    writeFileSync(file, bytes);
+    const back = readBook(new Uint8Array(readFileSync(file)), {});
+    const rowsOf = name => { const x = back.Sheets[name]; return x && x['!ref'] ? XLSX.utils.decode_range(x['!ref']).e.r + 1 : 0; };
+    const kind = SS.kindOf(sh), want = SS.tabsOf(sh);
+    const whole = JSON.stringify(back.SheetNames) === JSON.stringify(want) && rowsOf(kind.tab) === sh.rows.length + 2 &&
+      (!kind.byDate || rowsOf(SS.TABS.byDate) === sh.byDate.length + 1) && T.tabs.every(t => rowsOf(t.name) === t.rows.length + 2);
+    console.log(`  sample written without photos: ${file} · ${n(bytes.length)} bytes in ${secs(t0)} · read back: ${n(back.SheetNames.length)} tabs (${kind.tab}, ${n(T.tabs.length)} categories${kind.byDate ? ', By date' : ''}), ${n(rowsOf(kind.tab) - 2)} rows: ${whole ? 'yes' : 'NO'}`);
+    if (!whole) fails(`the sample ${kind.tab} sheet did not read back whole`);
+  }
 }
 
 // The checks the reconciliation can't make (a unit counted twice, or dropped, still adds up), worked out here from the

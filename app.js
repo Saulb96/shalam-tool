@@ -327,13 +327,14 @@
   // - any GET;
   // - POST /me/sendMail (the error email);
   // - POST /$batch when every request in it is a GET with no body (checked in the body about to be sent);
-  // - POST exactly /drives/<the sales library>/root:/<salesFile>:/createUploadSession, the library being the one
-  //   config.js's salesLibrary resolves to (salesDrive below), the file name exactly config.js's salesFile;
+  // - POST exactly /drives/<the sales library>/root:/<file>:/createUploadSession, the library being the one config.js's
+  //   salesLibrary resolves to (salesDrive below), the file name exactly config.js's salesFile or chinaFile;
   // - a PUT with no sign-in token, only to the upload address that session returned, on *.sharepoint.com.
   // Anything else is refused before it leaves the page. Only salesDrive() and uploadSession() set what the last two allow.
   const allowed = { salesDrive: '', upload: '' };
   const salesFileName = () => String(CFG.salesFile || '').trim();
-  const sessionPath = () => (allowed.salesDrive && salesFileName() ? `/drives/${allowed.salesDrive}/root:/${encPath(salesFileName())}:/createUploadSession` : '');
+  const chinaFileName = () => String(CFG.chinaFile || '').trim();
+  const sessionPath = file => (allowed.salesDrive && file ? `/drives/${allowed.salesDrive}/root:/${encPath(file)}:/createUploadSession` : '');
   const onSharePoint = u => { try { const x = new URL(u); return x.protocol === 'https:' && /^[a-z0-9-]+(\.[a-z0-9-]+)*\.sharepoint\.com$/i.test(x.hostname); } catch (e) { return false; } };
   // Why a request may not be sent ('' when it may). graph: through g(), which adds the sign-in token.
   function refusal(method, url, opt, graph) {
@@ -350,7 +351,7 @@
         if (reqs && reqs.length && reqs.every(x => x && typeof x === 'object' && String(x.method || '').toUpperCase() === 'GET' && x.body == null)) return '';
         return no("a batch with a request in it that isn't a GET");
       }
-      if (sessionPath() && path === sessionPath()) return '';
+      if ([salesFileName(), chinaFileName()].some(f => sessionPath(f) && path === sessionPath(f))) return '';
       return no(`a POST to ${path.split('?')[0]}`);
     }
     if (!graph && m === 'PUT') {
@@ -378,11 +379,11 @@
     }
     return allowed.salesDrive;
   }
-  // A new upload session for the sales sheet in that library, replacing the file: answers its upload address, the one
-  // place a PUT may then go (with no sign-in token: the address carries its own key).
-  async function uploadSession(signal) {
+  // A new upload session for a sales sheet's file (salesFile or chinaFile) in that library, replacing it: answers its
+  // upload address, the one place a PUT may then go (with no sign-in token: the address carries its own key).
+  async function uploadSession(signal, file) {
     allowed.upload = '';
-    const path = sessionPath();
+    const path = [salesFileName(), chinaFileName()].includes(file) ? sessionPath(file) : '';
     if (!path) throw new Error("The sales sheet's library or file name isn't known, so it can't be saved.");
     const j = await gj(path, { method: 'POST', signal, body: JSON.stringify({ item: { '@microsoft.graph.conflictBehavior': 'replace' } }) });
     const u = j && j.uploadUrl;
@@ -3702,10 +3703,11 @@
     return out;
   }
 
-  // ---------- the sales sheet (core/salesSheet.js): saved into Shalam Sales tool, and the Download button ----------
-  // What a salesperson may see of Available to sell, one Excel file with a photo per style (Saul, Nov 2). After a clean
-  // load (every source read without red, the ATS report no more than 8 days old) it is saved into the one library in
-  // config.js (salesLibrary), the only place the page writes, unless the file there already holds the same sheet.
+  // ---------- the sales sheets (core/salesSheet.js): saved into Shalam Sales tool, and the Download buttons ----------
+  // What a salesperson may see, two Excel files with a photo per row (Saul, Nov 2; two files, Nov 3): Available to sell
+  // (salesFile: the ATS report's on hand and in transit) and Pull from China (chinaFile). After a clean load (every
+  // source read without red, the ATS report no more than 8 days old) each is saved into the one library in config.js
+  // (salesLibrary), the only place the page writes, unless the file there already holds the same sheet.
   const SALES = { k: 'sales', name: 'Sales sheet', kind: 'sales' };
   const CHUNK = 10 * 320 * 1024;               // an upload session takes the file in parts, multiples of 320 KiB
   const SALES_MAX = 60 * 1024 * 1024;          // far beyond a real sheet (well under 10 MB): something went wrong
@@ -3724,23 +3726,32 @@
   }
   const savedFields = m => ({ file: m.name || salesFileName(), webUrl: m.webUrl || '', savedAt: m.lastModifiedDateTime || '', savedBy: who(m.lastModifiedBy) });
 
-  // The sheet as Available to sell stands (or why there's none), worked out once for each.
-  let sheetMemo = { sell: undefined, stages: undefined, sheet: null };
-  function salesSheetNow() {
+  // The two files (Saul, Nov 3): Available to sell (salesFile) and Pull from China (chinaFile), each with its own mark of
+  // its last save in this browser (store key).
+  const SHEETS = [
+    { kind: 'sales', label: 'Available to sell', file: salesFileName, mark: 'sales', make: 'salesRows' },
+    { kind: 'china', label: 'Pull from China', file: chinaFileName, mark: 'sales-china', make: 'chinaRows' },
+  ];
+  // A sheet as Available to sell stands (or why there's none), worked out once for each.
+  const sheetMemo = {};
+  function sheetNow(kind) {
+    const K = SHEETS.find(x => x.kind === kind);
     // core/salesSheet.js missing: boot() stops the page and says so; until then, no sheet.
-    if (!window.InvSalesSheet) return { ok: false, reason: "Part of the page (core/salesSheet.js) didn't load, so there's no sales sheet.", rows: [], byDate: [], counts: {} };
-    if (sheetMemo.sell !== sell || sheetMemo.stages !== stages || !sheetMemo.sheet) {
+    if (!window.InvSalesSheet) return { ok: false, kind, reason: "Part of the page (core/salesSheet.js) didn't load, so there's no sales sheet.", rows: [], byDate: [], counts: {} };
+    const m = sheetMemo[kind];
+    if (!m || m.sell !== sell || m.stages !== stages) {
       let sheet;
-      try { sheet = window.InvSalesSheet.salesRows(sell && !sellErr ? sell : { ok: false, notLoaded: (stages && stages.notLoaded) || [] }, { today: sellToday() }); }
-      catch (e) { console.error(e); sheet = { ok: false, reason: `The sales sheet couldn't be worked out (${(e && e.message) || e}): a bug in Shalam Tool, tell Saul.`, rows: [], byDate: [], counts: {} }; }
+      try { sheet = window.InvSalesSheet[K.make](sell && !sellErr ? sell : { ok: false, notLoaded: (stages && stages.notLoaded) || [] }, { today: sellToday() }); }
+      catch (e) { console.error(e); sheet = { ok: false, kind, reason: `The ${K.label} sheet couldn't be worked out (${(e && e.message) || e}): a bug in Shalam Tool, tell Saul.`, rows: [], byDate: [], counts: {} }; }
       // The page's own checks too (core/salesSheet.js sees only the selling engine's): the stage numbers or the rows of
       // Available to sell don't add up, the red banner says its numbers can't be trusted, so there's no sheet either.
       const bug = !sheet.ok ? '' : balanceBad() ? 'The stage numbers' : sellBalanceBad() ? 'Available to sell' : '';
-      if (bug) sheet = { ok: false, reason: `${bug} ${bug === 'The stage numbers' ? "don't" : "doesn't"} add up (a bug in Shalam Tool), so there's no sales sheet until it's fixed.`, asOf: sheet.asOf, reportDay: sheet.reportDay, rows: [], byDate: [], counts: {} };
-      sheetMemo = { sell, stages, sheet };
+      if (bug) sheet = { ok: false, kind, reason: `${bug} ${bug === 'The stage numbers' ? "don't" : "doesn't"} add up (a bug in Shalam Tool), so there's no sales sheet until it's fixed.`, asOf: sheet.asOf, reportDay: sheet.reportDay, rows: [], byDate: [], counts: {} };
+      sheetMemo[kind] = { sell, stages, sheet };
     }
-    return sheetMemo.sheet;
+    return sheetMemo[kind].sheet;
   }
+  const salesSheetNow = () => sheetNow('sales');
   // On Problems, under "Sales sheet": one line for the styles on it with no picture anywhere (once all of them were
   // looked up), one for photos that couldn't be read, the ERP report's pictures (a report whose pictures couldn't be
   // read, styles with different pictures on their rows, reports not looked in), and saving's own failure.
@@ -3801,8 +3812,8 @@
     const ctl = new AbortController(), signal = ctl.signal;
     salesCtl = ctl;
     const keep = 'The file in Shalam Sales tool keeps its last good copy.';
-    const off = !lib ? { state: 'off', label: 'not set', short: 'salesLibrary is blank in config.js', message: 'Saving the sales sheet is off: salesLibrary in config.js is blank. The Sales sheet button on Available to sell still downloads it.' }
-      : salesScopeMissing ? { state: 'off', label: 'saving off', short: "the Entra step isn't done", message: "Shalam Tool isn't allowed to save yet: the Entra step isn't done. The Sales sheet button on Available to sell still downloads it." }
+    const off = !lib ? { state: 'off', label: 'not set', short: 'salesLibrary is blank in config.js', message: 'Saving the sales sheet is off: salesLibrary in config.js is blank. The Sales sheet and Pull from China sheet buttons on Available to sell still download them.' }
+      : salesScopeMissing ? { state: 'off', label: 'saving off', short: "the Entra step isn't done", message: "Shalam Tool isn't allowed to save yet: the Entra step isn't done. The Sales sheet and Pull from China sheet buttons on Available to sell still download them." }
         : null;
     if (off) setSales(off);
     try {
@@ -3817,7 +3828,9 @@
       if (sheet.ok && photoOn()) {
         if (!off) setSales({ state: 'load', label: 'checking…', short: 'its photos', busy: true }, 'chip');
         try {
-          await lookupPhotos(sheet.rows.filter(r => !erpIn(pics, r)).map(r => r.photoKey), { fresh: true, signal });
+          // The Pull from China sheet's too when it's saved (chinaFile set); its Download button looks up its own.
+          const china = chinaFileName() ? sheetNow('china') : null, rows = [...sheet.rows, ...(china && china.ok ? china.rows : [])];
+          await lookupPhotos([...new Set(rows.filter(r => !erpIn(pics, r)).map(r => r.photoKey))], { fresh: true, signal });
           photosChecked = sheet;
         } catch (e) { if (cycleError(e)) throw e; photoFailed(e); }
         finally { photosRedraw(); }
@@ -3842,14 +3855,23 @@
         salesRed({ short: why, message: `Not saved: ${why}. ${keep}`, can: 'anyway', mailProblem: "photos can't be read", why: 'photos' });
         return;
       }
-      await saveSheet(sheet, signal, pics);
+      // Both files, one after the other (Pull from China only when chinaFile is set and it has rows), then one status.
+      const done = [], notes = [];
+      for (const K of SHEETS) {
+        if (!K.file()) continue;
+        const sh = K.kind === 'sales' ? sheet : sheetNow(K.kind);
+        if (!sh.ok) throw problem("can't make the file", `The ${K.label} sheet wasn't saved: ${sh.reason}`);
+        if (!sh.rows.length) { notes.push(`${K.label} has nothing on it, so the file there keeps its last copy`); continue; }
+        done.push(await saveSheet(sh, signal, pics, K));
+      }
+      salesSaved(done, notes);
     } catch (e) { salesFailed(e, keep); }
     finally { if (salesCtl === ctl) salesCtl = null; }
   }
 
   // This browser's mark of its last save, or of the last file it found already up to date: the file's eTag, and the
   // fingerprint of what it holds.
-  const salesMark = () => { try { const j = JSON.parse(store.get('sales') || 'null'); return j && typeof j === 'object' ? j : null; } catch (e) { return null; } };
+  const salesMark = key => { try { const j = JSON.parse(store.get(key) || 'null'); return j && typeof j === 'object' ? j : null; } catch (e) { return null; } };
   // A fingerprint of what the file holds: its dates, rows and schedule, the ERP report its pictures come from (its id and
   // eTag), and each style's picture by where it comes from: the ERP report's (a hash of its bytes in the report: the same
   // in every browser) or Quote Images' (its size there, so a replaced photo is saved again). A new picture report, or a style's
@@ -3862,13 +3884,13 @@
     return p && p.has === true ? ['quote', p.size ?? null] : null;
   });
   async function sheetPrint(sheet, pics) {
-    const text = JSON.stringify({ asOf: sheet.asOf, reportDay: sheet.reportDay, rows: sheet.rows, byDate: sheet.byDate,
+    const text = JSON.stringify({ kind: sheet.kind || 'sales', asOf: sheet.asOf, reportDay: sheet.reportDay, rows: sheet.rows, byDate: sheet.byDate,
       pictures: pics ? `${pics.itemId}|${pics.eTag}` : '', photos: salesPics(sheet, pics) });
     return window.crypto && crypto.subtle ? sha256Hex(text) : hash(text);
   }
   // The file in the library, with its download link (used at once, never kept), or null when it isn't there yet.
-  async function salesFileMeta(drive, signal) {
-    try { return await gj(`/drives/${drive}/root:/${encPath(salesFileName())}`, { signal }); }
+  async function salesFileMeta(drive, file, signal) {
+    try { return await gj(`/drives/${drive}/root:/${encPath(file)}`, { signal }); }
     catch (e) { if (e.status === 404) return null; throw e; }
   }
   // What a file in the library holds, read from it: the fingerprint written in it ('' when it has none, or can't be
@@ -3881,34 +3903,34 @@
       return { fp: String(props.Keywords || '').trim(), pics };
     } catch (e) { if (cycleError(e)) throw e; console.error(e); return { fp: '', pics: 0 }; }
   }
-  async function saveSheet(sheet, signal, pics) {
-    const file = salesFileName(), where = `${String(CFG.salesLibrary).trim()}|${file}`;
+  // One file saved (K: its entry in SHEETS), unless the file there already holds the same sheet. Answers { K, meta (the
+  // file as SharePoint has it now), upToDate, rows, pics, mb, made }; salesSaved() says how both went.
+  async function saveSheet(sheet, signal, pics, K) {
+    const file = K.file(), where = `${String(CFG.salesLibrary).trim()}|${file}`;
     // busy: Cancel on the chip, until the file in the library is replaced.
-    const say = (label, short, busy = true) => setSales({ state: 'load', label, short, busy }, 'chip');
+    const say = (label, short, busy = true) => setSales({ state: 'load', label, short: K.kind === 'sales' ? short : `${K.label}: ${short}`, busy }, 'chip');
     say('checking…', 'the file in Shalam Sales tool');
     const drive = await salesDrive(signal);
     if (!drive) throw problem("can't read the location", 'salesLibrary in config.js is blank.');
     // Nothing changed: the file in the library already holds this sheet (the same data and photos), whoever saved it.
     // The file this browser saved (or found up to date) last is known by its eTag; any other, saved from another browser
     // or changed by SharePoint since, is read once for the fingerprint written in it.
-    const fp = await sheetPrint(sheet, pics), meta = await salesFileMeta(drive, signal);
+    const fp = await sheetPrint(sheet, pics), meta = await salesFileMeta(drive, file, signal);
     if (meta && meta.eTag) {
-      const kept = salesMark(), mine = !!kept && kept.where === where && kept.eTag === meta.eTag;
+      const kept = salesMark(K.mark), mine = !!kept && kept.where === where && kept.eTag === meta.eTag;
       let holds = mine ? { fp: kept.fp, pics: kept.pics || 0 } : null;
       if (!mine && meta['@microsoft.graph.downloadUrl']) { say('checking…', 'what the file in Shalam Sales tool holds'); holds = await fileHolds(meta, signal); }
       if (holds && holds.fp === fp) {
-        if (!mine) store.set('sales', JSON.stringify({ where, eTag: meta.eTag, fp, at: meta.lastModifiedDateTime || '', pics: holds.pics }));
-        setSales({ ...savedFields(meta), state: 'ok', label: 'up to date', short: `saved ${fmtSaved(meta.lastModifiedDateTime)}`, styles: sheet.rows.length, pics: holds.pics,
-          message: `Up to date: nothing in it has changed since it was saved ${fmtLong(meta.lastModifiedDateTime)}.` });
-        return;
+        if (!mine) store.set(K.mark, JSON.stringify({ where, eTag: meta.eTag, fp, at: meta.lastModifiedDateTime || '', pics: holds.pics }));
+        return { K, meta, upToDate: true, rows: sheet.rows.length, pics: holds.pics };
       }
     }
     say('saving…', 'making the file');
     const made = await buildSalesFile(sheet, signal, msg => say('saving…', msg), pics);
     const bad = salesFileWrong(made.bytes, sheet);
-    if (bad) throw problem("can't make the file", `The sales sheet wasn't saved: ${bad}.`);
+    if (bad) throw problem("can't make the file", `The ${K.label} sheet wasn't saved: ${bad}.`);
     // Into the library, replacing the file: in parts through an upload session, with no sign-in token on its address.
-    const up = await uploadSession(signal), total = made.bytes.length;
+    const up = await uploadSession(signal, file), total = made.bytes.length;
     let item = null;
     for (let at = 0; at < total; at += CHUNK) {
       const end = Math.min(total, at + CHUNK);
@@ -3944,31 +3966,47 @@
       const wrong = salesFileWrong(back, sheet);
       if (wrong) throw problem('not saved whole', `${was}, and the copy read back from it is wrong (${wrong}), so the sheet may not have been saved whole.`);
     }
-    store.set('sales', JSON.stringify({ where, eTag: saved.eTag, fp: made.print, at: saved.lastModifiedDateTime || '', pics: made.photos }));
-    const mb = `${(total / 1048576).toFixed(1)} MB`;
-    setSales({ ...savedFields(saved), state: 'ok', label: `saved ${fmtSaved(saved.lastModifiedDateTime)}`, short: `${plural(sheet.rows.length, 'style')}, ${plural(made.photos, 'photo')}`,
-      styles: sheet.rows.length, pics: made.photos, message: `Saved ${fmtLong(saved.lastModifiedDateTime)}: ${plural(sheet.rows.length, 'style')}, ${plural(made.photos, 'photo')}${erpWords(made, pics)}, ${mb}.` });
+    store.set(K.mark, JSON.stringify({ where, eTag: saved.eTag, fp: made.print, at: saved.lastModifiedDateTime || '', pics: made.photos }));
+    return { K, meta: saved, upToDate: false, rows: sheet.rows.length, pics: made.photos, mb: `${(total / 1048576).toFixed(1)} MB`, made, set: pics };
+  }
+  // How the files went, as one status: its link and date are Available to sell's file's; the Pull from China file is
+  // added after it. notes: a file not saved because it has nothing on it.
+  function salesSaved(done, notes) {
+    const main = done.find(d => d.K.kind === 'sales') || done[0];
+    if (!main) { setSales({ state: 'warn', label: 'not saved', short: 'nothing to save', message: `Not saved: ${notes.join('; ') || 'no file name in config.js'}.` }); return; }
+    const unit = d => (d.K.kind === 'sales' ? 'style' : 'row'), rest = done.filter(d => d !== main);
+    const one = d => (d.upToDate ? `nothing in it has changed since it was saved ${fmtLong(d.meta.lastModifiedDateTime)}`
+      : `saved ${fmtLong(d.meta.lastModifiedDateTime)}: ${plural(d.rows, unit(d))}, ${plural(d.pics, 'photo')}${erpWords(d.made, d.set)}, ${d.mb}`);
+    const more = rest.map(d => ` ${d.K.label}: ${one(d)}.`).join('') + (notes.length ? ` ${notes.join('; ')}.` : '');
+    const short = `${plural(main.rows, unit(main))}, ${plural(main.pics, 'photo')}${rest.map(d => ` · ${d.K.label} ${plural(d.rows, unit(d))}`).join('')}`;
+    const fields = { ...savedFields(main.meta), state: 'ok', styles: main.rows, pics: main.pics };
+    if (done.every(d => d.upToDate)) {
+      setSales({ ...fields, label: 'up to date', short: `saved ${fmtSaved(main.meta.lastModifiedDateTime)}`, message: `Up to date: ${one(main)}.${more}` });
+      return;
+    }
+    const last = done.filter(d => !d.upToDate).map(d => d.meta.lastModifiedDateTime).sort().pop();
+    setSales({ ...fields, label: `saved ${fmtSaved(last)}`, short, message: `${main.upToDate ? `Up to date: ${one(main)}` : `S${one(main).slice(1)}`}.${more}` });
   }
   // How many of the file's photos are the ERP report's pictures, in words (the rest are Quote Images').
   const erpWords = (made, pics) => (made.erp && pics ? ` (${fmtN(made.erp)} from the ${fmtD(pics.reportDay)} ATS report's pictures)` : '');
   // An empty or half-built file is never uploaded (and one read back after the upload must be whole): a sensible size,
-  // and it opens with all its tabs (Available to sell, one per category, By date, in that order) and every style, in
-  // order. Answers what's wrong with it ('' when nothing is).
+  // and it opens with all its tabs (its first tab, one per category, then By date on Available to sell's, in that order)
+  // and every row, in order. Answers what's wrong with it ('' when nothing is).
   function salesFileWrong(bytes, sheet) {
-    const SS = window.InvSalesSheet;
+    const SS = window.InvSalesSheet, kind = SS.kindOf(sheet);
     if (!sheet.rows.length) return 'it has no rows';
     if (!bytes || bytes.length < 2048) return `the file came out at ${fmtN(bytes ? bytes.length : 0)} bytes, too small to hold the sheet`;
     if (bytes.length > SALES_MAX) return `the file came out at ${(bytes.length / 1048576).toFixed(1)} MB, far more than it should (well under 10 MB)`;
     let wb;
-    try { wb = XLSX.read(bytes, { type: 'array', sheets: [SS.TABS.sell] }); }
+    try { wb = XLSX.read(bytes, { type: 'array', sheets: [kind.tab] }); }
     catch (e) { return `it didn't open after it was written (${e.message})`; }
-    const tabs = [SS.TABS.sell, ...SS.categoryTabs(sheet.rows).map(t => t.name), SS.TABS.byDate];
+    const tabs = SS.tabsOf(sheet);
     const missing = tabs.find(t => !(wb.SheetNames || []).includes(t));
     if (missing) return `it has no "${missing}" tab`;
     if (JSON.stringify(wb.SheetNames) !== JSON.stringify(tabs)) return `its tabs aren't the ones it should have, in order (${fmtN(wb.SheetNames.length)} of them, not ${fmtN(tabs.length)})`;
-    const ws = wb.Sheets[SS.TABS.sell], ref = ws && ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']) : null;
-    if (!ref || ref.e.r + 1 !== sheet.rows.length + 2) return `it holds ${ref ? fmtN(ref.e.r - 1) : 'no'} style rows, not ${fmtN(sheet.rows.length)}`;
-    const col = SS.COLS.findIndex(c => c.k === 'style'), styleAt = i => { const c = ws[XLSX.utils.encode_cell({ r: i + 2, c: col })]; return c && c.v != null ? String(c.v) : ''; };
+    const ws = wb.Sheets[kind.tab], ref = ws && ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']) : null;
+    if (!ref || ref.e.r + 1 !== sheet.rows.length + 2) return `it holds ${ref ? fmtN(ref.e.r - 1) : 'no'} rows, not ${fmtN(sheet.rows.length)}`;
+    const col = kind.cols.findIndex(c => c.k === 'style'), styleAt = i => { const c = ws[XLSX.utils.encode_cell({ r: i + 2, c: col })]; return c && c.v != null ? String(c.v) : ''; };
     const at = sheet.rows.findIndex((r, i) => styleAt(i) !== r.style);
     if (at >= 0) return `its row ${fmtN(at + 3)} holds ${styleAt(at) || 'no style'}, not ${sheet.rows[at].style}`;
     return '';
@@ -4042,19 +4080,29 @@
   }
 
   // ---------- the Download button (Available to sell): the same file, for anyone signed in ----------
+  // Two buttons, one per file (Saul, Nov 3), one download at a time.
   let dl = null;   // { ctl, msg } while it's being made
+  const DL_BTN = { sales: 'btnSalesDl', china: 'btnChinaDl' };
+  const DL_NAME = { sales: 'Available to sell.xlsx', china: 'Pull from China.xlsx' };
+  const DL_WHAT = { sales: 'on hand and in transit, by the ATS report', china: 'our goods in China not sold yet, by pull-from date' };
   function renderDl() {
-    const btn = $('btnSalesDl');
-    if (!btn) return;
-    const sheet = salesSheetNow();
-    btn.disabled = !!dl || !sheet.ok;
-    $('salesDl').title = dl ? '' : sheet.ok ? `Download ${salesFileName() || 'the sales sheet'}: Available to sell for a salesperson, one photo per style; no factory, customer, PO or person in it` : sheet.reason;
+    if (!$('btnSalesDl')) return;
+    const tips = [];
+    for (const K of SHEETS) {
+      const btn = $(DL_BTN[K.kind]), sheet = sheetNow(K.kind);
+      if (!btn) continue;
+      btn.disabled = !!dl || !sheet.ok || !sheet.rows.length;
+      tips.push(sheet.ok ? `${K.label}: ${DL_WHAT[K.kind]}, one photo per row; no factory, customer, PO or person in it${sheet.rows.length ? '' : ' (nothing on it now)'}` : `${K.label}: ${sheet.reason}`);
+    }
+    // Both refused for the same reason: said once.
+    const why = SHEETS.map(K => sheetNow(K.kind)).filter(x => !x.ok).map(x => x.reason);
+    $('salesDl').title = dl ? '' : why.length === SHEETS.length && new Set(why).size === 1 ? why[0] : tips.join('\n');
     $('salesDlMsg').textContent = dl ? dl.msg : '';
     $('btnSalesDlX').hidden = !dl;
   }
-  async function downloadSales() {
-    const sheet = salesSheetNow();
-    if (dl || !sheet.ok) return;
+  async function downloadSales(kind) {
+    const K = SHEETS.find(x => x.kind === kind), sheet = sheetNow(kind);
+    if (dl || !K || !sheet.ok || !sheet.rows.length) return;
     const ctl = new AbortController();
     dl = { ctl, msg: 'starting' };
     renderDl();
@@ -4064,14 +4112,14 @@
       const made = await buildSalesFile(sheet, ctl.signal, msg => { if (dl) { dl.msg = msg; renderDl(); } }, picSet);
       const url = URL.createObjectURL(new Blob([made.bytes], { type: XLSX_TYPE }));
       const a = document.createElement('a');
-      a.href = url; a.download = salesFileName() || 'Available to sell.xlsx';
+      a.href = url; a.download = K.file() || DL_NAME[kind];
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 60000);
-      toast(`Sales sheet downloaded: ${plural(sheet.rows.length, 'style')}, ${plural(made.photos, 'photo')}.`, 5000);
+      toast(`${K.label} downloaded: ${plural(sheet.rows.length, kind === 'sales' ? 'style' : 'row')}, ${plural(made.photos, 'photo')}.`, 5000);
     } catch (e) {
-      if (isAbort(e)) toast('Sales sheet download cancelled.');
+      if (isAbort(e)) toast(`${K.label} download cancelled.`);
       else if (e && e.stop) stopNow();
-      else { console.error(e); toast(`The sales sheet couldn't be made: ${describe(e).message}`, 8000); }
+      else { console.error(e); toast(`The ${K.label} sheet couldn't be made: ${describe(e).message}`, 8000); }
     } finally { dl = null; renderDl(); renderIssues(); }
   }
 
@@ -4218,7 +4266,8 @@
       e.preventDefault();
       if (b.dataset.sales === 'cancel') { if (salesCtl) salesCtl.abort(); } else runSales(true);
     });
-    $('btnSalesDl').onclick = downloadSales;
+    $('btnSalesDl').onclick = () => downloadSales('sales');
+    $('btnChinaDl').onclick = () => downloadSales('china');
     $('btnSalesDlX').onclick = () => { if (dl) dl.ctl.abort(); };
     $('tabs').addEventListener('click', e => { const b = e.target.closest('.tab'); if (b) showTab(b.dataset.tab); });
     let qt = null;

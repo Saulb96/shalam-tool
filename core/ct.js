@@ -21,6 +21,7 @@
     po: { names: ['PO Number', 'PO', 'PO No'], required: true },
     upc: { names: ['Barcode', 'UPC'] },
     master: { names: ['Master', 'Master Pack', 'Master Carton'] },
+    inner: { names: ['Inner', 'Inner Pack', 'Inner Carton'] },
     factory: { names: ['Company', 'Factory', 'Supplier'] },
     name: { names: ['Product name', 'Description'] },
     price: { names: ['Price'] },
@@ -216,11 +217,11 @@
           issue('qty-not-number', sheet, row, `${sheet} row ${row}, PO ${cur.po}, style ${style}: the quantity ${qty == null ? 'is blank' : '"' + S(qtyV).slice(0, 20) + '" is not a number'}, so it is not counted.`, { po: cur.po, style });
           continue;
         }
-        const master = C.num(at(r, 'master'));
+        const master = C.num(at(r, 'master')), inner = C.num(at(r, 'inner'));
         const upcV = at(r, 'upc');
         if (!blank(upcV) && !NOT_APPLICABLE.test(S(upcV)) && !C.normUpc(upcV))
           issue('bad-upc', sheet, row, `${sheet} row ${row}, PO ${cur.po}, style ${style}: the barcode "${S(upcV).slice(0, 20)}" isn't 12 or 13 digits, so it can't be matched by UPC. The line is still counted.`, { po: cur.po, style });
-        cur.lines.push({ row, style, styleRaw: S(styleV), upc: C.normUpc(upcV), upcRaw: S(upcV), master: Number.isNaN(master) ? null : master, qty });
+        cur.lines.push({ row, style, styleRaw: S(styleV), upc: C.normUpc(upcV), upcRaw: S(upcV), master: Number.isNaN(master) ? null : master, inner: Number.isNaN(inner) ? null : inner, qty });
         n.counted++;
         n.units += qty;
       }

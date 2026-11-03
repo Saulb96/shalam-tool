@@ -2,7 +2,7 @@
 // if it is ever blank the page says so and stops. Sources: where each file or folder is, as a SharePoint link or a
 // /sites/<site>/<library>/<path>; a blank one shows grey "not set". The error email goes to errorEmailTo.
 // The sales sheet (Saul, Nov 2): saved as salesFile into salesLibrary (a /sites/<site>/<library>), the one place the page
-// may write; blank turns saving off. Its photos come from Quote Tracker's store: <photos>/thumb/<KEY>.jpg.
+// may write; blank turns saving off. chinaFile (Saul, Nov 3): the Pull from China sheet, saved next to it; blank: not saved. Its photos come from Quote Tracker's store: <photos>/thumb/<KEY>.jpg.
 window.INV_CONFIG = {
   tenantId: 'eeea7e3e-9ccb-4a16-894e-3417c6a7a4c1',
   clientId: 'f994e0f2-f0d4-452e-88d6-67d9396d7552',
@@ -18,6 +18,7 @@ window.INV_CONFIG = {
   sections: { pullFromChina: ['GT', 'Giant Tiger', 'TJX Mexico', 'TJX Aus', 'TJX UK', 'FOB Loaded'], planning: ['Unshipped', 'Planning - NB', 'Planning - other'], ignore: ['CT - Hidden Rows'] },
   salesLibrary: '/sites/Reports/Shalam Sales tool',
   salesFile: 'Available to sell.xlsx',
+  chinaFile: 'Pull from China.xlsx',
   photos: '/sites/Production/Shared Documents/Quote Sheets/Quote Images',
   errorEmailTo: 'saul@metro1solutions.com',
   errorEmailName: 'Saul',

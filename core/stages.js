@@ -65,6 +65,7 @@
   const MSL_SPEC = {
     upc: { names: ['Barcode', 'UPC'] },
     master: { names: ['Master', 'Master Pack', 'Master Carton'] },
+    inner: { names: ['Inner', 'Inner Pack', 'Inner Carton'] },
     category: { names: ['Category'] },
     sub: { names: ['Sub', 'Sub Category', 'SubCategory'] },
   };
@@ -112,10 +113,11 @@
       duplicateUnits: 0, partCase: 0, noCasePackStyles: 0, stylesNotInUpcMaster: 0, reportsMissing: [],
     };
 
-    // ---------- Master Sheet Live facts by row: Barcode, Master, Category, Sub (none required)
+    // ---------- Master Sheet Live facts by row: Barcode, Master, Inner, Category, Sub (none required)
     const mrows = input.mrows || po.mrows || null;
     const mcols = mrows && mrows.length ? C.findColumns(mrows[0] || [], MSL_SPEC).cols : {};
-    for (const k of Object.keys(MSL_SPEC)) {
+    // No Inner column is no issue: the sales sheets show the Master pack with "–" for the Inner, there to see.
+    for (const k of Object.keys(MSL_WHAT)) {
       if (mcols[k] != null) continue;
       const [name, what] = MSL_WHAT[k];
       issue('missing-column', '', '', 1, mrows && mrows.length
@@ -127,7 +129,7 @@
       if (factCache.has(row)) return factCache.get(row);
       const r = (mrows && row >= 1 && mrows[row - 1]) || [];
       const at = k => (mcols[k] == null ? null : r[mcols[k]] ?? null);
-      const f = { upc: C.normUpc(at('upc')), upcRaw: S(at('upc')), master: goodMaster(at('master')),
+      const f = { upc: C.normUpc(at('upc')), upcRaw: S(at('upc')), master: goodMaster(at('master')), inner: goodMaster(at('inner')),
         category: S(at('category')), sub: S(at('sub')) };
       factCache.set(row, f);
       return f;
@@ -141,7 +143,7 @@
       return trk.T.get(b + '|' + sty) || trk.T.get(b + '|' + (sty.endsWith('-F') ? sty.slice(0, -2) : sty + '-F')) || null;
     };
     const groups = new Map(), lines = [];
-    const styleMaster = new Map();   // style -> { row, master } of its latest Master Sheet line with a Master
+    const styleMaster = new Map();   // style -> { row, master, inner } of its latest Master Sheet line with a Master
     const styleLatest = new Map();   // style -> latest line (highest row)
     for (const l of po.lines) {
       const style = C.normStyle(l.sty);
@@ -167,7 +169,7 @@
       if (!g) groups.set(gk, g = { key: gk, po: orig, poRaw: S(origRaw), style, lines: [], cands: new Set(), chunks: [], planning: [] });
       g.lines.push(x);
       g.cands.add(orig + '|' + style); g.cands.add(shown + '|' + style);
-      if (fact.master != null) { const p = styleMaster.get(style); if (!p || l.row > p.row) styleMaster.set(style, { row: l.row, master: fact.master }); }
+      if (fact.master != null) { const p = styleMaster.get(style); if (!p || l.row > p.row) styleMaster.set(style, { row: l.row, master: fact.master, inner: fact.inner }); }
       const lp = styleLatest.get(style); if (!lp || l.row > lp.l.row) styleLatest.set(style, x);
     }
     counts.groups = groups.size;
@@ -517,7 +519,7 @@
       };
       if (c) Object.assign(from, { round: F.ct, containers: F.ct, etd: c.bi.etdFrom, eta: c.bi.etaFrom });
       return addAlloc({
-        bucket, units: n, cases: withCases(n, master), master, style: g.style, styleRaw: x.styleRaw, upc: upcV,
+        bucket, units: n, cases: withCases(n, master), master, inner: master ? x.fact.inner : null, style: g.style, styleRaw: x.styleRaw, upc: upcV,
         po: g.po, poShown: x.shown !== g.po ? S(l.po) : '', ptype: x.ptype, customer: S(l.cust), factory: S(l.sup),
         crd: l.crd ?? null, od: l.od ?? null, round: c ? roundText(c.bi.rounds) : '', rounds: c ? c.bi.rounds : [],
         containers: c ? c.bi.containers : [], etd: c ? c.bi.etd : null, eta: c ? c.bi.eta : null, stage: stageName,
@@ -529,9 +531,11 @@
     // An allocation of Container Tracking units no Master Sheet line takes (more than the sheet, or unmatched).
     function ctAlloc(g, c, n, bucket, flags) {
       const style = c.ln.style, sm = styleMaster.get(style);
+      // The Inner from the same place as the Master (this line's, else the style's latest Master Sheet line's).
       const master = goodMaster(c.ln.master) ?? (sm ? sm.master : null);
+      const inner = goodMaster(c.ln.master) ? goodMaster(c.ln.inner) : sm ? sm.inner : null;
       return addAlloc({
-        bucket, units: n, cases: withCases(n, master), master, style, styleRaw: c.ln.styleRaw || style, upc: c.ln.upc || null,
+        bucket, units: n, cases: withCases(n, master), master, inner, style, styleRaw: c.ln.styleRaw || style, upc: c.ln.upc || null,
         po: g ? g.po : c.b.po, poShown: g && g.po !== c.b.po ? c.b.po : '', ptype: '', customer: '', factory: S(c.b.factory),
         crd: null, od: null, round: roundText(c.bi.rounds), rounds: c.bi.rounds, containers: c.bi.containers,
         etd: c.bi.etd, eta: c.bi.eta, stage: STAGE[c.stage], ctStage: STAGE[c.stage], section: c.section, sheetRow: null, lineKey: '', status: '',

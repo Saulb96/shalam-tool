@@ -102,8 +102,8 @@ test('blocks and lines from Booking and Loaded', () => {
   assert.equal(b5.shipBy, null);
   assert.equal(b5.needBy, '');
   assert.deepEqual(b5.lines, [
-    { row: 5, style: 'AB-200', styleRaw: 'AB-200', upc: '000111222333', upcRaw: '000111222333', master: 48, qty: 2400 },
-    { row: 6, style: 'AB-201', styleRaw: 'ab-201', upc: null, upcRaw: 'N/A', master: null, qty: 1200 }]);
+    { row: 5, style: 'AB-200', styleRaw: 'AB-200', upc: '000111222333', upcRaw: '000111222333', master: 48, inner: null, qty: 2400 },
+    { row: 6, style: 'AB-201', styleRaw: 'ab-201', upc: null, upcRaw: 'N/A', master: null, inner: null, qty: 1200 }]);
   assert.equal(bk[2].poRaw, '900103 -bcf');
   assert.deepEqual(bk[5].lines, []); // its quantity is text: listed, never 0
   assert.ok(r.blocks.every(b => b.lines.every(l => typeof l.qty === 'number' && !Number.isNaN(l.qty))));
