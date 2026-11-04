@@ -19,6 +19,8 @@ window.INV_CONFIG = {
   salesLibrary: '/sites/Reports/Shalam Sales tool',
   salesFile: 'On hand ATS.xlsx',
   chinaFile: 'Pull from China.xlsx',
+  // POs ending in one of these are held for a customer: their goods are their own line on the sales sheets, with this note (Saul, Nov 4).
+  reserved: { '-BCF': 'Reserved -BCF' },
   photos: '/sites/Production/Shared Documents/Quote Sheets/Quote Images',
   errorEmailTo: 'saul@metro1solutions.com',
   errorEmailName: 'Saul',

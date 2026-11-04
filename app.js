@@ -3741,7 +3741,7 @@
     const m = sheetMemo[kind];
     if (!m || m.sell !== sell || m.stages !== stages) {
       let sheet;
-      try { sheet = window.InvSalesSheet[K.make](sell && !sellErr ? sell : { ok: false, notLoaded: (stages && stages.notLoaded) || [] }, { today: sellToday() }); }
+      try { sheet = window.InvSalesSheet[K.make](sell && !sellErr ? sell : { ok: false, notLoaded: (stages && stages.notLoaded) || [] }, { today: sellToday(), reserved: CFG.reserved }); }
       catch (e) { console.error(e); sheet = { ok: false, kind, reason: `The ${K.label} sheet couldn't be worked out (${(e && e.message) || e}): a bug in Shalam Tool, tell Saul.`, rows: [], byDate: [], counts: {} }; }
       // The page's own checks too (core/salesSheet.js sees only the selling engine's): the stage numbers or the rows of
       // Available to sell don't add up, the red banner says its numbers can't be trusted, so there's no sheet either.
@@ -3922,7 +3922,7 @@
       if (!mine && meta['@microsoft.graph.downloadUrl']) { say('checking…', 'what the file in Shalam Sales tool holds'); holds = await fileHolds(meta, signal); }
       if (holds && holds.fp === fp) {
         if (!mine) store.set(K.mark, JSON.stringify({ where, eTag: meta.eTag, fp, at: meta.lastModifiedDateTime || '', pics: holds.pics }));
-        return { K, meta, upToDate: true, rows: sheet.rows.length, pics: holds.pics };
+        return { K, meta, upToDate: true, rows: sheetCount(sheet), pics: holds.pics };
       }
     }
     say('saving…', 'making the file');
@@ -3967,8 +3967,11 @@
       if (wrong) throw problem('not saved whole', `${was}, and the copy read back from it is wrong (${wrong}), so the sheet may not have been saved whole.`);
     }
     store.set(K.mark, JSON.stringify({ where, eTag: saved.eTag, fp: made.print, at: saved.lastModifiedDateTime || '', pics: made.photos }));
-    return { K, meta: saved, upToDate: false, rows: sheet.rows.length, pics: made.photos, mb: `${(total / 1048576).toFixed(1)} MB`, made, set: pics };
+    return { K, meta: saved, upToDate: false, rows: sheetCount(sheet), pics: made.photos, mb: `${(total / 1048576).toFixed(1)} MB`, made, set: pics };
   }
+  // What a sheet holds, as its status and toast say it: On hand ATS's styles (a style in two packs is on two lines), Pull
+  // from China's rows.
+  const sheetCount = sheet => (sheet.kind === 'sales' && sheet.counts && typeof sheet.counts.styles === 'number' ? sheet.counts.styles : sheet.rows.length);
   // How the files went, as one status: its link and date are Available to sell's file's; the Pull from China file is
   // added after it. notes: a file not saved because it has nothing on it.
   function salesSaved(done, notes) {
@@ -4115,7 +4118,7 @@
       a.href = url; a.download = K.file() || DL_NAME[kind];
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 60000);
-      toast(`${K.label} downloaded: ${plural(sheet.rows.length, kind === 'sales' ? 'style' : 'row')}, ${plural(made.photos, 'photo')}.`, 5000);
+      toast(`${K.label} downloaded: ${plural(sheetCount(sheet), kind === 'sales' ? 'style' : 'row')}, ${plural(made.photos, 'photo')}.`, 5000);
     } catch (e) {
       if (isAbort(e)) toast(`${K.label} download cancelled.`);
       else if (e && e.stop) stopNow();

@@ -205,7 +205,14 @@ button.tile.go:hover{background:rgba(255,255,255,.7)}
 .pic{flex:none;display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:6px;background:rgba(95,108,125,.1)}
 img.pic{object-fit:contain;background:#fff}
 .pic.none{background:transparent;border:1px dashed rgba(95,108,125,.35);color:var(--off);font-size:8.5px;line-height:1.05;text-align:center;white-space:normal}
-.dlbox{display:inline-flex;align-items:center;gap:6px}
+.dlbox{display:inline-flex;align-items:center;gap:8px}
+/* The two sheet downloads stand out from the filters (Saul, Nov 4): filled, bold, an arrow. */
+button.dl{display:inline-flex;align-items:center;gap:6px;font-weight:650;color:#fff;border-color:transparent;padding:8px 15px;background:linear-gradient(135deg,#2f9bd6,#1b6fae);box-shadow:0 3px 10px rgba(27,111,174,.3)}
+button.dl.china{background:linear-gradient(135deg,#f58a5f,#d9572f);box-shadow:0 3px 10px rgba(217,87,47,.3)}
+button.dl:hover:not(:disabled){filter:brightness(1.07);background:linear-gradient(135deg,#2f9bd6,#1b6fae)}
+button.dl.china:hover:not(:disabled){background:linear-gradient(135deg,#f58a5f,#d9572f)}
+button.dl:disabled{box-shadow:none}
+button.dl .ico{flex:none}
 /* One height for every windowed Inventory row, UPC lines (smaller text) included. */
 #invTable tbody tr.r td{line-height:18px}
 button.nb,button.sb{font:inherit;color:var(--accentink);background:none;border:0;padding:0 1px;border-radius:4px;cursor:pointer;font-variant-numeric:tabular-nums;white-space:nowrap}
@@ -268,3 +275,10 @@ button.tag.ov:hover{background:#f6cdc5}
   #sellTable.pics td.fz.f-sty,#sellTable.pics th.fz.f-sty{width:190px;min-width:190px;max-width:190px}
   .panel{top:0;right:0;bottom:0;width:100vw;border-radius:0}}
 .grid td.pt{font-weight:400;font-style:italic;color:var(--muted)}
+/* Shalam Sales (sales.html): the sheet's rows with bigger photos, the table filling the window */
+.salespage .spane{height:calc(100vh - 210px);min-height:360px}
+.salespage .pic.big{width:64px;height:64px;font-size:10px}
+.salespage .grid td{vertical-align:middle}
+.salespage .grid td.desc{min-width:220px;max-width:360px;white-space:normal}
+.salespage .grid .upc{font-size:11px;color:var(--muted)}
+.salespage input[type=date]{font:inherit;border-radius:11px;border:1px solid var(--edge);background:rgba(255,255,255,.85);color:var(--ink);padding:5px 8px;margin-left:4px}

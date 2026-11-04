@@ -139,6 +139,12 @@ function configSections() {
   new Function('window', readFileSync(root('config.js'), 'utf8'))(win);
   return win.INV_CONFIG ? win.INV_CONFIG.sections : undefined;
 }
+// config.js's reserved PO suffixes ({ suffix: note }), as the page passes them to the sales sheets.
+function configReserved() {
+  const win = {};
+  new Function('window', readFileSync(root('config.js'), 'utf8'))(win);
+  return win.INV_CONFIG ? win.INV_CONFIG.reserved : undefined;
+}
 // One sheet's rows from A1, as app.js reads Master Sheet Live and the tracker.
 function readSheet(bytes, sheet) {
   let wb = readBook(bytes, { sheets: [sheet] }), hit = C.findSheet(wb, sheet);
@@ -555,11 +561,13 @@ if (!sellWithAts) {
 async function salesReport(S, R) {
   const SS = core('salesSheet');
   let sheet, china;
-  try { sheet = SS.salesRows(S, { today }); china = SS.chinaRows(S, { today }); } catch (e) { fails(`the sales sheets stopped: ${e.message}`); return; }
+  let reserved;
+  try { reserved = configReserved(); } catch (e) { fails(`can't read config.js: ${e.message}`); }
+  try { sheet = SS.salesRows(S, { today, reserved }); china = SS.chinaRows(S, { today, reserved }); } catch (e) { fails(`the sales sheets stopped: ${e.message}`); return; }
   if (!sheet.ok) { fails(`no sales sheet: ${sheet.reason}`); return; }
   if (!china.ok) { fails(`no Pull from China sheet: ${china.reason}`); return; }
   const k = sheet.counts, rows = sheet.rows, sum = (a, f) => a.reduce((p, x) => p + (f(x) || 0), 0);
-  console.log(`  Available to sell: styles ${n(k.styles)} · left off (nothing available) ${n(k.leftOff)} · not on the ATS report ${n(k.notOnReport)} · no ATS figure ${n(k.stockUnknown)} · In Trans not readable ${n(k.transitUnknown)} · by-date rows ${n(k.byDateRows)} · no Master/Inner ${n(k.noPack)}`);
+  console.log(`  On hand ATS: styles ${n(k.styles)} on ${n(k.rows)} lines (${n(k.split)} styles on more than one: a line per pack and note) · reserved lines ${n(k.reserved)} · left off (nothing available) ${n(k.leftOff)} · not on the ATS report ${n(k.notOnReport)} · no ATS figure ${n(k.stockUnknown)} · In Trans not readable ${n(k.transitUnknown)} · by-date rows ${n(k.byDateRows)} · no Master/Inner ${n(k.noPack)}`);
   // The ATS report on its own: on hand = its ATS from in WH above 0; in transit = its In Trans less what's oversold.
   let wantOn = 0, wantTr = 0;
   for (const e of atsR.styles.values()) {
@@ -577,7 +585,14 @@ async function salesReport(S, R) {
   const sched = sum(sheet.byDate, r => r.units), schedOk = sum(rows, r => r.total) === sched && sum(rows, r => r.total) === sum(rows, r => r.onHand + r.inTransit);
   console.log(`  total ${n(sum(rows, r => r.total))} = on hand + in transit = by date ${n(sched)}: ${schedOk ? 'yes' : 'NO'} · in transit available now ${n(sum(sheet.byDate.filter(r => r.where === 'In transit' && r.when === 'now'), r => r.units))} · no ETA ${n(sum(sheet.byDate.filter(r => r.when == null), r => r.units))} units`);
   if (!schedOk) fails("the sales sheet's total isn't on hand + in transit, or its schedule doesn't add up to it");
-  console.log(`  Master/Inner: one pack ${n(rows.filter(r => r.pack && !r.pack.includes(' · ')).length)} · more than one ${n(rows.filter(r => r.pack.includes(' · ')).length)} · no Inner on one ${n(rows.filter(r => r.pack.includes('/–')).length)} · none ${n(rows.filter(r => !r.pack).length)}`);
+  console.log(`  Master/Inner: lines with a pack ${n(rows.filter(r => r.pack).length)} · more than one pack on a line ${n(rows.filter(r => r.pack.includes(' · ')).length)} (never) · no Inner ${n(rows.filter(r => r.pack.includes('/–')).length)} · none ${n(rows.filter(r => !r.pack).length)}`);
+  if (rows.some(r => r.pack.includes(' · ')) || china.rows.some(r => r.pack.includes(' · '))) fails('a line of the sales sheets has more than one pack');
+  // Each style's lines add up to its own numbers by the ATS report (the split only moves units between its lines).
+  const byStyle = new Map();
+  for (const r of rows) { const x = byStyle.get(r.style) || byStyle.set(r.style, { on: 0, tr: 0, packs: new Set(), notes: new Set() }).get(r.style); x.on += r.onHand; x.tr += r.inTransit; x.packs.add(r.pack); x.notes.add(r.note); }
+  const notes = {};
+  for (const r of [...rows, ...china.rows]) if (r.note) notes[r.note] = (notes[r.note] || 0) + (r.total ?? r.units);
+  console.log(`  split: styles in more than one pack ${n([...byStyle.values()].filter(x => x.packs.size > 1).length)} · with a reserved line ${n([...byStyle.values()].filter(x => x.notes.size > 1 || !x.notes.has('')).length)} · units on reserved lines (both sheets): ${Object.entries(notes).map(([k2, v2]) => `${k2} ${n(v2)}`).join(', ') || 'none'} · config.js reserved: ${reserved ? Object.keys(reserved).join(', ') : 'none'}`);
   const ck = china.counts, crow = china.rows;
   console.log(`  Pull from China: rows ${n(ck.rows)} on ${n(ck.styles)} styles, ${n(china.totals.units)} units · taken by what's oversold ${n(ck.ordersOff)} · pull-from date passed (left off) ${n(ck.past)} · no date ${n(ck.noDate)} · styles with no ATS figure (left off) ${n(ck.stockUnknown)}`);
   // Every unit of our lots in China (before orders) is on the sheet, taken by the oversold, or past its date.
@@ -588,15 +603,16 @@ async function salesReport(S, R) {
   if (!chinaOk) fails("the Pull from China sheet doesn't add up to our goods in China");
   console.log(`  pull-from dates: about (an estimate) ${n(crow.filter(r => r.estimate).length)} rows · no date ${n(crow.filter(r => r.pullFrom == null).length)} rows`);
   // Only the fields the sheets may hold, on every row.
-  const odd = rows.filter(r => Object.keys(r).join() !== 'style,upc,desc,category,sub,pack,onHand,inTransit,transitFrom,total,photoKey').length +
-    sheet.byDate.filter(r => Object.keys(r).join() !== 'style,desc,category,when,where,units').length +
-    crow.filter(r => Object.keys(r).join() !== 'style,upc,desc,category,sub,pack,units,pullFrom,estimate,photoKey').length;
+  const odd = rows.filter(r => Object.keys(r).join() !== 'style,upc,desc,brand,category,sub,pack,note,onHand,inTransit,transitFrom,total,photoKey').length +
+    sheet.byDate.filter(r => Object.keys(r).join() !== 'style,desc,category,pack,note,when,where,units').length +
+    crow.filter(r => Object.keys(r).join() !== 'style,upc,desc,brand,category,sub,pack,note,units,pullFrom,estimate,photoKey').length;
   console.log(`  every row holds only the sheets' fields: ${odd ? 'NO' : 'yes'}`);
   if (odd) fails(`${n(odd)} rows of the sales sheets hold other fields`);
   // A tab per category (Saul, Nov 3): every row on exactly one.
   const tabsFor = list => { const tabs = SS.categoryTabs(list), on = tabs.flatMap(t => t.rows); return { tabs, ok: on.length === list.length && new Set(on).size === list.length && tabs.every(t => t.rows.every(i => C.S(list[i].category) === t.category)) }; };
   const T1 = tabsFor(rows), T2 = tabsFor(crow);
-  console.log(`  category tabs: Available to sell ${n(T1.tabs.length)} (${n(T1.tabs.filter(t => !t.category).length)} for no category), Pull from China ${n(T2.tabs.length)}; each row on its category's tab once: ${T1.ok && T2.ok ? 'yes' : 'NO'}`);
+  console.log(`  brands: ${n(new Set([...rows, ...crow].map(r => r.brand).filter(Boolean)).size)} · lines with none ${n([...rows, ...crow].filter(r => !r.brand).length)}`);
+  console.log(`  category tabs: On hand ATS ${n(T1.tabs.length)} (${n(T1.tabs.filter(t => !t.category).length)} for no category), Pull from China ${n(T2.tabs.length)}; each row on its category's tab once: ${T1.ok && T2.ok ? 'yes' : 'NO'}`);
   if (!T1.ok || !T2.ok) fails("the sales sheets' category tabs don't hold every row once");
   // Photos: the ERP report's picture first (the style's key, as its numbers match), Quote Images for the rest.
   if (erpPics) {
@@ -609,8 +625,8 @@ async function salesReport(S, R) {
   for (const a of R.allocs) { put('factory', a.factory); put('customer', a.customer); put('PO', a.po); put('PO', a.poShown); put('section', a.section); for (const x of [].concat(a.containers || [])) put('container', x); }
   for (const l of S.lots) { put('factory', l.factory); put('customer', l.customer); put('PO', l.po); put('ERP warehouse', l.warehouse); }
   if (atsR) for (const e of atsR.styles.values()) for (const w of e.warehouses || []) put('ERP warehouse', w);
-  const texts = [...rows, ...crow].flatMap(r => [r.style, r.upc, r.desc, r.category, r.sub, r.pack, ...r.upc.split(', ')])
-    .concat(sheet.byDate.flatMap(r => [r.style, r.desc, r.category, r.where])).map(v => C.S(v).toLowerCase());
+  const texts = [...rows, ...crow].flatMap(r => [r.style, r.upc, r.desc, r.brand, r.category, r.sub, r.pack, r.note, ...r.upc.split(', ')])
+    .concat(sheet.byDate.flatMap(r => [r.style, r.desc, r.category, r.pack, r.note, r.where])).map(v => C.S(v).toLowerCase());
   const hits = {};
   for (const t of texts) if (inside.has(t)) hits[inside.get(t)] = (hits[inside.get(t)] || 0) + 1;
   console.log(`  no factory, customer, PO, container, section or ERP warehouse name is a value in them (${n(texts.length)} text values against ${n(inside.size)} names): ${Object.keys(hits).length ? 'NO' : 'yes'}`);
@@ -629,6 +645,15 @@ async function salesReport(S, R) {
       (!kind.byDate || rowsOf(SS.TABS.byDate) === sh.byDate.length + 1) && T.tabs.every(t => rowsOf(t.name) === t.rows.length + 2);
     console.log(`  sample written without photos: ${file} · ${n(bytes.length)} bytes in ${secs(t0)} · read back: ${n(back.SheetNames.length)} tabs (${kind.tab}, ${n(T.tabs.length)} categories${kind.byDate ? ', By date' : ''}), ${n(rowsOf(kind.tab) - 2)} rows: ${whole ? 'yes' : 'NO'}`);
     if (!whole) fails(`the sample ${kind.tab} sheet did not read back whole`);
+    // As the sales page reads it (core/salesSheet.js readWorkbook): the same rows and schedule.
+    const E = loadExcelJS(), wb = new E.Workbook();
+    await wb.xlsx.load(readFileSync(file));
+    const rb = SS.readWorkbook(wb), same = JSON.stringify(rb.rows) === JSON.stringify(sh.rows) && JSON.stringify(rb.byDate) === JSON.stringify(sh.byDate || []);
+    // Where it differs: the first row and field (names only).
+    const at = same ? -1 : sh.rows.findIndex((r, i) => JSON.stringify(r) !== JSON.stringify(rb.rows[i]));
+    const why = same ? '' : at >= 0 ? ` (row ${n(at + 3)}: ${Object.keys(sh.rows[at]).filter(k2 => JSON.stringify(sh.rows[at][k2]) !== JSON.stringify((rb.rows[at] || {})[k2])).join(', ')})` : rb.rows.length !== sh.rows.length ? ` (${n(rb.rows.length)} rows read, not ${n(sh.rows.length)})` : ' (the schedule)';
+    console.log(`  the sales page reads it back the same: ${same ? 'yes' : 'NO' + why}`);
+    if (!same) fails(`the sales page doesn't read the ${kind.tab} sample back as it was written`);
   }
 }
 

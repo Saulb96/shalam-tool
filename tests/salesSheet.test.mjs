@@ -73,9 +73,11 @@ function mainSell() {
   return sellOf(as, atsOf({ SS100: [500, 40, 460, [[300, D(11, 20)], [120, D(10, 20)]]], SS200: [0, 50, -50, [[30, D(11, 10)]]], SS300: [10, 0, 10],
     SS400: [0, 0, 0], SS500: [100, 10, 80, [[24, null]]] }));
 }
-const ROW_KEYS = ['style', 'upc', 'desc', 'category', 'sub', 'pack', 'onHand', 'inTransit', 'transitFrom', 'total', 'photoKey'];
-const DATE_KEYS = ['style', 'desc', 'category', 'when', 'where', 'units'];
-const CHINA_KEYS = ['style', 'upc', 'desc', 'category', 'sub', 'pack', 'units', 'pullFrom', 'estimate', 'photoKey'];
+const ROW_KEYS = ['style', 'upc', 'desc', 'brand', 'category', 'sub', 'pack', 'note', 'onHand', 'inTransit', 'transitFrom', 'total', 'photoKey'];
+const DATE_KEYS = ['style', 'desc', 'category', 'pack', 'note', 'when', 'where', 'units'];
+const CHINA_KEYS = ['style', 'upc', 'desc', 'brand', 'category', 'sub', 'pack', 'note', 'units', 'pullFrom', 'estimate', 'photoKey'];
+// config.js's reserved, invented: goods on a PO ending in -ZZQ are held for a customer.
+const RESERVED = { '-ZZQ': 'Reserved -ZZQ' };
 
 // ---------- refusals
 
@@ -124,7 +126,7 @@ test('Available to sell: one row per style on the ATS report with something avai
   }
   for (const b of sh.byDate) assert.deepEqual(Object.keys(b), DATE_KEYS);
   // SS050 isn't on the report; SS200 (oversold beyond its In Trans) and SS400 have nothing.
-  assert.deepEqual(sh.counts, { styles: 3, leftOff: 2, stockUnknown: 0, transitUnknown: 0, notOnReport: 1, byDateRows: sh.byDate.length, noPack: 1 });
+  assert.deepEqual(sh.counts, { styles: 3, rows: 3, split: 0, reserved: 0, leftOff: 2, stockUnknown: 0, transitUnknown: 0, notOnReport: 1, byDateRows: sh.byDate.length, noPack: 1 });
   assert.deepEqual(sh.totals, { onHand: 550, inTransit: 444, total: 994 });
 });
 
@@ -161,18 +163,68 @@ test('in transit: every In Trans shipment, the oversold off the earliest first, 
   assert.deepEqual(o.byDate.map(b => [b.when, b.where, b.units]), [[D(12, 2), 'In transit', 30], [null, 'In transit', 24]]);
 });
 
-test('Master/Inner: every pack of the style once, "–" with no Inner, blank when not known', () => {
+test('Master/Inner: the pack of each line, "–" with no Inner, blank when not known', () => {
   assert.equal(SS.packText([{ master: 48, inner: 12 }]), '48/12');
   assert.equal(SS.packText([{ master: 24, inner: null }, { master: 48, inner: 12 }]), '24/– · 48/12');
   assert.equal(SS.packText([]), '');
   assert.equal(SS.packText(null), '');
   const sh = SS.salesRows(mainSell(), { today: TODAY }), row = st => sh.rows.find(r => r.style === st);
   assert.equal(row('SS100').pack, '24/6');
-  assert.equal(row('SS300').pack, '12/– · 12/3 · 24/6');
+  // SS300: its stock in the style's own pack (its Master Sheet line's), whatever its lots in China are.
+  assert.equal(row('SS300').pack, '24/6');
   assert.equal(row('SS500').pack, '', 'only on the ATS report: no pack known');
   // As the selling engine gives them: our lots' pairs; none, the latest Master Sheet line's.
   const s = mainSell().styles.find(x => x.style === 'SS300');
   assert.deepEqual(s.packs, [{ master: 12, inner: null }, { master: 12, inner: 3 }, { master: 24, inner: 6 }]);
+  assert.deepEqual(s.stockPack, { master: 24, inner: 6 });
+});
+
+// SS600: In Trans 300 (ETA 11/20: our 12/3 on the water, the same shipment) and 200 (ETA 12/1: none of ours); stock 120,
+// with our Landed goods 50 in 12/3 (10/15) and 100 in 24/6 on a -ZZQ PO (10/1). Its own pack: 12/3 (its lots').
+function packSell() {
+  const as = [
+    alloc({ style: 'SS600', styleRaw: 'SS600', po: '900201', bucket: 'water', units: 300, master: 12, inner: 3, eta: D(11, 20), stage: 'On the water' }),
+    alloc({ style: 'SS600', styleRaw: 'SS600', po: '900202-ZZQ', bucket: 'landed', units: 100, master: 24, inner: 6, eta: D(10, 1), stage: 'Landed' }),
+    alloc({ style: 'SS600', styleRaw: 'SS600', po: '900203', bucket: 'landed', units: 50, master: 12, inner: 3, eta: D(10, 15), stage: 'Landed' }),
+    alloc({ style: 'SS610', styleRaw: 'SS610', po: '900204-zzq', units: 60, master: 24, inner: 6, dates: { factoryCrd: D(12, 6) } }),
+    alloc({ style: 'SS610', styleRaw: 'SS610', po: '900205', units: 40, master: 24, inner: 6, dates: { factoryCrd: D(12, 6) } }),
+  ];
+  return sellOf(as, atsOf({ SS600: [120, 0, 120, [[300, D(11, 20)], [200, D(12, 1)]]], SS610: [0, 0, 0] }));
+}
+
+test('a line per pack: In Trans in the pack of the goods it was matched to, stock in our Landed goods\' packs (the latest first), the rest in the style\'s own', () => {
+  const sell = packSell(), s = sell.styles.find(x => x.style === 'SS600');
+  // As the selling engine gives them: each shipment's parts, and our Landed goods the latest first.
+  assert.deepEqual(s.erpTransit.map(x => [x.units, x.parts.map(p => [p.units, p.master, p.inner, p.po])]), [[300, [[300, 12, 3, '900201']]], [200, []]]);
+  assert.deepEqual(s.landedPacks.map(l => [l.units, l.master, l.inner, l.po]), [[50, 12, 3, '900203'], [100, 24, 6, '900202-ZZQ']]);
+  assert.deepEqual(s.stockPack, { master: 12, inner: 3 });
+
+  const sh = SS.salesRows(sell, { today: TODAY, reserved: RESERVED });
+  for (const r of sh.rows) assert.deepEqual(Object.keys(r), ROW_KEYS);
+  assert.deepEqual(sh.rows.map(r => [r.style, r.pack, r.note, r.onHand, r.inTransit, r.transitFrom, r.total]), [
+    ['SS600', '12/3', '', 50, 500, D(11, 27), 550],
+    ['SS600', '24/6', 'Reserved -ZZQ', 70, 0, null, 70],
+  ]);
+  assert.deepEqual(sh.byDate.map(b => [b.pack, b.note, b.when, b.where, b.units]), [
+    ['12/3', '', 'now', 'On hand', 50], ['12/3', '', D(11, 27), 'In transit', 300], ['12/3', '', D(12, 8), 'In transit', 200],
+    ['24/6', 'Reserved -ZZQ', 'now', 'On hand', 70],
+  ]);
+  assert.deepEqual([sh.counts.styles, sh.counts.rows, sh.counts.split, sh.counts.reserved], [1, 2, 1, 1]);
+  // The style's totals are the ATS report's, however it's split.
+  assert.deepEqual(sh.totals, { onHand: 120, inTransit: 500, total: 620 });
+  // With no reserved suffix in config.js, no note: a line per pack only.
+  assert.deepEqual(SS.salesRows(sell, { today: TODAY }).rows.map(r => [r.pack, r.note, r.total]), [['12/3', '', 550], ['24/6', '', 70]]);
+  // The oversold comes off the earliest shipment, its parts in turn.
+  const ov = SS.salesRows(sellOf([alloc({ style: 'SS600', styleRaw: 'SS600', po: '900201', bucket: 'water', units: 300, master: 12, inner: 3, eta: D(11, 20), stage: 'On the water' })],
+    atsOf({ SS600: [0, 100, -100, [[300, D(11, 20)]]] })), { today: TODAY });
+  assert.deepEqual(ov.rows.map(r => [r.pack, r.onHand, r.inTransit]), [['12/3', 0, 200]]);
+});
+
+test('Pull from China: a row per pack on the same date; goods on a reserved PO their own row with the note', () => {
+  const sh = SS.chinaRows(packSell(), { today: TODAY, reserved: RESERVED });
+  assert.deepEqual(sh.rows.map(r => [r.style, r.pullFrom, r.pack, r.note, r.units]), [['SS610', D(12, 1), '24/6', '', 40], ['SS610', D(12, 1), '24/6', 'Reserved -ZZQ', 60]]);
+  assert.equal(sh.counts.reserved, 1);
+  assert.deepEqual(SS.chinaRows(packSell(), { today: TODAY }).rows.map(r => [r.pack, r.note, r.units]), [['24/6', '', 100]]);
 });
 
 test('by date: on hand now, then each in-transit date, units only; in the rows\' order', () => {
@@ -188,7 +240,7 @@ test('by date: on hand now, then each in-transit date, units only; in the rows\'
 
 // ---------- Pull from China
 
-test('Pull from China: our goods in China not sold, one row per style and pull-from date; a date before today left off', () => {
+test('Pull from China: our goods in China not sold, one row per style, pull-from date and pack; a date before today left off', () => {
   const sh = SS.chinaRows(mainSell(), { today: TODAY });
   assert.equal(sh.ok, true);
   assert.equal(sh.kind, 'china');
@@ -199,11 +251,13 @@ test('Pull from China: our goods in China not sold, one row per style and pull-f
     ['SS100', D(10, 1) + 75, true, 100, '24/6'],
     // SS200: oversold 50, 30 of it off its In Trans, 20 off its goods in China.
     ['SS200', D(12, 1), false, 50, ''],
-    ['SS300', D(12, 1), false, 84, '12/3 · 24/6'],
+    // SS300: a row per pack on 12/1.
+    ['SS300', D(12, 1), false, 36, '12/3'],
+    ['SS300', D(12, 1), false, 48, '24/6'],
     ['SS300', D(12, 20), false, 30, '12/3'],
   ]);
   // SS100's Booked 240 had 10/10 to pull from: too late, left off.
-  assert.deepEqual(sh.counts, { rows: 6, styles: 4, ordersOff: 20, past: 240, noDate: 0, stockUnknown: 0 });
+  assert.deepEqual(sh.counts, { rows: 7, styles: 4, reserved: 0, ordersOff: 20, past: 240, noDate: 0, stockUnknown: 0 });
   assert.deepEqual(sh.totals, { units: 840 });
   // What a style is oversold beyond its In Trans comes off its earliest goods in China first (a past one too).
   const o = SS.chinaRows(sellOf([alloc({ units: 100, etd: D(10, 20), bucket: 'booked', stage: 'Booked' }), alloc({ units: 200, po: '900109', dates: { factoryCrd: D(12, 6) } })],
@@ -264,10 +318,11 @@ test('NO LEAK: the rows and the schedule hold none of the names, numbers, flags 
   const flags = new Set([...sell.styles, ...sell.lots].flatMap(x => x.flags || []).filter(f => f.includes('-')));
   assert.ok(flags.size >= 3, [...flags].join(', '));
 
-  const sh = SS.salesRows(sell, { today: TODAY }), ch = SS.chinaRows(sell, { today: TODAY });
+  const sh = SS.salesRows(sell, { today: TODAY, reserved: { '-QXLEAKPO': 'Reserved' } }), ch = SS.chinaRows(sell, { today: TODAY, reserved: { '-QXLEAKPO': 'Reserved' } });
   assert.equal(sh.ok, true);
   assert.equal(ch.ok, true);
-  assert.deepEqual(sh.rows.map(r => r.style), ['SS100', 'SS700']);
+  // SS100: its stock in the style's own pack, its In Trans on our goods' PO (it ends in the reserved suffix): two lines.
+  assert.deepEqual(sh.rows.map(r => [r.style, r.note]), [['SS100', ''], ['SS100', 'Reserved'], ['SS700', '']]);
   assert.deepEqual(ch.rows.map(r => r.style), ['SS100', 'SS700', 'SS701']);
   for (const [out, where] of [[allText(sh), 'the sales rows'], [allText(ch), 'the Pull from China rows']]) {
     noMarks(out, where);
@@ -313,34 +368,35 @@ test('the workbook: every style, a tab per category, By date; the title, frozen 
   const ws = book.Sheets['On hand ATS'], v = a => (ws[a] ? ws[a].v : undefined);
   assert.equal(v('A1'), 'M1S · On hand ATS');
   assert.equal(v('D1'), undefined, 'no "as of" line (Saul, Nov 3)');
-  assert.deepEqual('ABCDEFGHIJK'.split('').map(c => v(c + '2')), SS.COLS.map(c => c.h));
-  assert.deepEqual(SS.COLS.map(c => c.h), ['Photo', 'Style', 'UPC', 'Description', 'Category', 'Sub category', 'Master/Inner', 'Available on hand (units)',
-    'Available in transit (units)', 'In transit available from', 'Total available (units)']);
-  assert.deepEqual('BCDEFGHIJK'.split('').map(c => v(c + '3')), ['SS100', '000111222333', 'Item SS100', 'Lip', undefined, '24/6', 460, 420, 'now', 880]);
-  assert.deepEqual('BGHIJK'.split('').map(c => v(c + '4')), ['SS300', '12/– · 12/3 · 24/6', 10, undefined, undefined, 10]);
-  assert.deepEqual('BDGHIJK'.split('').map(c => v(c + '5')), ['SS500', 'ERP SS500', undefined, 80, 24, 'date to come', 104]);
+  assert.deepEqual('ABCDEFGHIJKLM'.split('').map(c => v(c + '2')), SS.COLS.map(c => c.h));
+  assert.deepEqual(SS.COLS.map(c => c.h), ['Photo', 'Style', 'UPC', 'Description', 'Brand', 'Category', 'Sub category', 'Master/Inner', 'Available on hand (units)',
+    'Available in transit (units)', 'In transit available from', 'Total available (units)', 'Notes']);
+  assert.deepEqual('BCDEFGHIJKLM'.split('').map(c => v(c + '3')), ['SS100', '000111222333', 'Item SS100', undefined, 'Lip', undefined, '24/6', 460, 420, 'now', 880, undefined]);
+  assert.deepEqual('BHIJKL'.split('').map(c => v(c + '4')), ['SS300', '24/6', 10, undefined, undefined, 10]);
+  assert.deepEqual('BDHIJKL'.split('').map(c => v(c + '5')), ['SS500', 'ERP SS500', undefined, 80, 24, 'date to come', 104]);
   assert.equal(v('B6'), undefined, 'three styles, no more');
   assert.equal(ws.C3.t, 's', 'UPCs stay text');
-  assert.equal(ws.H3.z, '#,##0');
-  assert.equal(ws.G3.t, 's', 'Master/Inner is text');
+  assert.equal(ws.I3.z, '#,##0');
+  assert.equal(ws.H3.t, 's', 'Master/Inner is text');
   // A date cell: a style whose first shipment is due after today.
   const later = SS.salesRows(sellOf([alloc({ dates: { factoryCrd: D(12, 6) } })], atsOf({ SS100: [0, 0, 0, [[48, D(11, 20)]]] })), { today: TODAY });
   const lb = readBack(await SS.workbookBytes(SS.buildWorkbook(loadExcelJS(), later, null))).Sheets['On hand ATS'];
-  assert.deepEqual([lb.J3.v, lb.J3.z, lb.K3.v], [serial(D(11, 27)), 'm/d/yyyy', 48]);
+  assert.deepEqual([lb.K3.v, lb.K3.z, lb.L3.v], [serial(D(11, 27)), 'm/d/yyyy', 48]);
 
   const wd = book.Sheets['By date'], w = a => (wd[a] ? wd[a].v : undefined);
-  assert.deepEqual(['A1', 'B1', 'C1', 'D1', 'E1', 'F1', 'G1'].map(w), ['Style', 'Description', 'Category', 'Available from', 'Where', 'Units', undefined]);
+  assert.deepEqual(['A1', 'B1', 'C1', 'D1', 'E1', 'F1', 'G1', 'H1', 'I1'].map(w), ['Style', 'Description', 'Category', 'Master/Inner', 'Available from', 'Where', 'Units', 'Notes', undefined]);
+  assert.equal(w('D2'), '24/6');
   const sched = [];
-  for (let r = 2; w('A' + r) !== undefined; r++) sched.push(['A', 'C', 'D', 'E', 'F'].map(c => w(c + r)));
+  for (let r = 2; w('A' + r) !== undefined; r++) sched.push(['A', 'C', 'E', 'F', 'G'].map(c => w(c + r)));
   assert.deepEqual(sched, [['SS100', 'Lip', 'now', 'On hand', 460], ['SS100', 'Lip', 'now', 'In transit', 120], ['SS100', 'Lip', serial(D(11, 27)), 'In transit', 300],
     ['SS300', 'Lip', 'now', 'On hand', 10], ['SS500', 'Lip', 'now', 'On hand', 80], ['SS500', 'Lip', 'date to come', 'In transit', 24]]);
 
   const parts = xlsxParts(bytes);
   const sheet1 = Buffer.from(parts.get('xl/worksheets/sheet1.xml')).toString('utf8'), sheet3 = Buffer.from(parts.get('xl/worksheets/sheet3.xml')).toString('utf8');
   assert.match(sheet1, /<pane xSplit="2" ySplit="2" topLeftCell="C3" activePane="bottomRight" state="frozen"\/>/);
-  assert.match(sheet1, /<autoFilter ref="A2:K2"\/>/);
+  assert.match(sheet1, /<autoFilter ref="A2:M2"\/>/);
   assert.match(sheet3, /<pane xSplit="1" ySplit="1" topLeftCell="B2" activePane="bottomRight" state="frozen"\/>/);
-  assert.match(sheet3, /<autoFilter ref="A1:F1"\/>/);
+  assert.match(sheet3, /<autoFilter ref="A1:H1"\/>/);
   // Two photos, in the Photo column on their styles' rows (SS100 on row 3, SS300 on row 4: 0-based 2 and 3), fitted
   // inside the cell; every style row has the photo row height. The Lip tab shows them too, from the same two pictures.
   assert.equal([...parts.keys()].filter(p => /^xl\/media\//.test(p)).length, 2);
@@ -367,21 +423,21 @@ test('the Pull from China workbook: every row, a tab per category, no By date; u
   const ws = book.Sheets['Pull from China'], v = a => (ws[a] ? ws[a].v : undefined);
   assert.equal(v('A1'), 'M1S · Pull from China');
   assert.equal(book.Sheets.Lip.A1.v, 'M1S · Pull from China · Lip');
-  assert.deepEqual('ABCDEFGHI'.split('').map(c => v(c + '2')), ['Photo', 'Style', 'UPC', 'Description', 'Category', 'Sub category', 'Master/Inner', 'Units', 'Pull from date']);
-  assert.deepEqual(SS.CHINA_COLS.map(c => c.h), 'ABCDEFGHI'.split('').map(c => v(c + '2')));
+  assert.deepEqual('ABCDEFGHIJK'.split('').map(c => v(c + '2')), ['Photo', 'Style', 'UPC', 'Description', 'Brand', 'Category', 'Sub category', 'Master/Inner', 'Units', 'Pull from date', 'Notes']);
+  assert.deepEqual(SS.CHINA_COLS.map(c => c.h), 'ABCDEFGHIJK'.split('').map(c => v(c + '2')));
   const about = `about ${C.fmtDay(D(10, 1) + 75)}`;
   const got = [];
-  for (let r = 3; v('B' + r) !== undefined; r++) got.push(['B', 'G', 'H', 'I'].map(c => v(c + r)));
+  for (let r = 3; v('B' + r) !== undefined; r++) got.push(['B', 'H', 'I', 'J'].map(c => v(c + r)));
   assert.deepEqual(got, [['SS050', '24/6', 96, about], ['SS100', '24/6', 480, serial(D(12, 1))], ['SS100', '24/6', 100, about], ['SS200', undefined, 50, serial(D(12, 1))],
-    ['SS300', '12/3 · 24/6', 84, serial(D(12, 1))], ['SS300', '12/3', 30, serial(D(12, 20))]]);
-  assert.equal(ws.I4.z, 'm/d/yyyy');
-  assert.match(Buffer.from(xlsxParts(bytes).get('xl/worksheets/sheet1.xml')).toString('utf8'), /<autoFilter ref="A2:I2"\/>/);
-  // SS100 on rows 4 and 5 and SS300 on rows 7 and 8, on both tabs: two pictures in the file, shown eight times.
+    ['SS300', '12/3', 36, serial(D(12, 1))], ['SS300', '24/6', 48, serial(D(12, 1))], ['SS300', '12/3', 30, serial(D(12, 20))]]);
+  assert.equal(ws.J4.z, 'm/d/yyyy');
+  assert.match(Buffer.from(xlsxParts(bytes).get('xl/worksheets/sheet1.xml')).toString('utf8'), /<autoFilter ref="A2:K2"\/>/);
+  // SS100 on rows 4 and 5 and SS300 on rows 7 to 9, on both tabs: two pictures in the file, shown ten times.
   const parts = xlsxParts(bytes);
   assert.equal([...parts.keys()].filter(p => /^xl\/media\//.test(p)).length, 2);
   const d1 = Buffer.from(parts.get('xl/drawings/drawing1.xml')).toString('utf8');
-  assert.deepEqual([...d1.matchAll(/<xdr:from><xdr:col>\d+<\/xdr:col><xdr:colOff>\d+<\/xdr:colOff><xdr:row>(\d+)<\/xdr:row>/g)].map(m => +m[1]), [3, 4, 6, 7]);
-  assert.equal(Buffer.from(parts.get('xl/drawings/drawing2.xml')).toString('utf8').match(/<xdr:pic>/g).length, 4);
+  assert.deepEqual([...d1.matchAll(/<xdr:from><xdr:col>\d+<\/xdr:col><xdr:colOff>\d+<\/xdr:colOff><xdr:row>(\d+)<\/xdr:row>/g)].map(m => +m[1]), [3, 4, 6, 7, 8]);
+  assert.equal(Buffer.from(parts.get('xl/drawings/drawing2.xml')).toString('utf8').match(/<xdr:pic>/g).length, 5);
 });
 
 test('a tab per category: A to Z, no category last, rows by sub category then style, the same numbers; each picture stored once', async () => {
@@ -403,15 +459,15 @@ test('a tab per category: A to Z, no category last, rows by sub category then st
   const cell = (tab, a) => (book.Sheets[tab][a] ? book.Sheets[tab][a].v : undefined);
   assert.equal(cell('Bath', 'A1'), 'M1S · On hand ATS · Bath');
   assert.equal(cell('No category', 'A1'), 'M1S · On hand ATS · No category');
-  assert.deepEqual('ABCDEFGHIJK'.split('').map(c => cell('Cosmetics2', c + '2')), SS.COLS.map(c => c.h));
-  assert.deepEqual(['B3', 'E3', 'F3', 'B4'].map(a => cell('Bath', a)), ['SS300', 'Bath', 'Gloves', undefined]);
-  assert.deepEqual(['B3', 'E3', 'F3', 'B4'].map(a => cell('No category', a)), ['SS500', undefined, undefined, undefined]);
+  assert.deepEqual('ABCDEFGHIJKLM'.split('').map(c => cell('Cosmetics2', c + '2')), SS.COLS.map(c => c.h));
+  assert.deepEqual(['B3', 'F3', 'G3', 'B4'].map(a => cell('Bath', a)), ['SS300', 'Bath', 'Gloves', undefined]);
+  assert.deepEqual(['B3', 'F3', 'G3', 'B4'].map(a => cell('No category', a)), ['SS500', undefined, undefined, undefined]);
   // Every category tab's cells are the all-styles tab's, row for row, and together they hold every style once.
   const tabs = SS.categoryTabs(sh.rows);
   assert.deepEqual(tabs.flatMap(t => t.rows).sort(), sh.rows.map((r, n) => n));
   for (const t of tabs) {
     t.rows.forEach((at, n) => {
-      for (const c of 'BCDEFGHIJK') assert.deepEqual(cell(t.name, c + (n + 3)), cell('On hand ATS', c + (at + 3)), `${t.name} ${c}${n + 3}`);
+      for (const c of 'BCDEFGHIJKLM') assert.deepEqual(cell(t.name, c + (n + 3)), cell('On hand ATS', c + (at + 3)), `${t.name} ${c}${n + 3}`);
     });
     assert.equal(cell(t.name, 'B' + (t.rows.length + 3)), undefined, `${t.name}: no more rows`);
   }
@@ -525,4 +581,35 @@ test('NO LEAK: no part of the Excel file holds a name, number, flag or problem t
   // Its author is the tool, never a person.
   assert.match(Buffer.from(parts.get('docProps/core.xml')).toString('utf8'), /<dc:creator>Shalam Tool<\/dc:creator>[^]*<cp:lastModifiedBy>Shalam Tool<\/cp:lastModifiedBy>/);
   }
+});
+
+// ---------- a file read back (the sales page)
+
+test('readWorkbook: each file read back gives its rows, schedule and each row\'s photo as they were written; a file it didn\'t make is refused', async () => {
+  const E = loadExcelJS(), sell = packSell();
+  for (const s1 of sell.styles) if (s1.style === 'SS600') s1.brand = 'Brand Q';
+  const load = async wb => { const w = new E.Workbook(); await w.xlsx.load(await SS.workbookBytes(wb)); return w; };
+  for (const [sh, label] of [[SS.salesRows(mainSell(), { today: TODAY }), 'sales'], [SS.salesRows(sell, { today: TODAY, reserved: RESERVED }), 'sales, split'],
+    [SS.chinaRows(mainSell(), { today: TODAY }), 'china'], [SS.chinaRows(sell, { today: TODAY, reserved: RESERVED }), 'china, reserved']]) {
+    // A photo for every other style (each of its lines shows it), the first a 1×1, the next a 2×1.
+    const styles = [...new Set(sh.rows.map(r => r.style))];
+    const photos = sh.rows.map(r => { const i = styles.indexOf(r.style); return i % 2 === 0 ? { data: i % 4 === 0 ? PNG1 : PNG2, width: i % 4 === 0 ? 1 : 2, height: 1, extension: 'png' } : null; });
+    const got = SS.readWorkbook(await load(SS.buildWorkbook(E, sh, photos)));
+    assert.equal(got.kind, sh.kind, label);
+    assert.deepEqual(got.rows, sh.rows, label);
+    assert.deepEqual(got.byDate, sh.byDate || [], label);
+    assert.equal(JSON.stringify(got.rows) + JSON.stringify(got.byDate), JSON.stringify(sh.rows) + JSON.stringify(sh.byDate || []), `${label}: the fields in the same order`);
+    assert.deepEqual(got.photos.map((p, i) => (p ? [!!photos[i] && Buffer.from(p.data).equals(Buffer.from(photos[i].data)), p.extension, Math.round(p.width / p.height)] : null)),
+      photos.map(p => (p ? [true, 'png', p.width] : null)), label);
+    // Written again from what was read: the same cells.
+    const again = SS.readWorkbook(await load(SS.buildWorkbook(E, { ok: true, kind: got.kind, rows: got.rows, byDate: got.byDate }, got.photos)));
+    assert.deepEqual([again.rows, again.byDate], [got.rows, got.byDate], label);
+  }
+  // Not one of these files: refused in plain words.
+  const other = new E.Workbook(); other.addWorksheet('Report').getRow(2).getCell(1).value = 'Style';
+  const loaded = await load(other);
+  assert.throws(() => SS.readWorkbook(loaded), /isn't one of the sales sheets Shalam Tool makes/);
+  const changed = await load(SS.buildWorkbook(E, SS.salesRows(mainSell(), { today: TODAY }), null));
+  changed.worksheets[0].getRow(2).getCell(5).value = 'Something else';
+  assert.throws(() => SS.readWorkbook(changed), /isn't one of the sales sheets/);
 });

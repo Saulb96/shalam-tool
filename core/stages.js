@@ -68,6 +68,7 @@
     inner: { names: ['Inner', 'Inner Pack', 'Inner Carton'] },
     category: { names: ['Category'] },
     sub: { names: ['Sub', 'Sub Category', 'SubCategory'] },
+    brand: { names: ['Brand'] },
   };
   const MSL_WHAT = {
     upc: ['Barcode', 'the UPCs come from Container Tracking only'],
@@ -116,7 +117,8 @@
     // ---------- Master Sheet Live facts by row: Barcode, Master, Inner, Category, Sub (none required)
     const mrows = input.mrows || po.mrows || null;
     const mcols = mrows && mrows.length ? C.findColumns(mrows[0] || [], MSL_SPEC).cols : {};
-    // No Inner column is no issue: the sales sheets show the Master pack with "–" for the Inner, there to see.
+    // No Inner or Brand column is no issue: the sales sheets show the Master pack with "–" for the Inner, and the brand
+    // from UPC_MASTER (or none), there to see.
     for (const k of Object.keys(MSL_WHAT)) {
       if (mcols[k] != null) continue;
       const [name, what] = MSL_WHAT[k];
@@ -130,7 +132,7 @@
       const r = (mrows && row >= 1 && mrows[row - 1]) || [];
       const at = k => (mcols[k] == null ? null : r[mcols[k]] ?? null);
       const f = { upc: C.normUpc(at('upc')), upcRaw: S(at('upc')), master: goodMaster(at('master')), inner: goodMaster(at('inner')),
-        category: S(at('category')), sub: S(at('sub')) };
+        category: S(at('category')), sub: S(at('sub')), brand: S(at('brand')) };
       factCache.set(row, f);
       return f;
     }
@@ -815,12 +817,13 @@
       const um = upcMap ? upcMap.get(s.style) : null;
       if (upcMap && !(um && um.length)) counts.stylesNotInUpcMaster++;
       const latest = styleLatest.get(s.style);
-      const umDesc = um && um.find(e => e.desc), umCat = um && um.find(e => e.category), umSub = um && um.find(e => e.sub);
+      const umDesc = um && um.find(e => e.desc), umCat = um && um.find(e => e.category), umSub = um && um.find(e => e.sub), umBrand = um && um.find(e => e.brand);
       const from = {};
-      let desc = '', category = '', sub = '';
+      let desc = '', category = '', sub = '', brand = '';
       if (umDesc) { desc = umDesc.desc; from.desc = F.upc; } else if (latest && S(latest.l.desc)) { desc = S(latest.l.desc); from.desc = latest.tr ? F.trk : F.msl; }
       if (umCat) { category = umCat.category; from.category = F.upc; } else if (latest && latest.fact.category) { category = latest.fact.category; from.category = F.msl; }
       if (umSub) { sub = umSub.sub; from.sub = F.upc; } else if (latest && latest.fact.sub) { sub = latest.fact.sub; from.sub = F.msl; }
+      if (umBrand) { brand = umBrand.brand; from.brand = F.upc; } else if (latest && latest.fact.brand) { brand = latest.fact.brand; from.brand = F.msl; }
       const factories = uniq(s.counted.map(a => a.factory)).sort();
       const customers = uniq(s.counted.map(a => a.customer)).sort();
       const etas = s.counted.filter(a => (a.bucket === 'water' || a.bucket === 'port') && a.eta != null).map(a => a.eta);
@@ -831,7 +834,7 @@
         issue('no-case-pack', '', s.style, latest ? latest.l.row : '', `Style ${latest ? latest.styleRaw : s.style}: ${unitsText(s.noCasePackUnits.incoming + s.noCasePackUnits.pullFromChina + s.noCasePackUnits.unmatched)} in the stage totals have no Master (case pack) on Master Sheet Live or Container Tracking, so they show as units only, not cases.`, { sheet: F.msl });
       }
       styles.push({
-        style: s.style, styleRaw: latest ? latest.styleRaw : s.counted[0].styleRaw, desc, category, sub, from,
+        style: s.style, styleRaw: latest ? latest.styleRaw : s.counted[0].styleRaw, desc, category, sub, brand, from,
         factories, factory: factories.length > 1 ? 'Several' : factories[0] || '', customers,
         upcs, units: s.units, cases: s.cases, noCasePackUnits: s.noCasePackUnits, noCasePack: s.noCasePack,
         nextEta: etas.length ? Math.min(...etas) : null, allocs: allocsByStyle.get(s.style) || [],

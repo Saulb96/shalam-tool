@@ -118,6 +118,10 @@
     for (const p of list) if (p && isDay(p.master) && p.master > 0) m.set(p.master + '/' + (p.inner ?? ''), { master: p.master, inner: isDay(p.inner) ? p.inner : null });
     return [...m.values()].sort((a, b) => a.master - b.master || (a.inner ?? 0) - (b.inner ?? 0));
   };
+  // Part of one of the ERP's shipments that our goods (a lot, or our Landed goods) were placed on: its units, and their
+  // Master/Inner and PO (the sales sheets split a style by pack: Saul, Nov 4).
+  const partOf = (src, units) => ({ units, master: isDay(src.master) && src.master > 0 ? src.master : null,
+    inner: isDay(src.master) && src.master > 0 && isDay(src.inner) && src.inner > 0 ? src.inner : null, po: S(src.po) });
   // A source date more than a year ahead, or before 2015 (core/ct.js's "date-far" rule), isn't used as the ready date.
   const FLOOR = C.ymd(2015, 1, 1);
   const farDay = (d, today) => isDay(today) && (d > today + 366 || d < FLOOR);
@@ -225,7 +229,8 @@
       if (a.bucket === 'landed' && a.units > 0 && !soldA(a)) {
         const day = isDay(a.eta) ? a.eta : isDay(a.delivered) ? a.delivered : isDay(a.etd) ? a.etd : null;
         (landedBy.get(a.style) || landedBy.set(a.style, []).get(a.style)).push({ po: a.po, units: a.units, day,
-          dayFrom: isDay(a.eta) ? 'eta' : isDay(a.delivered) ? 'delivered' : isDay(a.etd) ? 'etd' : null });
+          dayFrom: isDay(a.eta) ? 'eta' : isDay(a.delivered) ? 'delivered' : isDay(a.etd) ? 'etd' : null,
+          master: isDay(a.master) && a.master > 0 ? a.master : null, inner: innerOf(a) });
       }
       const lotBucket = IN_CHINA.includes(a.bucket) || SAILED.includes(a.bucket);
       const sold = a.bucket === 'pullFromChina' || (lotBucket && soldA(a));
@@ -298,7 +303,7 @@
       return { id: `erp|${style}|${x.row}|${i + 1}`, allocId: null, style, styleRaw, upc: null, po: '', poShown: '', erpPo: po,
         status: STATUS.erp, bucket: 'erp', source: 'erp', inChina: false, units: n,
         matched: 0, received: 0, inErpTransit: 0, erpTier: null, notOnErp: 0, taken: 0, available: n, master: null, cases: null,
-        place: { matched: 0, landedOurs: 0, landedDue: 0, offChina: 0, unplaced: 0 },
+        place: { matched: 0, landedOurs: 0, landedDue: 0, offChina: 0, unplaced: 0 }, parts: [],
         readyDate: null, readyFrom: null, readySources: [], readySpread: 0, dates: Object.assign({}, NO_DATES),
         crd: null, etd: null, eta, pullFrom: null, pullRule: null, pullRange: null, pullNow: false,
         arrival: eta, arrivalRule: eta != null ? 'eta' : 'none', availableDate: eta, estimate: false,
@@ -403,8 +408,8 @@
         const landedFits = day => s => dueBy(s) || (s.eta != null && day != null && s.eta <= day + LANDED_LATE_DAYS);
         // n units of our goods dated `day` placed on the shipments still unplaced (only those `fits` allows; with dueFirst,
         // those due by the report's day before any other): one of the same quantity first, then the closest ETA, then the
-        // earliest.
-        const place = (n, day, key, dueFirst, fits = () => true) => {
+        // earliest. src: the lot or Landed goods they are (each shipment's parts).
+        const place = (n, day, key, dueFirst, fits = () => true, src = null) => {
           const gap = s => (s.eta == null || day == null ? Infinity : Math.abs(s.eta - day));
           const rank = (a, b) => gap(a) - gap(b) || etaOrder(a, b);
           const open = ships.filter(s => left.get(s) > 0 && fits(s));
@@ -415,13 +420,14 @@
               if (k <= 0) break;
               const m = Math.min(left.get(s), k);
               left.set(s, left.get(s) - m); s.place[key] += m; k -= m;
+              if (src && m > 0) s.parts.push(partOf(src, m));
               if (key === 'landedOurs' && !dueBy(s)) res.landedLater += m;
             }
           }
         };
         for (const l of sailed.slice().sort(etaOrder)) {
           l.matched = l.units; res.matched += l.units; l.flags.push('matched-erp'); counts.matchedLots++;
-          place(l.units, l.eta, 'matched', false);
+          place(l.units, l.eta, 'matched', false, undefined, l);
         }
         let x = E - res.ourSailed;
         // 1. Landed, not received yet: our Landed goods of the style dated from 60 days before the report's day up to
@@ -438,7 +444,7 @@
           for (const a of recent) {
             const fits = landedFits(a.day), n = Math.min(a.units, room, sumU(ships.filter(s => fits(s)), s => left.get(s)));
             if (n <= 0) continue;
-            place(n, a.day, 'landedOurs', true, fits); x -= n; room -= n; res.landedOurs += n;
+            place(n, a.day, 'landedOurs', true, fits, a); x -= n; room -= n; res.landedOurs += n;
             res.landedLots.push({ po: a.po, units: n, day: a.day, dayFrom: a.dayFrom });
           }
           for (const s of ships) if (dueBy(s) && left.get(s) > 0 && room > 0) { const m = Math.min(left.get(s), room); s.place.landedDue += m; left.set(s, left.get(s) - m); x -= m; room -= m; res.landedDue += m; }
@@ -448,7 +454,7 @@
         // China (above). Never below the report's Import PO Backlog: only our China goods beyond it may come off.
         const bases = new Set(goneBasesBy.get(style) || []);
         for (const s of ships) if (left.get(s) > 0 && base6(s.erpPo)) bases.add(base6(s.erpPo));
-        x -= takeOffChina(Math.min(x, offMax), bases, (m, l) => place(m, l.eta, 'offChina', false));
+        x -= takeOffChina(Math.min(x, offMax), bases, (m, l) => place(m, l.eta, 'offChina', false, undefined, l));
         res.takenDueBy = sumU(ships.filter(dueBy), s => s.place.offChina);
         // 3. Still unplaced: Arriving on the ERP's word, and listed (some our sheets may still show in China).
         res.unplaced = x;
@@ -488,7 +494,7 @@
           const gap = l => (s.eta == null || l.eta == null ? Infinity : Math.abs(l.eta - s.eta));
           const same = free.filter(l => l.units === s.units).sort((a, b) => gap(a) - gap(b) || etaOrder(a, b))[0];
           if (!same) continue;
-          free.splice(free.indexOf(same), 1); sameShips.add(s);
+          free.splice(free.indexOf(same), 1); sameShips.add(s); s.parts.push(partOf(same, s.units));
           same.matched = same.units; res.matched += same.units;
           same.flags.push('matched-erp'); counts.matchedLots++; counts.sameQtyMatchedLots++;
         }
@@ -517,9 +523,9 @@
           const bases = new Set(goneBasesBy.get(style) || []);
           for (const s of later) if (base6(s.erpPo)) bases.add(base6(s.erpPo));
           const left = new Map(later.map(s => [s, s.units]));
-          takeOffChina(k, bases, m0 => {
+          takeOffChina(k, bases, (m0, l) => {
             let m = m0;
-            for (const s of later) { if (m <= 0) break; const q = Math.min(left.get(s), m); left.set(s, left.get(s) - q); s.place.offChina += q; m -= q; }
+            for (const s of later) { if (m <= 0) break; const q = Math.min(left.get(s), m); left.set(s, left.get(s) - q); s.place.offChina += q; m -= q; if (q > 0) s.parts.push(partOf(l, q)); }
           });
           counts.lessTakenStyles++;
         }
@@ -537,6 +543,13 @@
           s.place.matched = s.units - s.place.offChina;
           if (s.place.matched) s.flags.push('erp-ours-sailed');
           if (s.place.offChina) s.flags.push('erp-off-china');
+        }
+        // Their parts: our sailed lots' units matched to the report, earliest ETA first, on its shipments in the same order
+        // (a shipment of the same quantity has its own lot already).
+        const pool = free.filter(l => l.matched > 0).map(l => ({ l, n: l.matched }));
+        for (const s of res.erpLots.filter(s => !sameShips.has(s)).sort(etaOrder)) {
+          let need = s.place.matched;
+          for (const p of pool) { if (need <= 0) break; const q = Math.min(p.n, need); if (q > 0) { s.parts.push(partOf(p.l, q)); p.n -= q; need -= q; } }
         }
       }
       for (const l of ls) l.available = l.units - replaced(l);
@@ -618,7 +631,7 @@
       const stockPack = isDay(casePack) ? casePack : lm ? lm.master : null;
       // Master/Inner (the sales sheets, Saul, Nov 3): every pair on our lots, else the latest Master Sheet line's.
       const packs = packsOf(ours.length && masters.length ? ours : lm ? [lm] : []);
-      const stockPair = packs.find(p => p.master === stockPack) || null;
+      const stockPair = packs.find(p => p.master === stockPack) || (lm && lm.master === stockPack ? { master: lm.master, inner: lm.inner ?? null } : null);
       for (const l of x.erpLots) { l.master = stockPack; l.inner = stockPair ? stockPair.inner : null; }
 
       const sum = (pred, f) => ls.filter(pred).reduce((s, l) => s + f(l), 0);
@@ -642,7 +655,7 @@
       const pulls = ls.filter(l => l.inChina && l.available > 0 && l.pullFrom != null);
       const first = pulls.reduce((m, l) => (!m || l.pullFrom < m.pullFrom ? l : m), null);
       const arr = ls.filter(l => !l.inChina && l.available > 0 && l.arrival != null);
-      const umDesc = um.find(u => u.desc), umCat = um.find(u => u.category);
+      const umDesc = um.find(u => u.desc), umCat = um.find(u => u.category), umBrand = um.find(u => u.brand);
       const catFrom = st && st.category ? st : umCat || (e && e.category ? e : null);
       const upcs = uniq([...(st ? st.upcs.map(u => u.upc) : []), ...ls.map(l => l.upc), ...um.map(u => u.upc)]);
       styles.push({
@@ -650,6 +663,8 @@
         desc: (st && st.desc) || (umDesc && umDesc.desc) || (e && e.desc) || '',
         // The sub category from where the category came, never one from each.
         category: catFrom ? catFrom.category : '', sub: (catFrom && catFrom.sub) || '',
+        // The brand: UPC_MASTER's, else Master Sheet Live's (through the stage engine), '' when neither has one.
+        brand: (umBrand && umBrand.brand) || (st && st.brand) || '',
         // The ATS report's own category and sub category (the sales sheet's tabs: Saul, Nov 3), '' when it has none.
         atsCategory: (e && e.category) || '', atsSub: (e && e.category && e.sub) || '',
         factory: (st && st.factory) || '', factories: st ? st.factories.slice() : [],
@@ -658,7 +673,13 @@
         // (null when it has none, or it can't be read), and its In Trans shipments ({ units, eta }, each quantity with its
         // ETA; null when its In Trans isn't known for the style).
         erpAts: e && isDay(e.erpAts) ? e.erpAts : null,
-        erpTransit: x.mode === 'erp' ? x.erpLots.map(l => ({ units: l.units, eta: l.eta })) : null,
+        // parts: our goods each shipment was matched to ({ units, master, inner, po }; the rest of it: none known).
+        erpTransit: x.mode === 'erp' ? x.erpLots.map(l => ({ units: l.units, eta: l.eta, parts: l.parts.map(p => ({ ...p })) })) : null,
+        // The pack stock is in when nothing says otherwise ({ master, inner }, null when unknown), and our Landed goods not
+        // sold ({ units, day, master, inner, po }, the latest first): the sales sheets split the stock by them (Saul, Nov 4).
+        stockPack: isDay(stockPack) ? { master: stockPack, inner: stockPair ? stockPair.inner : null } : null,
+        landedPacks: (landedBy.get(style) || []).slice().sort((a, b) => (b.day ?? -Infinity) - (a.day ?? -Infinity) || byPo(b.po, a.po))
+          .map(a => ({ units: a.units, day: a.day, master: a.master, inner: a.inner, po: S(a.po) })),
         // orders: the ERP's Total Customer Orders as they are; ordersShipChina of them ship from China with goods sold
         // there (not loaded yet: soldNotLoaded, never on a style ending in -F), so ordersOffStock come off the stock:
         // stockNet = inWh − ordersOffStock.

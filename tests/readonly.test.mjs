@@ -9,7 +9,7 @@ import { root } from './load.mjs';
 
 const text = p => readFileSync(root(p), 'utf8');
 const app = text('app.js');
-const pageFiles = ['app.js', 'index.html', 'config.js', 'picturesWorker.js', ...readdirSync(root('core')).filter(f => f.endsWith('.js')).map(f => 'core/' + f)];
+const pageFiles = ['app.js', 'index.html', 'config.js', 'picturesWorker.js', 'sales.js', 'sales.html', ...readdirSync(root('core')).filter(f => f.endsWith('.js')).map(f => 'core/' + f)];
 const GRAPH = 'https://graph.microsoft.com/v1.0';
 // A piece of app.js, from `from` up to (not including) the next `to` after it.
 function slice(from, to) {
@@ -234,6 +234,8 @@ test('config.js holds the sign-in, every source location, the sales sheet\'s lib
   assert.match(c.salesLibrary, /^\/sites\/[^/]+\/[^/]+$/);
   assert.equal(c.salesFile, 'On hand ATS.xlsx');
   assert.equal(c.chinaFile, 'Pull from China.xlsx');
+  // POs held for a customer (Saul, Nov 4): a suffix and the note its lines get.
+  assert.equal(JSON.stringify(c.reserved), JSON.stringify({ '-BCF': 'Reserved -BCF' }));
   assert.match(c.salesFile, /^[^/\\:*?"<>|]+\.xlsx$/);
   assert.equal(c.photos, '/sites/Production/Shared Documents/Quote Sheets/Quote Images');
   assert.match(c.errorEmailTo, /^[^@\s]+@[^@\s]+\.[^@\s]+$/);
@@ -259,4 +261,32 @@ test('index.html is a whole document that loads config.js first and app.js last;
   assert.match(slice('  function loadExcelJS(', '\n  }\n'), /s\.src = 'vendor\/exceljs\/exceljs\.min\.js';/);
   assert.match(app, /\['InvSalesSheet', 'core\/salesSheet\.js'\]/);
   assert.doesNotMatch(h, /<!--/, 'a comment marker in index.html');
+});
+
+// ---------- Shalam Sales (sales.html): the salesperson's page reads only
+const sales = text('sales.js');
+test('Shalam Sales: every request is a GET (Graph through g(), the files through their download link); the guard refuses anything else', () => {
+  const fetches = sales.split('\n').map((l, i) => [i + 1, l]).filter(([, l]) => /\bfetch\s*\(/.test(l) && !/^\s*\/\//.test(l));
+  const ok = [/const r = await fetch\(\/\^https\?:\/\.test\(url\) \? url : GRAPH \+ url, \{ \.\.\.opt, method: 'GET', headers: \{ Authorization: 'Bearer ' \+ t \} \}\);/,
+    /const r = await fetch\(url, \{ signal, cache: 'no-store' \}\);/];
+  assert.equal(fetches.length, ok.length, fetches.map(([n, l]) => `sales.js:${n} ${l.trim()}`).join('\n'));
+  for (const [n, l] of fetches) assert.ok(ok.some(re => re.test(l)), `sales.js:${n}: ${l.trim()}`);
+  assert.doesNotMatch(sales, /\b(POST|PUT|PATCH|DELETE|MERGE)\b|sendMail|createUploadSession|\$batch|XMLHttpRequest|sendBeacon/, 'sales.js names a write');
+  const i = sales.indexOf('  const refusal = method => {'), j = sales.indexOf('\n  };\n', i);
+  const refusal = vm.runInNewContext('(' + sales.slice(i + '  const refusal = '.length, j + 4).replace(/;\s*$/, '') + ')');
+  assert.equal(refusal('GET'), '');
+  assert.equal(refusal(undefined), '');
+  for (const m of ['POST', 'PUT', 'PATCH', 'DELETE', 'post']) assert.match(refusal(m), /^Shalam Sales only reads, so it refused a [A-Z]+ request\.$/, m);
+  assert.match(sales, /async function g\(url, opt = \{\}, tries = \{ auth: 0, busy: 0 \}\) \{\n    const refused = refusal\(opt\.method\);\n    if \(refused\) throw new Error\(refused\);/);
+});
+
+test('Shalam Sales: sign-in asks for read permissions only; the page is a whole document that loads config.js first and sales.js last', () => {
+  assert.match(sales, /const SCOPES = \['User\.Read', 'Sites\.Read\.All'\];/);
+  assert.doesNotMatch(sales, /Mail\.Send|ReadWrite|Selected/);
+  const h = text('sales.html');
+  assert.match(h, /^<!doctype html>\s*<html lang="en">\s*<head>[^]*<\/head>\s*<body class="salespage">[^]*<\/body>\s*<\/html>\s*$/i);
+  assert.match(h, /<title>M1S · Shalam Sales<\/title>/);
+  assert.doesNotMatch(h, /<!--/, 'a comment marker in sales.html');
+  const scripts = [...h.matchAll(/<script src="([^"]+)"><\/script>/g)].map(m => m[1]);
+  assert.deepEqual(scripts, ['config.js', 'vendor/msal/msal-browser.min.js', 'core/common.js', 'core/salesSheet.js', 'core/salesView.js', 'sales.js']);
 });

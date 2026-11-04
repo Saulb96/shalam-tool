@@ -68,7 +68,7 @@ const NAMES = { msl: 'Master Sheet Live', tracker: 'PO Status Tracker', pobook: 
 
 const X = loadXLSX();
 const C = core('common'), PB = core('pobook'), CT = core('ct'), SH = core('shipping'), UPC = core('upc'), ST = core('stages');
-const ATS = core('ats'), SELL = core('sell'), SS = core('salesSheet'), EP = core('erpPictures');
+const ATS = core('ats'), SELL = core('sell'), SS = core('salesSheet'), EP = core('erpPictures'), SV = core('salesView');
 const TODAY = C.todayNY(Date.now());   // the page works its dates out from the same clock
 const iso = days => new Date(Date.now() - days * 864e5).toISOString();
 const fmtN = v => (typeof v === 'number' ? v.toLocaleString('en-US') : String(v));
@@ -709,7 +709,7 @@ function graph(w, method, path, q, body) {
 }
 
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.png': 'image/png', '.json': 'application/json', '.svg': 'image/svg+xml' };
-const SERVED = /^(index\.html|app\.js|app\.css|favicon\.png|picturesWorker\.js|core\/[\w.-]+\.js|vendor\/[\w./-]+)$/;
+const SERVED = /^(index\.html|app\.js|app\.css|favicon\.png|picturesWorker\.js|sales\.html|sales\.js|core\/[\w.-]+\.js|vendor\/[\w./-]+)$/;
 
 function pageServer() {
   return createServer((req, res) => {
@@ -1384,8 +1384,9 @@ function makePhotos() {
 const SELL_PICS = { 'SL-101': 'photo-1.jpg', 'SL-102': 'photo-2.jpg', 'SL-105': 'photo-3.jpg', 'SL-107': 'photo-4.jpg', 'SL-110': 'photo-1.jpg' };
 const PICS = { cfg: { photos: PHOTO_LOC }, photos: k => SELL_PICS[k] || null };
 // Names, numbers and words in the invented files that must never be in the sales sheet (factory, customer, PO,
-// container, round, section, person, file, place, the ERP's warehouses, brand, and what Available to sell says inside).
-const MARKS_SELL = ['Factory S', 'Customer', 'Brand S', 'Test Saver', 'Test User', 'test.user', 'example', 'Saul', 'GGGU1111111', 'FFFU5555555', 'EEEU3333333',
+// container, round, section, person, file, place, the ERP's warehouses, and what Available to sell says inside). The
+// brand is on it (Saul, Nov 4: the sales page filters by it).
+const MARKS_SELL = ['Factory S', 'Customer', 'Test Saver', 'Test User', 'test.user', 'example', 'Saul', 'GGGU1111111', 'FFFU5555555', 'EEEU3333333',
   'Round 3', 'Planning A', 'Hidden Rows', 'China Pickup', 'Master Sheet', 'PO Status', 'Container Tracking', 'Inventory Report', 'sharepoint', 'contoso',
   'Photo Store', 'oversold', 'Oversold', 'In WH', 'warehouse', '>LA<', '>NJ<', 'Sold', 'flag'];
 // Category (Cosmetics on the invented lines) is on the sheet: a tab per category (Saul, Nov 3).
@@ -1420,6 +1421,51 @@ const want0 = (S, today) => (S && S.ok ? SS.salesRows(S, { today }).rows.length 
 // The sheet's rows as the page should make them: the selling engine here, then core/salesSheet.js.
 const sheetFor = (fx, today, f) => { const { S } = sellFor(fx, today, f); return S && S.ok ? SS.salesRows(S, { today }) : null; };
 const chinaFor = (fx, today, f) => { const { S } = sellFor(fx, today, f); return S && S.ok ? SS.chinaRows(S, { today }) : null; };
+
+// ---- the sales page (sales.html, Saul, Nov 4): it reads the two files in the library, nothing else.
+// Ready: signed in, done loading, and showing rows or why there are none.
+const SALES_READY = `(() => { const a = document.getElementById('app'), l = document.getElementById('lead'), b = document.getElementById('busy');
+  return !!a && !a.hidden && a.getAttribute('aria-busy') === 'false' && !!b && b.hidden &&
+    (!!document.querySelector('#grid tbody tr') || (!!l && !l.hidden && !/^Loading/.test(document.getElementById('leadH').textContent))); })()`;
+// What the checks read from the sales page, in one call. A row: its style, pack, note and every cell's text.
+const SALES_SNAP = `(() => {
+  const q = s => document.querySelector(s), txt = el => (el ? el.textContent.replace(/\\s+/g, ' ').trim() : '');
+  const rows = [...document.querySelectorAll('#grid tbody tr')].filter(tr => !tr.querySelector('td.empty'));
+  return { tab: (q('#tabs .tab.on') || {}).dataset.tab, cSales: txt(q('#cSales')), cChina: txt(q('#cChina')), lead: q('#lead').hidden ? '' : txt(q('#lead')),
+    health: txt(q('#health')), info: txt(q('#fInfo')), heads: [...document.querySelectorAll('#grid thead th')].map(txt), barShown: !q('#fbar').hidden,
+    rows: rows.map(tr => ({ style: txt(tr.children[1].querySelector('b')), cells: [...tr.children].map(txt), pic: !!tr.querySelector('img.pic') })),
+    brands: [...q('#fBrand').options].map(o => o.value), cats: [...q('#fCat').options].map(o => o.value), whereShown: !q('#fWhere').hidden,
+    clear: !q('#btnClearF').hidden, dl: { disabled: q('#btnDl').disabled, text: txt(q('#btnDl')) }, toast: txt(q('#toast')),
+    saved: ((window.__headless || {}).saved || []).map(x => x.name) };
+})()`;
+const salesSnap = t => t.eval(SALES_SNAP);
+// A filter set as a person would: a select's value, the search typed, a date picked.
+const setFilter = (t, id, value) => t.eval(`(() => { const el = document.getElementById(${JSON.stringify(id)}); el.value = ${JSON.stringify(value)};
+  el.dispatchEvent(new Event(${JSON.stringify(id === 'fq' ? 'input' : 'change')})); })()`);
+const isoDay = d => new Date(d * 864e5).toISOString().slice(0, 10);
+// The two files as Shalam Tool saves them, with the invented photos, put in the library before the page opens: answers
+// each file's sheet as the page should read it back.
+async function salesLibrary(w, today) {
+  const files = { ...SELL_FILES, ats: SELL_ATS }, E = loadExcelJS(), out = {};
+  for (const [kind, sh] of [['sales', sheetFor(w.fx, today, files)], ['china', chinaFor(w.fx, today, files)]]) {
+    const pics = sh.rows.map(r => { const n = SELL_PICS[r.photoKey], b = n && w.fx.bytes.get(n), d = b && EP.pictureSize(new Uint8Array(b), 'jpeg');
+      return d ? { data: new Uint8Array(b), width: d.w, height: d.h, extension: 'jpeg' } : null; });
+    const bytes = Buffer.from(await SS.workbookBytes(SS.buildWorkbook(E, sh, pics)));
+    const f = kind === 'sales' ? { id: 'itm-sales', name: SALES_FILE, eTag: '"{5A1E5000-0000-4000-8000-000000000001},1"' } : { id: 'itm-china', name: CHINA_FILE, eTag: '"{C41A5000-0000-4000-8000-000000000001},1"' };
+    w.sales[kind === 'sales' ? 'file' : 'china'] = { ...f, size: bytes.length, bytes, sent: bytes, at: new Date().toISOString() };
+    const wb = new E.Workbook();
+    await wb.xlsx.load(bytes);
+    out[kind] = SS.readWorkbook(wb);
+  }
+  return out;
+}
+// A file the page handed over to save, read back as the page's sheets are.
+async function savedSheet(t, i) {
+  const E = loadExcelJS(), wb = new E.Workbook();
+  await wb.xlsx.load(Buffer.from(await t.eval(`window.__headless.savedFile(${i})`), 'base64'));
+  return SS.readWorkbook(wb);
+}
+const lineOf = r => `${r.style}|${r.pack}|${r.note}`;
 // What every saving scenario checks once the sheet is saved: one session (replacing the file), every part in order with
 // no token, the file whole in the library and as the page's sheet, the page's mark of it, and the chip.
 async function savedChecks(c, t, w, want, o = {}) {
@@ -2985,6 +3031,113 @@ const SCENARIOS = [
     },
   },
   {
+    name: 'salespage', title: 'the sales page: both files from the library with their photos; filters; Download is exactly what is shown; nothing but GETs, nothing else read',
+    world: { cfg: { chinaFile: CHINA_FILE } }, page: 'sales.html', photos: true, noGraph: false,
+    async setup(o) { o.w.lib = await salesLibrary(o.w, o.today); },
+    async run({ t, w, c, today }) {
+      const L = w.lib, sales = L.sales, china = L.china;
+      t.shots.push(await t.shot('salespage-onhand'));
+      let p = await salesSnap(t);
+      c(`On hand ATS shown first: ${sales.rows.length} lines, Pull from China ${china.rows.length}, both saved (said at the top)`, p.tab === 'sales' && !p.lead && p.barShown &&
+        p.cSales === fmtN(sales.rows.length) && p.cChina === fmtN(china.rows.length) && /On hand ATS saved .* · Pull from China saved /.test(p.health), JSON.stringify({ tab: p.tab, lead: p.lead, c: [p.cSales, p.cChina], h: p.health }));
+      c('its columns', p.heads.join('|') === 'Photo|Style|Description|Brand|Category|Sub category|Master/Inner|On hand|In transit|Available from|Total|Notes', p.heads.join('|'));
+      c('every line of the file, in its order, with its units and its photo', p.rows.length === sales.rows.length && p.rows.every((r, i) => r.style === sales.rows[i].style &&
+        r.cells[6] === sales.rows[i].pack && r.cells[7] === (sales.rows[i].onHand ? fmtN(sales.rows[i].onHand) : '') && r.cells[10] === fmtN(sales.rows[i].total) && r.pic === !!sales.photos[i]),
+        JSON.stringify(p.rows.slice(0, 3)));
+      c('photos shown for the lines that have one in the file', p.rows.filter(r => r.pic).length === sales.photos.filter(Boolean).length && sales.photos.some(Boolean), p.rows.filter(r => r.pic).length);
+      const ch = SV.choices(sales);
+      c("the brand and category choices are the file's", JSON.stringify(p.brands) === JSON.stringify([SV.ALL, ...ch.brands]) && JSON.stringify(p.cats) === JSON.stringify([SV.ALL, ...ch.categories]),
+        JSON.stringify({ b: p.brands, c: p.cats }));
+      c('the brand is on the sheet (Brand S on the invented lines)', ch.brands.includes('Brand S'), ch.brands.join(', '));
+      const reads = w.calls.map(x => `${x.method} ${x.path}`);
+      const want = ['GET /sites/met1sol.sharepoint.com:/sites/TestReports', 'GET /sites/site-rep/drives', `GET /drives/${SALES_DRV}/root:/${SALES_FILE}`, `GET /drives/${SALES_DRV}/root:/${CHINA_FILE}`];
+      c('it asked SharePoint for the library and the two files only, and downloaded those two', reads.length === want.length && want.every(x => reads.includes(x)) &&
+        JSON.stringify(w.downloads.map(d => d.name).sort()) === JSON.stringify(['china file', 'sales file']), `${reads.join('; ')} · ${w.downloads.map(d => d.name).join(', ')}`);
+      c('no email, no upload, no source read', !w.calls.some(x => x.method !== 'GET') && !w.sales.made && !w.sales.chinaMade && !w.downloads.some(d => !/file$/.test(d.name)));
+
+      // Filters, each compared with core/salesView.js on the file as read here.
+      const f = { q: '', brand: SV.ALL, category: SV.ALL, sub: SV.ALL, where: 'all', by: null };
+      const same = async (label, ff) => {
+        await sleep(350);
+        const s1 = await salesSnap(t), v = SV.view(sales, ff);
+        c(label + `: ${v.rows.length} lines`, s1.rows.map(r => `${r.style}|${r.cells[6]}|${r.cells[11]}`).join() === v.rows.map(lineOf).join() &&
+          s1.rows.every((r, i) => r.cells[8] === (v.rows[i].inTransit ? fmtN(v.rows[i].inTransit) : '') && r.cells[10] === fmtN(v.rows[i].total)) && s1.clear === SV.filtered(ff) &&
+          s1.info.endsWith(`${fmtN(v.totals.total)} units`), `${s1.rows.map(r => `${r.style}|${r.cells[6]}|${r.cells[8]}|${r.cells[10]}`).join('; ')} · want ${v.rows.map(r => `${lineOf(r)}|${r.inTransit}|${r.total}`).join('; ')} · ${s1.info}`);
+        return v;
+      };
+      const cat = ch.categories[0];
+      await setFilter(t, 'fCat', cat); f.category = cat;
+      await same(`category ${cat}`, f);
+      await setFilter(t, 'fq', 'SL-10'); f.q = 'SL-10';
+      await same('and the search "SL-10"', f);
+      await setFilter(t, 'fq', ''); f.q = '';
+      await setFilter(t, 'fWhere', 'onHand'); f.where = 'onHand';
+      await same('on hand only', f);
+      await setFilter(t, 'fWhere', 'transit'); f.where = 'transit';
+      await same('in transit only', f);
+      await setFilter(t, 'fWhere', 'all'); f.where = 'all';
+      const by = today + 20;
+      await setFilter(t, 'fBy', isoDay(by)); f.by = by;
+      const v = await same(`available by ${C.fmtDay(by)}`, f);
+      p = await salesSnap(t);
+      c('the button says the file will be filtered', p.dl.text === 'Download On hand ATS (filtered)' && !p.dl.disabled, JSON.stringify(p.dl));
+      await t.eval(`document.getElementById('btnDl').click()`);
+      await t.waitFor(`(window.__headless.saved || []).length === 1`, 'the file to be handed over', 20000);
+      const got = await savedSheet(t, 0);
+      p = await salesSnap(t);
+      c(`Download: "On hand ATS (filtered).xlsx" holds exactly the ${v.rows.length} lines shown, their schedule and photos`, p.saved[0] === 'On hand ATS (filtered).xlsx' && got.kind === 'sales' &&
+        JSON.stringify(got.rows) === JSON.stringify(v.rows) && JSON.stringify(got.byDate) === JSON.stringify(v.byDate) && got.photos.filter(Boolean).length === v.photos.filter(Boolean).length,
+        `${p.saved.join(', ')} · ${got.rows.map(lineOf).join('; ')} · want ${v.rows.map(lineOf).join('; ')}`);
+      c('its toast', p.toast === `On hand ATS (filtered).xlsx downloaded: ${v.rows.length} line${v.rows.length === 1 ? '' : 's'}, ${v.photos.filter(Boolean).length} photo${v.photos.filter(Boolean).length === 1 ? '' : 's'}.`, p.toast);
+      await t.eval(`document.getElementById('btnClearF').click()`);
+      await same('Clear filters: every line again', { q: '', brand: SV.ALL, category: SV.ALL, sub: SV.ALL, where: 'all', by: null });
+
+      // Pull from China: its own columns, no on hand / in transit choice; downloaded whole.
+      await t.eval(`document.querySelector('#tabs .tab[data-tab="china"]').click()`);
+      await sleep(200);
+      p = await salesSnap(t);
+      c(`Pull from China: its ${china.rows.length} lines and columns; no "on hand or in transit"`, p.tab === 'china' && p.rows.length === china.rows.length && !p.whereShown &&
+        p.heads.join('|') === 'Photo|Style|Description|Brand|Category|Sub category|Master/Inner|Units|Pull from date|Notes' && p.rows.every((r, i) => r.style === china.rows[i].style && r.cells[7] === fmtN(china.rows[i].units)),
+        JSON.stringify({ tab: p.tab, n: p.rows.length, heads: p.heads, whereShown: p.whereShown }));
+      await t.eval(`document.getElementById('btnDl').click()`);
+      await t.waitFor(`(window.__headless.saved || []).length === 2`, 'the second file to be handed over', 20000);
+      const g2 = await savedSheet(t, 1);
+      p = await salesSnap(t);
+      c('Download: "Pull from China.xlsx", every line', p.saved[1] === 'Pull from China.xlsx' && g2.kind === 'china' && JSON.stringify(g2.rows) === JSON.stringify(china.rows), p.saved.join(', '));
+      // The 5-minute refresh: the files haven't changed, so nothing is downloaded again.
+      const dls = w.downloads.length;
+      await t.eval('window.__headless.fireLong()');
+      await t.waitFor(SALES_READY, 'the refresh', 20000);
+      await sleep(300);
+      c('the 5-minute refresh: the files looked at again, not downloaded again (unchanged)', w.downloads.length === dls && w.calls.filter(x => x.path === `/drives/${SALES_DRV}/root:/${SALES_FILE}`).length === 2,
+        `${w.downloads.length - dls} downloads`);
+      t.shots.push(await t.shot('salespage'));
+    },
+  },
+  {
+    name: 'salespage-noaccess', title: "the sales page for someone who can't open the library: said plainly, nothing shown, nothing downloaded",
+    world: { cfg: { chinaFile: CHINA_FILE }, salesHidden: true }, page: 'sales.html', photos: true,
+    async setup(o) { await salesLibrary(o.w, o.today); },
+    async run({ t, w, c }) {
+      const p = await salesSnap(t);
+      c('"Your account can\'t open Sales Test Library. Ask Saul for access."', /^On hand ATS can't be shown Your account can't open Sales Test Library\. Ask Saul for access\.$/.test(p.lead) && !p.barShown && !p.rows.length && p.dl.disabled,
+        JSON.stringify({ lead: p.lead, bar: p.barShown }));
+      c('no file read', !w.downloads.length && !w.calls.some(x => x.path.includes(SALES_DRV + '/')), w.calls.map(x => x.path).join('; '));
+    },
+  },
+  {
+    name: 'salespage-none', title: "the sales page before Shalam Tool has saved the files: each tab says so",
+    world: { cfg: { chinaFile: CHINA_FILE } }, page: 'sales.html',
+    async run({ t, c }) {
+      let p = await salesSnap(t);
+      c('On hand ATS: "hasn\'t been saved into Shalam Sales tool yet"', p.lead === "On hand ATS can't be shown On hand ATS hasn't been saved into Shalam Sales tool yet." && !p.cSales, p.lead);
+      await t.eval(`document.querySelector('#tabs .tab[data-tab="china"]').click()`);
+      await sleep(150);
+      p = await salesSnap(t);
+      c('Pull from China the same', p.lead === "Pull from China can't be shown Pull from China hasn't been saved into Shalam Sales tool yet.", p.lead);
+    },
+  },
+  {
     name: 'sales-resized', title: 'SharePoint stores the sales sheet with its own properties written in (another size): read back and checked, saved; no Cancel once the file is replaced',
     world: { ...SELLW, ats: SELL_ATS, ...PICS, salesResized: true, slow: { [`/drives/${SALES_DRV}/items/itm-sales`]: 4000 } }, init: { scp: SAVE_SCP }, photos: true, saves: true, wait: 'sales',
     async run({ t, w, c, today }) {
@@ -3910,11 +4063,13 @@ async function main() {
           if (t) await t.close();
           if (w) { allCalls.push(...w.calls); allDownloads.push(...w.downloads); allWorlds.push(w); }
           w = world = newWorld(fx, s.world);
+          // s.setup: what the library holds before the page opens (the sales page's scenarios). s.page: the page opened.
+          if (s.setup) await s.setup({ w, today });
           t = await openTab(edge.cdp, initScript(ORIGIN, s.init));
           t.shots = [];
           t.workerInit = s.workerInit || '';   // from the first load on (a scenario can change it later)
-          await t.send('Page.navigate', { url: `${ORIGIN}/index.html` });
-          if (!s.wait) await t.waitFor(READY, 'the sources to load', s.readyMs || 45000);
+          await t.send('Page.navigate', { url: `${ORIGIN}/${s.page || 'index.html'}` });
+          if (!s.wait) await t.waitFor(s.page ? SALES_READY : READY, 'the sources to load', s.readyMs || 45000);
         }
         const before = { blocked: t.blocked.length, exceptions: t.exceptions.length, net: s.after ? t.net.length : 0,
           calls: s.after ? w.calls.length : 0, downloads: s.after ? w.downloads.length : 0, wnet: s.after ? t.workerNet.length : 0 };
@@ -3952,7 +4107,7 @@ async function main() {
         c('fake sign-in in place: the vendored msal loaded and could not replace it', snap.msalFake && snap.msalSetTried >= 1, `fake ${snap.msalFake}, set tried ${snap.msalSetTried}`);
         const cfg = snap.msalConfig && snap.msalConfig.auth;
         c('sign-in set up with the test config.js; redirect is the folder address', !!cfg && cfg.clientId === TEST_CONFIG.clientId &&
-          cfg.authority.endsWith(TEST_CONFIG.tenantId) && cfg.redirectUri === ORIGIN + '/', JSON.stringify(cfg));
+          cfg.authority.endsWith(TEST_CONFIG.tenantId) && cfg.redirectUri === ORIGIN + '/' + (s.page || ''), JSON.stringify(cfg));
         c('no interactive sign-in, sign-out or token popup', !snap.msalInteractive.length, snap.msalInteractive.join(','));
         const blocked = [...t.blocked.slice(before.blocked), ...snap.fetchBlocked];
         c('no request left 127.0.0.1', !blocked.length, blocked.join(', '));
