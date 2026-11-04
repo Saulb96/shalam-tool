@@ -34,8 +34,8 @@
   const { S, DAY } = C;
   const fmt = C.fmtDay;
 
-  const TITLE = 'M1S · Available to sell';
-  const TABS = { sell: 'Available to sell', byDate: 'By date', china: 'Pull from China' };
+  const TITLE = 'M1S · On hand ATS';
+  const TABS = { sell: 'On hand ATS', byDate: 'By date', china: 'Pull from China' };
   // In transit is available this many days after its ETA (Saul, Nov 3: "ETA date + 7 days to be clean").
   const TRANSIT_DAYS = 7;
   // Where a schedule row's goods are, in the order they're listed on the same date.

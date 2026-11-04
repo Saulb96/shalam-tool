@@ -17,7 +17,7 @@ window.INV_CONFIG = {
   // Container Tracking sections with no round: straight to the customer (Pull from China), not booked yet (Master Sheet stage), or ignored.
   sections: { pullFromChina: ['GT', 'Giant Tiger', 'TJX Mexico', 'TJX Aus', 'TJX UK', 'FOB Loaded'], planning: ['Unshipped', 'Planning - NB', 'Planning - other'], ignore: ['CT - Hidden Rows'] },
   salesLibrary: '/sites/Reports/Shalam Sales tool',
-  salesFile: 'Available to sell.xlsx',
+  salesFile: 'On hand ATS.xlsx',
   chinaFile: 'Pull from China.xlsx',
   photos: '/sites/Production/Shared Documents/Quote Sheets/Quote Images',
   errorEmailTo: 'saul@metro1solutions.com',

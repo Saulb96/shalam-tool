@@ -2397,11 +2397,11 @@
     { k: 'inWh', t: 'In warehouse', n: 1, tip: 'In WH on the weekly ATS report: physical stock' },
     { k: 'orders', t: 'Customer orders', n: 1, tip: "Total Customer Orders on the ATS report: sold, not shipped yet. They include the orders for goods sold to ship from China that aren't loaded yet (China Pickup, or straight to the customer; never on a style ending in -F): those ship from China, so they aren't taken off the stock" },
     { k: 'now', t: 'Available now', b: 1, tip: "In warehouse minus customer orders (less the orders that ship from China with goods sold there), when above zero. Orders beyond the stock come off the earliest goods from China" },
-    { k: 'fromChina', t: 'Available from China', b: 1, tip: "Still in China (in production, ready, booked, loaded), after customer orders. Goods on a vessel that the ATS report already counts In Trans are in Arriving instead" },
-    { k: 'firstPull', t: 'First pull date', date: 1, tip: 'The first date goods in China can be pulled: 10 days before the ETD, else 5 days before the CRD, else about 75 days after the order date. "now": that date has passed' },
     { k: 'arriving', t: 'Arriving', b: 1, sub: () => arrivingSub(), tip: ARRIVING_TIP },
     { k: 'firstArrival', t: 'First arrival', date: 1, tip: "The earliest ETA of what's arriving (the ATS report's In Trans, and ours not on it yet)" },
-    { k: 'total', t: 'Total available', b: 1, sum: 1, tip: 'Available now + from China + arriving' },
+    { k: 'fromChina', t: 'Available from China', b: 1, tip: "Still in China (in production, ready, booked, loaded), after customer orders. Goods on a vessel that the ATS report already counts In Trans are in Arriving instead" },
+    { k: 'firstPull', t: 'First pull date', date: 1, tip: 'The first date goods in China can be pulled: 10 days before the ETD, else 5 days before the CRD, else about 75 days after the order date. "now": that date has passed' },
+    { k: 'total', t: 'Total available', b: 1, sum: 1, tip: 'Available now + arriving + from China' },
     { k: 'soldChina', t: 'Sold (ships from China)', b: 1, tip: PULL_TIP },
   ];
   const SELL_STOCK = ['inWh', 'orders', 'now', 'total'];
@@ -2576,9 +2576,9 @@
     ordersShipChina: 'Customer orders that ship from China' };
   const SELL_TILES = [
     ['now', 'In warehouse minus customer orders (the ATS report; orders that ship from China with goods sold there are not taken off), where above zero', false],
-    ['fromChina', 'Still in China (in production, ready, booked, loaded), after customer orders. Click for the lots and their pull-from dates', true],
     ['arriving', `${ARRIVING_TIP}. Click for the shipments and their ETAs, with our own goods on the water or at port and how they meet the report`, true],
-    ['total', 'Available now + from China + arriving. Click for the lots', true],
+    ['fromChina', 'Still in China (in production, ready, booked, loaded), after customer orders. Click for the lots and their pull-from dates', true],
+    ['total', 'Available now + arriving + from China. Click for the lots', true],
     ['oversold', 'Styles with more customer orders than their stock and every lot coming (each one is on Problems)', false],
   ];
   function sellAgg(rows) {
@@ -3726,10 +3726,10 @@
   }
   const savedFields = m => ({ file: m.name || salesFileName(), webUrl: m.webUrl || '', savedAt: m.lastModifiedDateTime || '', savedBy: who(m.lastModifiedBy) });
 
-  // The two files (Saul, Nov 3): Available to sell (salesFile) and Pull from China (chinaFile), each with its own mark of
+  // The two files (Saul, Nov 3): On hand ATS (salesFile) and Pull from China (chinaFile), each with its own mark of
   // its last save in this browser (store key).
   const SHEETS = [
-    { kind: 'sales', label: 'Available to sell', file: salesFileName, mark: 'sales', make: 'salesRows' },
+    { kind: 'sales', label: 'On hand ATS', file: salesFileName, mark: 'sales', make: 'salesRows' },
     { kind: 'china', label: 'Pull from China', file: chinaFileName, mark: 'sales-china', make: 'chinaRows' },
   ];
   // A sheet as Available to sell stands (or why there's none), worked out once for each.
@@ -4083,7 +4083,7 @@
   // Two buttons, one per file (Saul, Nov 3), one download at a time.
   let dl = null;   // { ctl, msg } while it's being made
   const DL_BTN = { sales: 'btnSalesDl', china: 'btnChinaDl' };
-  const DL_NAME = { sales: 'Available to sell.xlsx', china: 'Pull from China.xlsx' };
+  const DL_NAME = { sales: 'On hand ATS.xlsx', china: 'Pull from China.xlsx' };
   const DL_WHAT = { sales: 'on hand and in transit, by the ATS report', china: 'our goods in China not sold yet, by pull-from date' };
   function renderDl() {
     if (!$('btnSalesDl')) return;

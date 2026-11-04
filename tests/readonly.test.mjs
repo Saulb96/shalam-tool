@@ -232,7 +232,7 @@ test('config.js holds the sign-in, every source location, the sales sheet\'s lib
   // Tracker's photo store.
   assert.equal(c.salesLibrary, '/sites/Reports/Shalam Sales tool');
   assert.match(c.salesLibrary, /^\/sites\/[^/]+\/[^/]+$/);
-  assert.equal(c.salesFile, 'Available to sell.xlsx');
+  assert.equal(c.salesFile, 'On hand ATS.xlsx');
   assert.equal(c.chinaFile, 'Pull from China.xlsx');
   assert.match(c.salesFile, /^[^/\\:*?"<>|]+\.xlsx$/);
   assert.equal(c.photos, '/sites/Production/Shared Documents/Quote Sheets/Quote Images');

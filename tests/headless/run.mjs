@@ -1293,7 +1293,7 @@ const SL = `(() => {
   };
 })()`;
 const sl = t => t.eval(SL);
-const SELL_TILE_KEYS = ['now', 'fromChina', 'arriving', 'total'];
+const SELL_TILE_KEYS = ['now', 'arriving', 'fromChina', 'total'];
 const sellTile = (p, k) => p.tiles.find(x => x.k === k) || { n: null, cs: [], cls: '', lbl: '' };
 const sellTilesSay = (p, S) => [...SELL_TILE_KEYS, 'oversold'].map(k => `${k} "${sellTile(p, k).n}" vs ${S ? S.totals[k] : '?'}`).join('; ');
 // "1,234 cases + 7 loose units + 56 units with no case pack", as the tiles write it (whole cases only).
@@ -1319,7 +1319,7 @@ function whenSays(l, today) {
 const firstPullSays = (s, today) => (s.firstPull == null ? (s.lots.some(l => l.inChina && l.available > 0) ? 'no date' : '')
   : s.firstPull < today ? 'now' : (s.firstPullEstimate ? 'about ' : '') + C.fmtDay(s.firstPull));
 // The table's columns, in order.
-const SELL_HEADS = ['Style', 'Description', 'Case pack', 'In warehouse', 'Customer orders', 'Available now', 'Available from China', 'First pull date', 'Arriving', 'First arrival',
+const SELL_HEADS = ['Style', 'Description', 'Case pack', 'In warehouse', 'Customer orders', 'Available now', 'Arriving', 'First arrival', 'Available from China', 'First pull date',
   'Total available', 'Sold (ships from China)'];
 // Every style row drawn against the engine: stock, after orders, from China, arriving, total, sold, dates. Answers what differs.
 function sellRowsDiffer(p, S, today, stock) {
@@ -1351,7 +1351,7 @@ const SA = `(() => {
     chip: ch ? { state: ch.dataset.state, text: txt(ch), title: ch.getAttribute('title') || '', em: txt(ch.querySelector('em')), small: txt(ch.querySelector('small')),
       buttons: [...ch.querySelectorAll('button')].map(txt), link: (ch.querySelector('a') || {}).href || '' } : null,
     row: txt(row), rowPill: txt(row && row.querySelector('.pill')),
-    dl: { shown: !!dl && !dl.hidden && !dl.closest('[hidden]'), disabled: q('#btnSalesDl').disabled, chinaDisabled: q('#btnChinaDl').disabled, chinaText: txt(q('#btnChinaDl')), title: dl ? dl.title : '', msg: txt(q('#salesDlMsg')), cancel: !q('#btnSalesDlX').hidden },
+    dl: { shown: !!dl && !dl.hidden && !dl.closest('[hidden]'), disabled: q('#btnSalesDl').disabled, chinaDisabled: q('#btnChinaDl').disabled, chinaText: txt(q('#btnChinaDl')), salesText: txt(q('#btnSalesDl')), title: dl ? dl.title : '', msg: txt(q('#salesDlMsg')), cancel: !q('#btnSalesDlX').hidden },
     picsClass: q('#sellTable').classList.contains('pics'),
     pics: [...document.querySelectorAll('#sellTable tbody tr.r')].map(tr => { const p = tr.querySelector('.pic');
       return { style: txt(tr.querySelector('button.sb')), img: !!p && p.tagName === 'IMG' && /^blob:/.test(p.src) && p.naturalWidth > 0, none: !!p && p.classList.contains('none'), text: txt(p), upc: txt(tr.querySelector('td .u')),
@@ -3156,8 +3156,8 @@ const SCENARIOS = [
       c('nothing asked of the sales library, no email', !w.calls.some(x => x.path.includes(SALES_DRV)) && !sendMails(w.calls).length);
       c('photos still on the rows (read access)', p.pics.filter(x => x.img).length === p.pics.filter(x => SELL_PICS[x.style]).length && p.pics.some(x => x.img), JSON.stringify(p.pics.map(x => `${x.style}:${x.img ? 'img' : x.text}`)));
       c('the Problems line is there too', p.iss.some(x => x.code === 'no-photo'), JSON.stringify(p.iss));
-      c('the Download buttons "Sales sheet" and "Pull from China sheet" are on Available to sell, ready', p.dl.shown && !p.dl.disabled && !p.dl.chinaDisabled && p.dl.chinaText === 'Pull from China sheet' &&
-        /^Available to sell: on hand and in transit, by the ATS report/.test(p.dl.title) && /\nPull from China: our goods in China not sold yet/.test(p.dl.title), JSON.stringify(p.dl));
+      c('the Download buttons "On hand ATS" and "Pull from China sheet" are on Available to sell, ready', p.dl.shown && !p.dl.disabled && !p.dl.chinaDisabled && p.dl.salesText === 'On hand ATS' && p.dl.chinaText === 'Pull from China sheet' &&
+        /^On hand ATS: on hand and in transit, by the ATS report/.test(p.dl.title) && /\nPull from China: our goods in China not sold yet/.test(p.dl.title), JSON.stringify(p.dl));
       // Clicked: progress and Cancel show at once; the file is handed over to save.
       const first = await t.eval(`(() => { document.getElementById('btnSalesDl').click(); return { msg: document.getElementById('salesDlMsg').textContent, cancel: !document.getElementById('btnSalesDlX').hidden, disabled: document.getElementById('btnSalesDl').disabled }; })()`);
       c('while it is made: progress, Cancel, the button off', !!first.msg && first.cancel && first.disabled, JSON.stringify(first));
@@ -3170,7 +3170,7 @@ const SCENARIOS = [
         JSON.stringify({ name: p.saved[0].name, tabs: got.tabs, tabRows: got.tabRows, rows: got.rows, dateRows: got.dateRows }));
       c(`it has ${pics} pictures`, got.images === pics && got.media === pics, `${got.images} images, ${got.media} media`);
       c('none of the names, numbers or words that stay inside are in it', !got.found.length && got.creator === 'Shalam Tool', got.found.slice(0, 8).join('; ') || got.creator);
-      c('the toast says what it holds; the button is back', p.toast === `Available to sell downloaded: ${want.rows.length} styles, ${pics} photos.` && !p.dl.disabled && !p.dl.cancel && !p.dl.msg, JSON.stringify({ toast: p.toast, dl: p.dl }));
+      c('the toast says what it holds; the button is back', p.toast === `On hand ATS downloaded: ${want.rows.length} styles, ${pics} photos.` && !p.dl.disabled && !p.dl.cancel && !p.dl.msg, JSON.stringify({ toast: p.toast, dl: p.dl }));
       // The Pull from China sheet: its own file, named so as config.js names none here.
       const china = chinaFor(w.fx, today, { ...SELL_FILES, ats: SELL_ATS });
       await t.eval(`document.getElementById('btnChinaDl').click()`);

@@ -308,10 +308,10 @@ test('the workbook: every style, a tab per category, By date; the title, frozen 
   const bytes = await SS.workbookBytes(wb);
   assert.ok(bytes instanceof Uint8Array && bytes.length > 5000, `${bytes.length} bytes`);
   const book = readBack(bytes);
-  assert.deepEqual(book.SheetNames, ['Available to sell', 'Lip', 'By date']);
+  assert.deepEqual(book.SheetNames, ['On hand ATS', 'Lip', 'By date']);
   assert.deepEqual(SS.tabsOf(sh), book.SheetNames);
-  const ws = book.Sheets['Available to sell'], v = a => (ws[a] ? ws[a].v : undefined);
-  assert.equal(v('A1'), 'M1S · Available to sell');
+  const ws = book.Sheets['On hand ATS'], v = a => (ws[a] ? ws[a].v : undefined);
+  assert.equal(v('A1'), 'M1S · On hand ATS');
   assert.equal(v('D1'), undefined, 'no "as of" line (Saul, Nov 3)');
   assert.deepEqual('ABCDEFGHIJK'.split('').map(c => v(c + '2')), SS.COLS.map(c => c.h));
   assert.deepEqual(SS.COLS.map(c => c.h), ['Photo', 'Style', 'UPC', 'Description', 'Category', 'Sub category', 'Master/Inner', 'Available on hand (units)',
@@ -325,7 +325,7 @@ test('the workbook: every style, a tab per category, By date; the title, frozen 
   assert.equal(ws.G3.t, 's', 'Master/Inner is text');
   // A date cell: a style whose first shipment is due after today.
   const later = SS.salesRows(sellOf([alloc({ dates: { factoryCrd: D(12, 6) } })], atsOf({ SS100: [0, 0, 0, [[48, D(11, 20)]]] })), { today: TODAY });
-  const lb = readBack(await SS.workbookBytes(SS.buildWorkbook(loadExcelJS(), later, null))).Sheets['Available to sell'];
+  const lb = readBack(await SS.workbookBytes(SS.buildWorkbook(loadExcelJS(), later, null))).Sheets['On hand ATS'];
   assert.deepEqual([lb.J3.v, lb.J3.z, lb.K3.v], [serial(D(11, 27)), 'm/d/yyyy', 48]);
 
   const wd = book.Sheets['By date'], w = a => (wd[a] ? wd[a].v : undefined);
@@ -399,10 +399,10 @@ test('a tab per category: A to Z, no category last, rows by sub category then st
   const photos = new Map([['SS300', { data: PNG1, width: 1, height: 1, extension: 'png' }], ['SS100', { data: PNG2, width: 2, height: 1, extension: 'png' }]]);
   const bytes = await SS.workbookBytes(SS.buildWorkbook(loadExcelJS(), sh, photos));
   const book = readBack(bytes);
-  assert.deepEqual(book.SheetNames, ['Available to sell', 'Bath', 'Cosmetics2', 'No category', 'By date']);
+  assert.deepEqual(book.SheetNames, ['On hand ATS', 'Bath', 'Cosmetics2', 'No category', 'By date']);
   const cell = (tab, a) => (book.Sheets[tab][a] ? book.Sheets[tab][a].v : undefined);
-  assert.equal(cell('Bath', 'A1'), 'M1S · Available to sell · Bath');
-  assert.equal(cell('No category', 'A1'), 'M1S · Available to sell · No category');
+  assert.equal(cell('Bath', 'A1'), 'M1S · On hand ATS · Bath');
+  assert.equal(cell('No category', 'A1'), 'M1S · On hand ATS · No category');
   assert.deepEqual('ABCDEFGHIJK'.split('').map(c => cell('Cosmetics2', c + '2')), SS.COLS.map(c => c.h));
   assert.deepEqual(['B3', 'E3', 'F3', 'B4'].map(a => cell('Bath', a)), ['SS300', 'Bath', 'Gloves', undefined]);
   assert.deepEqual(['B3', 'E3', 'F3', 'B4'].map(a => cell('No category', a)), ['SS500', undefined, undefined, undefined]);
@@ -411,7 +411,7 @@ test('a tab per category: A to Z, no category last, rows by sub category then st
   assert.deepEqual(tabs.flatMap(t => t.rows).sort(), sh.rows.map((r, n) => n));
   for (const t of tabs) {
     t.rows.forEach((at, n) => {
-      for (const c of 'BCDEFGHIJK') assert.deepEqual(cell(t.name, c + (n + 3)), cell('Available to sell', c + (at + 3)), `${t.name} ${c}${n + 3}`);
+      for (const c of 'BCDEFGHIJK') assert.deepEqual(cell(t.name, c + (n + 3)), cell('On hand ATS', c + (at + 3)), `${t.name} ${c}${n + 3}`);
     });
     assert.equal(cell(t.name, 'B' + (t.rows.length + 3)), undefined, `${t.name}: no more rows`);
   }
