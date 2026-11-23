@@ -3031,6 +3031,56 @@ const SCENARIOS = [
     },
   },
   {
+    name: 'sales-brands', title: 'Brands: a tick list beside the downloads; a brand unticked is left off both sheets (kept in this browser), which are saved again; Show all puts it back',
+    world: { ...SELLW, ats: SELL_ATS, ...PICS, cfg: { ...PICS.cfg, chinaFile: CHINA_FILE } }, init: { scp: SAVE_SCP }, photos: true, saves: true,
+    async run({ t, w, c, today }) {
+      const files = { ...SELL_FILES, ats: SELL_ATS }, { S } = sellFor(w.fx, today, files);
+      const all = SS.salesRows(S, { today }), allChina = SS.chinaRows(S, { today });
+      await t.waitFor(chipIs('ok'), 'both files to be saved', 40000);
+      await t.click('#tabs .tab[data-tab="sell"]');
+      const BR = `(() => { const b = document.getElementById('brandsBox'), sum = document.getElementById('brandsSum'); return { shown: !!b && !b.closest('[hidden]'), open: !!b && b.open, sum: sum ? sum.textContent : '',
+        some: !!sum && sum.classList.contains('some'), allOff: document.getElementById('btnBrandsAll').disabled,
+        list: [...document.querySelectorAll('#brandsList label')].map(l => ({ text: l.textContent, on: l.querySelector('input').checked, name: l.querySelector('input').dataset.name })) }; })()`;
+      let b = await t.eval(BR);
+      const brands = [...new Set(S.styles.map(x => x.brand).filter(Boolean))].sort();
+      c('the Brands button is beside the two downloads on Available to sell, closed, with nothing left off', b.shown && !b.open && b.sum === 'Brands' && !b.some && b.allOff, JSON.stringify(b));
+      c(`its list: every brand of Available to sell (${brands.join(', ')}), each ticked, with its styles`, b.list.map(x => x.name).join('|') === brands.join('|') && b.list.every(x => x.on && /\d+ styles?$/.test(x.text)), JSON.stringify(b.list));
+      // The brand on the most rows of the sheet, so leaving it off changes both files.
+      const count = {};
+      for (const r of all.rows) if (r.brand) count[r.brand] = (count[r.brand] || 0) + 1;
+      const pick = Object.keys(count).sort((x, y) => count[y] - count[x])[0];
+      const want = SS.salesRows(S, { today, brandsOff: [pick] }), wantChina = SS.chinaRows(S, { today, brandsOff: [pick] });
+      c(`leaving ${pick} off changes the sheet worked out here (${all.rows.length} rows to ${want.rows.length})`, !!pick && want.rows.length < all.rows.length && want.rows.every(r => r.brand !== pick) && wantChina.rows.every(r => r.brand !== pick),
+        JSON.stringify(count));
+      const made = w.sales.made;
+      await t.eval(`(() => { document.getElementById('brandsSum').click(); const i = [...document.querySelectorAll('#brandsList input')].find(x => x.dataset.name === ${JSON.stringify(pick)}); i.click(); })()`);
+      await t.waitFor(`(() => document.getElementById('brandsSum').textContent === 'Brands (1 off)')()`, 'the button to say 1 off', 10000);
+      t.shots.push(await t.shot('sales-brands'));
+      b = await t.eval(BR);
+      c('unticked: the button says "Brands (1 off)", the list stays open with that brand unticked, Show all is on', b.open && b.some && !b.allOff && b.list.filter(x => !x.on).map(x => x.name).join() === pick, JSON.stringify(b));
+      let s = await t.snap();
+      c('kept in this browser (inv:sales-brands-off)', (s.store || {})['inv:sales-brands-off'] === JSON.stringify([pick]), (s.store || {})['inv:sales-brands-off']);
+      if (want.rows.length) {
+        for (let i = 0; i < 150 && w.sales.made === made; i++) await sleep(200);
+        await sleep(300);
+        await t.waitFor(chipIs('ok'), 'the sheets to be saved again', 40000);
+        c('the On hand ATS file was saved again', w.sales.made > made, `${made} to ${w.sales.made} sessions`);
+        const got = w.sales.file ? await openSheet(w.sales.file.sent, MARKS_SELL) : null;
+        c(`the saved file holds the sheet without ${pick}: ${want.rows.length} rows, none of that brand`, !!got && got.styles.join() === want.rows.map(r => r.style).join(), JSON.stringify(got && { rows: got.styles.length, want: want.rows.length }));
+      }
+      // Show all: back as it was.
+      await t.click('#btnBrandsAll');
+      await t.waitFor(`(() => document.getElementById('brandsSum').textContent === 'Brands')()`, 'the button to say Brands', 10000);
+      b = await t.eval(BR);
+      s = await t.snap();
+      c('Show all: every brand ticked again, nothing kept in this browser', b.list.every(x => x.on) && b.allOff && !b.some && !('inv:sales-brands-off' in (s.store || {})), JSON.stringify(b.list));
+      await t.click('#btnBrandsClose');
+      b = await t.eval(BR);
+      c('Close shuts the list', !b.open, JSON.stringify(b.open));
+      void allChina;
+    },
+  },
+  {
     name: 'salespage', title: 'the sales page: both files from the library with their photos; filters; Download is exactly what is shown; nothing but GETs, nothing else read',
     world: { cfg: { chinaFile: CHINA_FILE } }, page: 'sales.html', photos: true, noGraph: false,
     async setup(o) { o.w.lib = await salesLibrary(o.w, o.today); },

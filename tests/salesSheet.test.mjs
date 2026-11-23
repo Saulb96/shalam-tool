@@ -128,7 +128,7 @@ test('Available to sell: one row per style on the ATS report with something avai
   for (const b of sh.byDate) assert.deepEqual(Object.keys(b), DATE_KEYS);
   // SS050 isn't on the report; SS200 (oversold beyond its In Trans) and SS400 have nothing.
   assert.deepEqual(sh.counts, { styles: 3, rows: 3, split: 0, reserved: 0, leftOff: 2, stockUnknown: 0, transitUnknown: 0, notOnReport: 1, byDateRows: sh.byDate.length, noPack: 1,
-    oursStyles: 1, oursUnits: 60 });
+    oursStyles: 1, oursUnits: 60, heldOnHand: 0, heldTransit: 0, heldStyles: 0, brandOffStyles: 0, brandOffOnHand: 0, brandOffTransit: 0 });
   assert.deepEqual(sh.totals, { onHand: 550, inTransit: 504, total: 1054 });
   assert.deepEqual(sh.merges, []);
 });
@@ -274,6 +274,37 @@ test("in transit from our own sheets: our goods on the water or at port the repo
   assert.deepEqual([sb.totals.inTransit, sb.counts.oursUnits, sb.counts.transitUnknown], [0, 0, 1]);
 });
 
+test('goods on a PO left off (reservedOff) and brands left off (brandsOff) are on neither sheet, and counted', () => {
+  // SS600: stock 120 (100 of it on a -ZZQ PO landed 10/1, the 50 landed 10/15 first), In Trans 300 + 200. SS610: 60 of
+  // its 100 in China on a -zzq PO.
+  const off = { today: TODAY, reservedOff: ['-zzq'] };
+  const sh = SS.salesRows(packSell(), off), ch = SS.chinaRows(packSell(), off);
+  assert.ok(sh.rows.every(r => r.note === '') && ch.rows.every(r => r.note === ''));
+  assert.deepEqual(sh.rows.map(r => [r.style, r.pack, r.onHand, r.inTransit]), [['SS600', '12/3', 50, 500]]);
+  assert.deepEqual([sh.totals, sh.counts.heldOnHand, sh.counts.heldTransit, sh.counts.heldStyles], [{ onHand: 50, inTransit: 500, total: 550 }, 70, 0, 0]);
+  assert.equal(sh.byDate.reduce((t, b) => t + b.units, 0), 550);
+  assert.deepEqual(ch.rows.map(r => [r.style, r.units]), [['SS610', 40]]);
+  assert.deepEqual([ch.totals.units, ch.counts.held, ch.counts.reserved], [40, 60, 0]);
+  // With the note instead (reserved), the same goods are their own line: nothing held.
+  const noted = SS.salesRows(packSell(), { today: TODAY, reserved: RESERVED });
+  assert.deepEqual([noted.totals.total, noted.counts.heldOnHand], [620, 0]);
+  // A style with nothing but goods on such a PO has no line.
+  const only = sellOf([alloc({ style: 'SS630', styleRaw: 'SS630', po: '900401-ZZQ', bucket: 'landed', units: 90, eta: D(10, 20), stage: 'Landed' })], atsOf({ SS630: [80, 0, 80] }));
+  const so = SS.salesRows(only, off);
+  assert.deepEqual([so.rows.length, so.counts.styles, so.counts.heldStyles, so.counts.heldOnHand, so.totals.total], [0, 0, 1, 80, 0]);
+  // A brand left off: its styles on neither sheet (capitals and spaces aside); a style with no brand stays.
+  const sell = mainSell();
+  for (const s of sell.styles) s.brand = { SS100: 'Brand One', SS200: 'BRANDONE', SS300: 'Brand Two' }[s.style] || '';
+  const b = { today: TODAY, brandsOff: ['brand one', ''] };
+  const bs = SS.salesRows(sell, b), bc = SS.chinaRows(sell, b);
+  assert.deepEqual(bs.rows.map(r => r.style), ['SS300', 'SS500']);
+  assert.deepEqual([bs.counts.brandOffStyles, bs.counts.brandOffOnHand, bs.counts.brandOffTransit, bs.totals.total], [1, 460, 420, 174]);
+  assert.deepEqual([...new Set(bc.rows.map(r => r.style))].sort(), ['SS050', 'SS300']);
+  const all = SS.chinaRows(sell, { today: TODAY });
+  // Counted before the date rule: what's left off is on the sheet or past its date without it.
+  assert.equal(bc.totals.units + bc.counts.past + bc.counts.brandOff, all.totals.units + all.counts.past);
+});
+
 // ---------- Pull from China
 
 test('Pull from China: our goods in China not sold, one row per style, pull-from date and pack; a date before today left off', () => {
@@ -293,7 +324,7 @@ test('Pull from China: our goods in China not sold, one row per style, pull-from
     ['SS300', D(12, 20), false, 30, '12/3'],
   ]);
   // SS100's Booked 240 had 10/10 to pull from: too late, left off.
-  assert.deepEqual(sh.counts, { rows: 7, styles: 4, reserved: 0, ordersOff: 20, past: 240, noDate: 0, stockUnknown: 0 });
+  assert.deepEqual(sh.counts, { rows: 7, styles: 4, reserved: 0, ordersOff: 20, past: 240, noDate: 0, stockUnknown: 0, held: 0, brandOff: 0 });
   assert.deepEqual(sh.totals, { units: 840 });
   // What a style is oversold beyond its In Trans comes off its earliest goods in China first (a past one too).
   const o = SS.chinaRows(sellOf([alloc({ units: 100, etd: D(10, 20), bucket: 'booked', stage: 'Booked' }), alloc({ units: 200, po: '900109', dates: { factoryCrd: D(12, 6) } })],

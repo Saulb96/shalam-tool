@@ -235,7 +235,7 @@ test('config.js holds the sign-in, every source location, the sales sheet\'s lib
   assert.equal(c.salesFile, 'On hand ATS.xlsx');
   assert.equal(c.chinaFile, 'Pull from China.xlsx');
   // POs held for a customer (Saul, Nov 4): a suffix and the note its lines get.
-  assert.equal(JSON.stringify(c.reserved), JSON.stringify({ '-BCF': 'Reserved -BCF' }));
+  assert.equal(JSON.stringify([c.reserved, c.reservedOff, c.brandsOff]), JSON.stringify([{}, ['-BCF'], []]));
   assert.match(c.salesFile, /^[^/\\:*?"<>|]+\.xlsx$/);
   assert.equal(c.photos, '/sites/Production/Shared Documents/Quote Sheets/Quote Images');
   assert.match(c.errorEmailTo, /^[^@\s]+@[^@\s]+\.[^@\s]+$/);

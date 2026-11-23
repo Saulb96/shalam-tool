@@ -19,8 +19,12 @@ window.INV_CONFIG = {
   salesLibrary: '/sites/Reports/Shalam Sales tool',
   salesFile: 'On hand ATS.xlsx',
   chinaFile: 'Pull from China.xlsx',
-  // POs ending in one of these are held for a customer: their goods are their own line on the sales sheets, with this note (Saul, Nov 4).
-  reserved: { '-BCF': 'Reserved -BCF' },
+  // POs ending in one of these are held for a customer. reservedOff: their goods aren't on the sales sheets at all (Saul,
+  // Nov 23). reserved ({ suffix: note }): their goods are their own line with the note (Saul, Nov 4; none now).
+  reserved: {},
+  reservedOff: ['-BCF'],
+  // Brands left off the sales sheets (capitals and spaces aside).
+  brandsOff: [],
   photos: '/sites/Production/Shared Documents/Quote Sheets/Quote Images',
   errorEmailTo: 'saul@metro1solutions.com',
   errorEmailName: 'Saul',

@@ -15,7 +15,9 @@
 // pack, so each In Trans shipment takes the pack of our goods core/sell.js matched it to, and the stock goes to the
 // packs of our goods landed, the latest first (older goods ship first: a best guess); what neither places is in the
 // style's own pack (its Master Sheet Live Master). Goods on a PO ending in a suffix named in config.js's reserved (held
-// for a customer) are their own line, marked with its note (Saul, Nov 4: "-BCF", "put as reserved").
+// for a customer) are their own line, marked with its note (Saul, Nov 4: "-BCF", "put as reserved"). Goods on a PO
+// ending in a suffix in config.js's reservedOff aren't on the sheets at all (Saul, Nov 23: "Leave the goods off"), and
+// neither is a style whose brand is in config.js's brandsOff (Saul, Nov 23).
 // One category written two ways (BODY and Body, Makeup Brushes and MakeupBrushes) is one category on the sheets (Saul,
 // Nov 23): names that differ only by capitals or spaces. A number is part of the name: Cosmetics1 and Cosmetics2 stay
 // apart (his choice).
@@ -26,7 +28,8 @@
 // Available to sell.
 // - salesRows(sell, { today, reserved }) / chinaRows(sell, { today, reserved }): the rows (and On hand ATS's schedule by
 //   date) from InvSell.buildSell's result; none (ok false, with the reason in plain words) when there's no usable ATS
-//   report, Available to sell wasn't worked out, or its units don't add up. reserved: config.js's { suffix: note }.
+//   report, Available to sell wasn't worked out, or its units don't add up. reserved: config.js's { suffix: note };
+//   reservedOff: its PO suffixes left off; brandsOff: its brands left off.
 // - buildWorkbook(ExcelJS, sheet, photos, { print }): the Excel file (ExcelJS 4.4.0, vendor/exceljs): every row (a photo
 //   per row fitted in its cell the way Quote Tracker does it), then a tab per category (categoryTabs: A to Z, named as
 //   the rows have them), then By date (On hand ATS only); the page's fingerprint of it in its keywords.
@@ -130,6 +133,11 @@
   const reservedOf = opts => Object.entries((opts && opts.reserved && typeof opts.reserved === 'object') ? opts.reserved : {})
     .map(([k, v]) => [S(k).toUpperCase(), S(v)]).filter(([k, v]) => k && v);
   const noteOf = (list, po) => { const p = S(po).toUpperCase(); const hit = p && list.find(([k]) => p.endsWith(k)); return hit ? hit[1] : ''; };
+  // config.js's reservedOff (["-SUFFIX"]): is a PO's goods left off the sheets (matched at the PO's end, case aside)?
+  // And its brandsOff (["Brand"]): is a style's brand left off (capitals and spaces aside; a style with no brand never)?
+  const listOf = v => (Array.isArray(v) ? v : []).map(S).filter(Boolean);
+  const poOffOf = opts => { const list = listOf(opts && opts.reservedOff).map(k => k.toUpperCase()); return po => { const p = S(po).toUpperCase(); return !!p && list.some(k => p.endsWith(k)); }; };
+  const brandOffOf = opts => { const set = new Set(listOf(opts && opts.brandsOff).map(nameKey)); return s => { const b = nameKey(s && s.brand); return !!b && set.has(b); }; };
 
   // A style's stock by the ATS report: { known, onHand, transit: [{ units, when, parts, ours }], transitKnown, left,
   // ours }. Its "ATS from in WH" (else In WH − Total Customer Orders, when the report has no such figure for it); what's
@@ -191,11 +199,12 @@
   // totals: { onHand, inTransit, total } (units). counts: { styles, rows, split (styles on more than one row), reserved
   //   (rows with a note), leftOff (nothing available), stockUnknown (no ATS figure: left off), transitUnknown (on hand
   //   only: its In Trans can't be read), notOnReport, byDateRows, noPack (rows), oursStyles and oursUnits (in transit
-  //   from our own sheets: not on the report's In Trans) }.
+  //   from our own sheets: not on the report's In Trans), heldOnHand and heldTransit (units on a reservedOff PO: left
+  //   off; heldStyles: styles with nothing else), brandOffStyles, brandOffOnHand and brandOffTransit (a brand left off) }.
   function salesRows(sell, opts) {
-    const today = todayOf(sell, opts), reserved = reservedOf(opts);
+    const today = todayOf(sell, opts), reserved = reservedOf(opts), poOff = poOffOf(opts), brandOff = brandOffOf(opts);
     const counts = { styles: 0, rows: 0, split: 0, reserved: 0, leftOff: 0, stockUnknown: 0, transitUnknown: 0, notOnReport: 0, byDateRows: 0, noPack: 0,
-      oursStyles: 0, oursUnits: 0 };
+      oursStyles: 0, oursUnits: 0, heldOnHand: 0, heldTransit: 0, heldStyles: 0, brandOffStyles: 0, brandOffOnHand: 0, brandOffTransit: 0 };
     const totals = { onHand: 0, inTransit: 0, total: 0 };
     const reportDay = sell && isDay(sell.reportDay) ? sell.reportDay : null;
     const why = refusal(sell);
@@ -209,11 +218,14 @@
       if (!k.transitKnown) counts.transitUnknown++;
       const inTransit = k.transit.reduce((t, x) => t + x.units, 0), total = k.onHand + inTransit;
       if (!(total > 0)) { counts.leftOff++; continue; }
+      if (brandOff(s)) { counts.brandOffStyles++; counts.brandOffOnHand += k.onHand; counts.brandOffTransit += inTransit; continue; }
       const b = base(s, cats.of), own = packOf(s.stockPack);
       if (k.ours > 0) { counts.oursStyles++; counts.oursUnits += k.ours; }
-      // The style's lines: pack and note -> { pack, note, onHand, dates (when -> units) }.
-      const lines = new Map();
+      // The style's lines: pack and note -> { pack, note, onHand, dates (when -> units) }. held: its goods on a PO left
+      // off the sheets (never a line).
+      const lines = new Map(), held = { onHand: 0, dates: new Map() };
       const lineOf = (p, po) => {
+        if (poOff(po)) return held;
         const pack = packOf(p) || own, note = noteOf(reserved, po), key = lineKey(pack, note);
         return lines.get(key) || lines.set(key, { pack, note, onHand: 0, dates: new Map() }).get(key);
       };
@@ -226,7 +238,10 @@
       }
       if (stock > 0) lineOf(null, '').onHand += stock;
       for (const x of k.transit) for (const p of x.parts) { const L = lineOf(p, p.po); L.dates.set(x.when, (L.dates.get(x.when) || 0) + p.units); }
+      const heldTransit = [...held.dates.values()].reduce((t, n) => t + n, 0);
+      counts.heldOnHand += held.onHand; counts.heldTransit += heldTransit;
       const list = [...lines.values()].sort(lineOrder);
+      if (!list.length) { counts.heldStyles++; continue; }
       for (const L of list) {
         const pack = packText(L.pack ? [L.pack] : []);
         const dates = [...L.dates.keys()].sort((p, q) => whenRank(p) - whenRank(q));
@@ -240,7 +255,7 @@
       }
       counts.styles++;
       if (list.length > 1) counts.split++;
-      totals.onHand += k.onHand; totals.inTransit += inTransit; totals.total += total;
+      totals.onHand += k.onHand - held.onHand; totals.inTransit += inTransit - heldTransit; totals.total += total - held.onHand - heldTransit;
     }
     counts.rows = rows.length; counts.byDateRows = byDate.length;
     return { ok: true, reason: '', kind: 'sales', asOf: today, reportDay, rows, byDate, totals, counts, merges: cats.merges };
@@ -253,10 +268,11 @@
   //   photoKey }.
   // totals: { units }. counts: { rows, styles, reserved (rows with a note), ordersOff (units the oversold took), past
   //   (units whose pull-from date is before today: left off), noDate (units with no date), stockUnknown (styles on the
-  //   report with no ATS figure: left off, their orders not known) }.
+  //   report with no ATS figure: left off, their orders not known), held (units on a reservedOff PO: left off),
+  //   brandOff (units of a brand left off) }.
   function chinaRows(sell, opts) {
-    const today = todayOf(sell, opts), reserved = reservedOf(opts);
-    const counts = { rows: 0, styles: 0, reserved: 0, ordersOff: 0, past: 0, noDate: 0, stockUnknown: 0 };
+    const today = todayOf(sell, opts), reserved = reservedOf(opts), poOff = poOffOf(opts), brandOff = brandOffOf(opts);
+    const counts = { rows: 0, styles: 0, reserved: 0, ordersOff: 0, past: 0, noDate: 0, stockUnknown: 0, held: 0, brandOff: 0 };
     const totals = { units: 0 };
     const reportDay = sell && isDay(sell.reportDay) ? sell.reportDay : null;
     const why = refusal(sell);
@@ -287,6 +303,8 @@
         left -= off; counts.ordersOff += off;
         const n = l.units - off;
         if (!(n > 0)) continue;
+        if (brandOff(s)) { counts.brandOff += n; continue; }
+        if (poOff(l.po)) { counts.held += n; continue; }
         if (l.pullFrom != null && l.pullFrom < today) { counts.past += n; continue; }
         if (l.pullFrom == null) counts.noDate += n;
         const pack = packOf(l) || own, note = noteOf(reserved, l.po), key = `${l.pullFrom}|${lineKey(pack, note)}`;

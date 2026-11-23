@@ -143,7 +143,8 @@ function configSections() {
 function configReserved() {
   const win = {};
   new Function('window', readFileSync(root('config.js'), 'utf8'))(win);
-  return win.INV_CONFIG ? win.INV_CONFIG.reserved : undefined;
+  const c = win.INV_CONFIG || {};
+  return { reserved: c.reserved, reservedOff: c.reservedOff, brandsOff: c.brandsOff };
 }
 // One sheet's rows from A1, as app.js reads Master Sheet Live and the tracker.
 function readSheet(bytes, sheet) {
@@ -561,9 +562,9 @@ if (!sellWithAts) {
 async function salesReport(S, R) {
   const SS = core('salesSheet');
   let sheet, china;
-  let reserved;
-  try { reserved = configReserved(); } catch (e) { fails(`can't read config.js: ${e.message}`); }
-  try { sheet = SS.salesRows(S, { today, reserved }); china = SS.chinaRows(S, { today, reserved }); } catch (e) { fails(`the sales sheets stopped: ${e.message}`); return; }
+  let reserved, cfgOff = {};
+  try { cfgOff = configReserved(); reserved = cfgOff.reserved; } catch (e) { fails(`can't read config.js: ${e.message}`); }
+  try { sheet = SS.salesRows(S, { today, ...cfgOff }); china = SS.chinaRows(S, { today, ...cfgOff }); } catch (e) { fails(`the sales sheets stopped: ${e.message}`); return; }
   if (!sheet.ok) { fails(`no sales sheet: ${sheet.reason}`); return; }
   if (!china.ok) { fails(`no Pull from China sheet: ${china.reason}`); return; }
   const k = sheet.counts, rows = sheet.rows, sum = (a, f) => a.reduce((p, x) => p + (f(x) || 0), 0);
@@ -585,9 +586,12 @@ async function salesReport(S, R) {
     wantTr += Math.max(0, it + ours - Math.max(0, -ats));
     oursAll += ours;
   }
-  for (const [got, want, label, from] of [[sum(rows, r => r.onHand), wantOn, 'Available on hand', 'from the ATS report on its own'],
-    [sum(rows, r => r.inTransit), wantTr, 'Available in transit', "from the ATS report + our shipped goods it doesn't have"]]) {
-    console.log(`  ${label.padEnd(22)} ${n(got).padStart(12)} units on the sheet · ${n(want).padStart(12)} ${from}   same: ${got === want ? 'yes' : 'NO'}`);
+  // Goods on a PO left off (config.js reservedOff) and brands left off (brandsOff) are counted back in for the check.
+  const offOn = k.heldOnHand + k.brandOffOnHand, offTr = k.heldTransit + k.brandOffTransit;
+  console.log(`  left off by config.js: on POs ending ${(cfgOff.reservedOff || []).join(', ') || '(none)'}: on hand ${n(k.heldOnHand)} (a best guess: the newest landed POs), in transit ${n(k.heldTransit)}, ${n(k.heldStyles)} styles with nothing else · brands ${(cfgOff.brandsOff || []).join(', ') || '(none)'}: ${n(k.brandOffStyles)} styles, on hand ${n(k.brandOffOnHand)}, in transit ${n(k.brandOffTransit)}`);
+  for (const [got, want, label, from] of [[sum(rows, r => r.onHand) + offOn, wantOn, 'Available on hand', 'from the ATS report on its own'],
+    [sum(rows, r => r.inTransit) + offTr, wantTr, 'Available in transit', "from the ATS report + our shipped goods it doesn't have"]]) {
+    console.log(`  ${label.padEnd(22)} ${n(got).padStart(12)} units on the sheet + left off · ${n(want).padStart(12)} ${from}   same: ${got === want ? 'yes' : 'NO'}`);
     if (got !== want) fails(`the sales sheet's ${label} (${n(got)}) isn't the ATS report's (${n(want)})`);
   }
   console.log(`  in transit by the ATS report on its own ${n(wantErp)} + from our own sheets ${n(wantTr - wantErp)} (our goods on the water or at port not on its In Trans: ${n(oursAll)} units on ${n(oursBy.size)} styles, before the oversold; the sheet counts ${n(k.oursUnits)} on ${n(k.oursStyles)} styles after it)`);
@@ -612,12 +616,12 @@ async function salesReport(S, R) {
   for (const r of [...rows, ...china.rows]) if (r.note) notes[r.note] = (notes[r.note] || 0) + (r.total ?? r.units);
   console.log(`  split: styles in more than one pack ${n([...byStyle.values()].filter(x => x.packs.size > 1).length)} · with a reserved line ${n([...byStyle.values()].filter(x => x.notes.size > 1 || !x.notes.has('')).length)} · units on reserved lines (both sheets): ${Object.entries(notes).map(([k2, v2]) => `${k2} ${n(v2)}`).join(', ') || 'none'} · config.js reserved: ${reserved ? Object.keys(reserved).join(', ') : 'none'}`);
   const ck = china.counts, crow = china.rows;
-  console.log(`  Pull from China: rows ${n(ck.rows)} on ${n(ck.styles)} styles, ${n(china.totals.units)} units · taken by what's oversold ${n(ck.ordersOff)} · pull-from date passed (left off) ${n(ck.past)} · no date ${n(ck.noDate)} · styles with no ATS figure (left off) ${n(ck.stockUnknown)}`);
+  console.log(`  Pull from China: rows ${n(ck.rows)} on ${n(ck.styles)} styles, ${n(china.totals.units)} units · on a PO left off ${n(ck.held)} · of a brand left off ${n(ck.brandOff)} · taken by what's oversold ${n(ck.ordersOff)} · pull-from date passed (left off) ${n(ck.past)} · no date ${n(ck.noDate)} · styles with no ATS figure (left off) ${n(ck.stockUnknown)}`);
   // Every unit of our lots in China (before orders) is on the sheet, taken by the oversold, or past its date.
   const skip = new Set(S.styles.filter(s => s.onReport === true && typeof s.erpAts !== 'number' && !(typeof s.inWh === 'number' && typeof s.orders === 'number')).map(s => s.style));
   const pre = sum(S.lots.filter(l => l.inChina && l.source !== 'erp' && !skip.has(l.style)), l => (l.available || 0) + (l.taken || 0));
-  const chinaOk = china.totals.units + ck.ordersOff + ck.past === pre && sum(crow, r => r.units) === china.totals.units && !crow.some(r => r.pullFrom != null && r.pullFrom < today);
-  console.log(`  our goods in China ${n(pre)} = on the sheet ${n(china.totals.units)} + taken by the oversold ${n(ck.ordersOff)} + past their date ${n(ck.past)}, no date before today: ${chinaOk ? 'yes' : 'NO'} · the engine's Available from China ${n(S.totals.fromChina)}`);
+  const chinaOk = china.totals.units + ck.ordersOff + ck.past + ck.held + ck.brandOff === pre && sum(crow, r => r.units) === china.totals.units && !crow.some(r => r.pullFrom != null && r.pullFrom < today);
+  console.log(`  our goods in China ${n(pre)} = on the sheet ${n(china.totals.units)} + taken by the oversold ${n(ck.ordersOff)} + past their date ${n(ck.past)} + left off by config.js ${n(ck.held + ck.brandOff)}, no date before today: ${chinaOk ? 'yes' : 'NO'} · the engine's Available from China ${n(S.totals.fromChina)}`);
   if (!chinaOk) fails("the Pull from China sheet doesn't add up to our goods in China");
   console.log(`  pull-from dates: about (an estimate) ${n(crow.filter(r => r.estimate).length)} rows · no date ${n(crow.filter(r => r.pullFrom == null).length)} rows`);
   // Only the fields the sheets may hold, on every row.

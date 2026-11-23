@@ -3732,22 +3732,33 @@
     { kind: 'sales', label: 'On hand ATS', file: salesFileName, mark: 'sales', make: 'salesRows' },
     { kind: 'china', label: 'Pull from China', file: chinaFileName, mark: 'sales-china', make: 'chinaRows' },
   ];
+  // Brands left off the two sheets (Saul, Nov 23: "i want to be able to select", "in the main tool, for everyone"):
+  // config.js's brandsOff, and the ones unticked here, kept in this browser (the page can't save a setting to
+  // SharePoint). A brand is known by its name without capitals or spaces, as core/salesSheet.js matches it.
+  const brandKey = v => String(v ?? '').trim().toLowerCase().replace(/\s+/g, '');
+  const BRANDS_KEY = 'sales-brands-off';
+  function brandsPicked() {
+    try { const j = JSON.parse(store.get(BRANDS_KEY) || '[]'); return Array.isArray(j) ? j.map(v => String(v ?? '').trim()).filter(Boolean) : []; }
+    catch (e) { return []; }
+  }
+  const brandsFixed = () => (Array.isArray(CFG.brandsOff) ? CFG.brandsOff : []).map(v => String(v ?? '').trim()).filter(Boolean);
+  const brandsOffNow = () => [...brandsFixed(), ...brandsPicked()];
   // A sheet as Available to sell stands (or why there's none), worked out once for each.
   const sheetMemo = {};
   function sheetNow(kind) {
     const K = SHEETS.find(x => x.kind === kind);
     // core/salesSheet.js missing: boot() stops the page and says so; until then, no sheet.
     if (!window.InvSalesSheet) return { ok: false, kind, reason: "Part of the page (core/salesSheet.js) didn't load, so there's no sales sheet.", rows: [], byDate: [], counts: {} };
-    const m = sheetMemo[kind];
-    if (!m || m.sell !== sell || m.stages !== stages) {
+    const m = sheetMemo[kind], brandsOff = brandsOffNow(), brands = brandsOff.map(brandKey).sort().join('|');
+    if (!m || m.sell !== sell || m.stages !== stages || m.brands !== brands) {
       let sheet;
-      try { sheet = window.InvSalesSheet[K.make](sell && !sellErr ? sell : { ok: false, notLoaded: (stages && stages.notLoaded) || [] }, { today: sellToday(), reserved: CFG.reserved }); }
+      try { sheet = window.InvSalesSheet[K.make](sell && !sellErr ? sell : { ok: false, notLoaded: (stages && stages.notLoaded) || [] }, { today: sellToday(), reserved: CFG.reserved, reservedOff: CFG.reservedOff, brandsOff }); }
       catch (e) { console.error(e); sheet = { ok: false, kind, reason: `The ${K.label} sheet couldn't be worked out (${(e && e.message) || e}): a bug in Shalam Tool, tell Saul.`, rows: [], byDate: [], counts: {} }; }
       // The page's own checks too (core/salesSheet.js sees only the selling engine's): the stage numbers or the rows of
       // Available to sell don't add up, the red banner says its numbers can't be trusted, so there's no sheet either.
       const bug = !sheet.ok ? '' : balanceBad() ? 'The stage numbers' : sellBalanceBad() ? 'Available to sell' : '';
       if (bug) sheet = { ok: false, kind, reason: `${bug} ${bug === 'The stage numbers' ? "don't" : "doesn't"} add up (a bug in Shalam Tool), so there's no sales sheet until it's fixed.`, asOf: sheet.asOf, reportDay: sheet.reportDay, rows: [], byDate: [], counts: {} };
-      sheetMemo[kind] = { sell, stages, sheet };
+      sheetMemo[kind] = { sell, stages, brands, sheet };
     }
     return sheetMemo[kind].sheet;
   }
@@ -4102,6 +4113,45 @@
     $('salesDl').title = dl ? '' : why.length === SHEETS.length && new Set(why).size === 1 ? why[0] : tips.join('\n');
     $('salesDlMsg').textContent = dl ? dl.msg : '';
     $('btnSalesDlX').hidden = !dl;
+    renderBrands();
+  }
+  // The Brands tick list: every brand of a style on Available to sell (one written two ways is one, shown as the
+  // spelling on the most styles), ticked when it's on the sheets. A brand config.js leaves off is listed, never ticked.
+  let brandsShown = '';
+  function renderBrands() {
+    const box = $('brandsBox');
+    if (!box) return;
+    const by = new Map();
+    for (const s of (sell && !sellErr && Array.isArray(sell.styles) ? sell.styles : [])) {
+      const name = String(s.brand ?? '').trim(), k = brandKey(name);
+      if (!k) continue;
+      const x = by.get(k) || by.set(k, { names: new Map(), styles: 0 }).get(k);
+      x.styles++; x.names.set(name, (x.names.get(name) || 0) + 1);
+    }
+    const fixed = new Set(brandsFixed().map(brandKey)), picked = new Set(brandsPicked().map(brandKey));
+    const list = [...by].map(([k, x]) => ({ k, styles: x.styles, name: [...x.names].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))[0][0] }))
+      .sort((a, b) => a.name.localeCompare(b.name, 'en', { sensitivity: 'base' }));
+    const off = list.filter(b => fixed.has(b.k) || picked.has(b.k)).length;
+    const sum = $('brandsSum');
+    sum.textContent = off ? `Brands (${fmtN(off)} off)` : 'Brands';
+    sum.classList.toggle('some', off > 0);
+    sum.title = off ? `${plural(off, 'brand')} left off On hand ATS and Pull from China` : 'Choose brands to leave off On hand ATS and Pull from China';
+    $('btnBrandsAll').disabled = !picked.size;
+    const sig = JSON.stringify([list, [...fixed], [...picked]]);
+    if (sig === brandsShown) return;
+    brandsShown = sig;
+    const at = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.brand : null;
+    $('brandsList').innerHTML = list.length ? list.map(b => {
+      const fx = fixed.has(b.k);
+      return `<label class="${fx ? 'fixed' : ''}"${fx ? ' title="Left off for everyone (config.js)"' : ''}><input type="checkbox" data-brand="${esc(b.k)}" data-name="${esc(b.name)}"${fx || picked.has(b.k) ? '' : ' checked'}${fx ? ' disabled' : ''}>${esc(b.name)}<span class="n">${plural(b.styles, 'style')}</span></label>`;
+    }).join('') : '<div class="none">No brands yet: they show once Available to sell has loaded.</div>';
+    if (at) { const el = [...$('brandsList').querySelectorAll('input')].find(i => i.dataset.brand === at); if (el) el.focus(); }
+  }
+  // A brand ticked or unticked: kept in this browser, then both sheets are worked out again and saved if they changed.
+  function setBrandsPicked(names) {
+    if (names.length) store.set(BRANDS_KEY, JSON.stringify(names)); else store.del(BRANDS_KEY);
+    renderDl(); renderSrcTable(); renderIssues();
+    runSales(false);
   }
   async function downloadSales(kind) {
     const K = SHEETS.find(x => x.kind === kind), sheet = sheetNow(kind);
@@ -4271,6 +4321,16 @@
     });
     $('btnSalesDl').onclick = () => downloadSales('sales');
     $('btnChinaDl').onclick = () => downloadSales('china');
+    $('brandsList').onchange = e => {
+      const t = e.target;
+      if (!t || !t.dataset || !t.dataset.brand) return;
+      const rest = brandsPicked().filter(v => brandKey(v) !== t.dataset.brand);
+      setBrandsPicked(t.checked ? rest : [...rest, t.dataset.name]);
+    };
+    $('btnBrandsAll').onclick = () => setBrandsPicked([]);
+    $('btnBrandsClose').onclick = () => { $('brandsBox').open = false; $('brandsSum').focus(); };
+    document.addEventListener('keydown', e => { if (e.key === 'Escape' && $('brandsBox').open) { $('brandsBox').open = false; $('brandsSum').focus(); } });
+    document.addEventListener('click', e => { const b = $('brandsBox'); if (b.open && !b.contains(e.target)) b.open = false; });
     $('btnSalesDlX').onclick = () => { if (dl) dl.ctl.abort(); };
     $('tabs').addEventListener('click', e => { const b = e.target.closest('.tab'); if (b) showTab(b.dataset.tab); });
     let qt = null;

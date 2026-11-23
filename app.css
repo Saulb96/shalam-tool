@@ -206,6 +206,21 @@ button.tile.go:hover{background:rgba(255,255,255,.7)}
 img.pic{object-fit:contain;background:#fff}
 .pic.none{background:transparent;border:1px dashed rgba(95,108,125,.35);color:var(--off);font-size:8.5px;line-height:1.05;text-align:center;white-space:normal}
 .dlbox{display:inline-flex;align-items:center;gap:8px}
+/* Brands left off the two sheets (Saul, Nov 23): a tick list that drops down beside the downloads. */
+details.brands{position:relative}
+details.brands>summary{list-style:none;cursor:pointer;user-select:none;padding:7px 12px;border:1px solid var(--line,#d5dbe3);border-radius:8px;background:#fff;font-weight:600;white-space:nowrap}
+details.brands>summary::-webkit-details-marker{display:none}
+details.brands>summary.some{border-color:#d9572f;color:#b5441f}
+details.brands[open]>summary{box-shadow:0 0 0 3px rgba(47,155,214,.2)}
+.brandspop{position:absolute;z-index:30;top:calc(100% + 6px);right:0;width:300px;max-width:calc(100vw - 32px);padding:10px;border:1px solid var(--line,#d5dbe3);border-radius:10px;background:#fff;box-shadow:0 10px 30px rgba(20,30,45,.18)}
+.brandshd{font-size:12px;color:var(--off,#5f6c7d);margin-bottom:8px}
+.brandslist{max-height:300px;overflow:auto;display:flex;flex-direction:column;gap:2px}
+.brandslist label{display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:6px;cursor:pointer}
+.brandslist label:hover{background:rgba(95,108,125,.08)}
+.brandslist label .n{margin-left:auto;font-size:12px;color:var(--off,#5f6c7d);white-space:nowrap}
+.brandslist label.fixed{cursor:default;color:var(--off,#5f6c7d)}
+.brandslist .none{font-size:12px;color:var(--off,#5f6c7d);padding:4px 6px}
+.brandsft{display:flex;justify-content:space-between;gap:8px;margin-top:8px}
 /* The two sheet downloads stand out from the filters (Saul, Nov 4): filled, bold, an arrow. */
 button.dl{display:inline-flex;align-items:center;gap:6px;font-weight:650;color:#fff;border-color:transparent;padding:8px 15px;background:linear-gradient(135deg,#2f9bd6,#1b6fae);box-shadow:0 3px 10px rgba(27,111,174,.3)}
 button.dl.china{background:linear-gradient(135deg,#f58a5f,#d9572f);box-shadow:0 3px 10px rgba(217,87,47,.3)}
