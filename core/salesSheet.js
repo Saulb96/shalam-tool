@@ -2,12 +2,13 @@
 // saved into the one library they can open.
 // - On hand ATS: the ATS report's own numbers, style by style (Saul, Nov 3: "that is the gold standard of our ATS").
 //   Available on hand is its "ATS from in WH" (0 when below 0: oversold). Available in transit is its In Trans
-//   shipments, every one, with what the style is oversold taken off its earliest ETA first; each is available ETA + 7
-//   days ("now" once that day has come). Total = on hand + in transit. Only styles on the report; our shipping sheets
-//   add nothing to it.
+//   shipments, every one, and our own goods on the water or at port that its In Trans doesn't have yet (Saul, Nov 23:
+//   "show from our sheets"; core/sell.js's oursTransit), with what the style is oversold taken off the earliest ETA
+//   first; each is available ETA + 7 days ("now" once that day has come). Total = on hand + in transit. Only styles on
+//   the report; our shipping sheets add nothing else to it.
 // - Pull from China: our goods still in China that aren't sold, one row per style, pull-from date and pack
 //   (core/sell.js: 10 days before the ETD; no ETD, 5 days before the ready date; no ready date, about 75 days after the
-//   order date). What a style is oversold beyond its In Trans comes off them, earliest pull-from date first (the orders
+//   order date). What a style is oversold beyond its in transit comes off them, earliest pull-from date first (the orders
 //   that ship from China with goods sold there aside: core/sell.js). A pull-from date before today is too late: left off
 //   (Saul, Nov 3).
 // A style in more than one pack (Master/Inner) has a line per pack (Saul, Nov 4: "split by PO"). The ATS report has no
@@ -15,6 +16,9 @@
 // packs of our goods landed, the latest first (older goods ship first: a best guess); what neither places is in the
 // style's own pack (its Master Sheet Live Master). Goods on a PO ending in a suffix named in config.js's reserved (held
 // for a customer) are their own line, marked with its note (Saul, Nov 4: "-BCF", "put as reserved").
+// One category written two ways (BODY and Body, Makeup Brushes and MakeupBrushes) is one category on the sheets (Saul,
+// Nov 23): names that differ only by capitals or spaces. A number is part of the name: Cosmetics1 and Cosmetics2 stay
+// apart (his choice).
 // Per row only: style, UPCs, description, brand, category and sub category (the ATS report's, else UPC_MASTER's, the
 // pair from one place), Master/Inner, units (never cases), the date, the note and a photo. Never a factory, customer,
 // PO, PO type, section, container, round, person, file name, SharePoint link, ERP warehouse, In WH, customer orders,
@@ -25,7 +29,7 @@
 //   report, Available to sell wasn't worked out, or its units don't add up. reserved: config.js's { suffix: note }.
 // - buildWorkbook(ExcelJS, sheet, photos, { print }): the Excel file (ExcelJS 4.4.0, vendor/exceljs): every row (a photo
 //   per row fitted in its cell the way Quote Tracker does it), then a tab per category (categoryTabs: A to Z, named as
-//   the ERP has them, never joined), then By date (On hand ATS only); the page's fingerprint of it in its keywords.
+//   the rows have them), then By date (On hand ATS only); the page's fingerprint of it in its keywords.
 //   Each picture is stored once in the file, however many tabs show it.
 // - readWorkbook(wb): one of these files read back (the sales page, sales.js): its kind, rows, schedule by date and the
 //   rows' photos, as buildWorkbook was given them.
@@ -81,10 +85,39 @@
   // Sheet Live); both from the same place, never one from each. Rows go by category, sub category, then style: each
   // category's tab and the By date tab keep the same order.
   const catOf = s => (S(s.atsCategory) ? [S(s.atsCategory), S(s.atsSub)] : [S(s.category), S(s.sub)]);
-  const order = (a, b) => { const x = catOf(a), y = catOf(b); return byName(x[0], y[0]) || byName(x[1], y[1]) || byStyle(a.style, b.style); };
-  // What every row of a style carries, copied by name.
-  const base = s => {
-    const style = S(s.styleRaw || s.style), [category, sub] = catOf(s);
+  // One category written two ways (Saul, Nov 23): names that differ only by capitals or spaces are one, shown as one of
+  // its spellings: one in mixed case before one all in capitals or all small, then the one with the most words apart,
+  // then the one on the most styles, then A to Z. A number is part of the name (Cosmetics1 and Cosmetics2 stay apart).
+  // Sub categories the same way, inside their category. From every style of Available to sell, so both sheets name a
+  // category alike. Answers { of: style -> [category, sub], merges: [{ category, sub (null: a category), spellings }] }.
+  const nameKey = v => S(v).toLowerCase().replace(/\s+/g, '');
+  const mixedCase = v => v !== v.toUpperCase() && v !== v.toLowerCase();
+  const wordGaps = v => (v.match(/\s+/g) || []).length;
+  const bestName = m => [...m].sort((a, b) => mixedCase(b[0]) - mixedCase(a[0]) || wordGaps(b[0]) - wordGaps(a[0]) || b[1] - a[1] || byStyle(a[0], b[0]))[0][0];
+  function categoriesOf(styles) {
+    // key -> { names (spelling -> styles), cat (a sub category's category key) }; a key holds no space, so one joins a pair.
+    const cats = new Map(), subs = new Map();
+    const bump = (m, k, name, cat) => { const x = m.get(k) || m.set(k, { names: new Map(), cat }).get(k); x.names.set(name, (x.names.get(name) || 0) + 1); };
+    for (const s of Array.isArray(styles) ? styles : []) {
+      const [c, sub] = catOf(s), k = nameKey(c);
+      bump(cats, k, c, null); bump(subs, k + ' ' + nameKey(sub), sub, k);
+    }
+    for (const x of [...cats.values(), ...subs.values()]) x.name = bestName(x.names);
+    const spellings = x => [...x.names.keys()].sort(byStyle);
+    // Categories A to Z, then sub categories by category.
+    const az = (a, b) => byName(a.category, b.category) || byName(a.sub || '', b.sub || '');
+    const merges = [...cats.values()].filter(x => x.names.size > 1).map(x => ({ category: x.name, sub: null, spellings: spellings(x) })).sort(az)
+      .concat([...subs.values()].filter(x => x.names.size > 1).map(x => ({ category: cats.get(x.cat).name, sub: x.name, spellings: spellings(x) })).sort(az));
+    const of = s => {
+      const [c, sub] = catOf(s), k = nameKey(c), x = cats.get(k), y = subs.get(k + ' ' + nameKey(sub));
+      return [x ? x.name : c, y ? y.name : sub];
+    };
+    return { of, merges };
+  }
+  const orderBy = cat => (a, b) => { const x = cat(a), y = cat(b); return byName(x[0], y[0]) || byName(x[1], y[1]) || byStyle(a.style, b.style); };
+  // What every row of a style carries, copied by name (cat: categoriesOf's of).
+  const base = (s, cat) => {
+    const style = S(s.styleRaw || s.style), [category, sub] = cat(s);
     return { style, upc: (Array.isArray(s.upcs) ? s.upcs : []).map(S).filter(Boolean).join(', '), desc: S(s.desc), brand: S(s.brand),
       category, sub, photoKey: photoKey(style) };
   };
@@ -98,15 +131,18 @@
     .map(([k, v]) => [S(k).toUpperCase(), S(v)]).filter(([k, v]) => k && v);
   const noteOf = (list, po) => { const p = S(po).toUpperCase(); const hit = p && list.find(([k]) => p.endsWith(k)); return hit ? hit[1] : ''; };
 
-  // A style's stock by the ATS report: { known, onHand, transit: [{ units, when, parts }], transitKnown, left }. Its "ATS
-  // from in WH" (else In WH − Total Customer Orders, when the report has no such figure for it); what's below 0
-  // (oversold) comes off its In Trans shipments, earliest ETA first (no ETA last), off each one's parts in turn; left:
-  // what's still oversold after them. A shipment's parts: our goods core/sell.js matched it to ({ units, master, inner,
-  // po }), then the rest of it (master null: the style's own pack).
+  // A style's stock by the ATS report: { known, onHand, transit: [{ units, when, parts, ours }], transitKnown, left,
+  // ours }. Its "ATS from in WH" (else In WH − Total Customer Orders, when the report has no such figure for it); what's
+  // below 0 (oversold) comes off its In Trans shipments and our own shipped goods its In Trans doesn't have (oursTransit:
+  // Saul, Nov 23), earliest ETA first (no ETA last; the report's first on the same day), off each one's parts in turn;
+  // left: what's still oversold after them; ours: the units of ours still there. A shipment's parts: our goods
+  // core/sell.js matched it to ({ units, master, inner, po }), then the rest of it (master null: the style's own pack).
   function erpStock(s, today) {
     const ats = isDay(s.erpAts) ? s.erpAts : isDay(s.inWh) && isDay(s.orders) ? s.inWh - s.orders : null;
-    if (ats == null) return { known: false, onHand: 0, transit: [], transitKnown: false, left: 0 };
+    if (ats == null) return { known: false, onHand: 0, transit: [], transitKnown: false, left: 0, ours: 0 };
     let left = Math.max(0, -ats);
+    const oursShips = (Array.isArray(s.oursTransit) ? s.oursTransit : []).filter(x => x && units(x.units) > 0)
+      .map(x => ({ units: x.units, eta: isDay(x.eta) ? x.eta : null, ours: true, parts: [{ units: x.units, master: x.master, inner: x.inner, po: S(x.po) }] }));
     const ships = (Array.isArray(s.erpTransit) ? s.erpTransit : []).filter(x => x && units(x.units) > 0)
       .map(x => {
         const parts = [];
@@ -116,10 +152,12 @@
           if (n > 0) { parts.push({ units: n, master: p.master, inner: p.inner, po: S(p.po) }); rest -= n; }
         }
         if (rest > 0) parts.push({ units: rest, master: null, inner: null, po: '' });
-        return { units: x.units, eta: isDay(x.eta) ? x.eta : null, parts };
+        return { units: x.units, eta: isDay(x.eta) ? x.eta : null, ours: false, parts };
       })
+      .concat(oursShips)
       .sort((a, b) => (a.eta == null) - (b.eta == null) || (a.eta ?? 0) - (b.eta ?? 0));
     const transit = [];
+    let ours = 0;
     for (const x of ships) {
       const parts = [];
       for (const p of x.parts) {
@@ -130,10 +168,11 @@
       const n = parts.reduce((t, p) => t + p.units, 0);
       if (n > 0) {
         const day = x.eta == null ? null : x.eta + TRANSIT_DAYS;
-        transit.push({ units: n, when: day == null ? null : day <= today ? 'now' : day, parts });
+        transit.push({ units: n, when: day == null ? null : day <= today ? 'now' : day, parts, ours: x.ours });
+        if (x.ours) ours += n;
       }
     }
-    return { known: true, onHand: Math.max(0, ats), transit, transitKnown: Array.isArray(s.erpTransit), left };
+    return { known: true, onHand: Math.max(0, ats), transit, transitKnown: Array.isArray(s.erpTransit), left, ours };
   }
   const todayOf = (sell, opts) => {
     const today = opts && opts.today != null ? opts.today : sell && sell.today;
@@ -143,7 +182,7 @@
 
   // sell: InvSell.buildSell's result. opts.today: the day the sheet is made (a day number; defaults to sell's own);
   // opts.reserved: config.js's { suffix: note }.
-  // Answers { ok, reason, kind: 'sales', asOf, reportDay, rows, byDate, totals, counts }:
+  // Answers { ok, reason, kind: 'sales', asOf, reportDay, rows, byDate, totals, counts, merges (categoriesOf's) }:
   // rows, one per style on the ATS report with something available and pack (and note: above), by category, sub
   //   category, style, then pack: { style, upc, desc, brand, category, sub, pack (Master/Inner text, '' when not known),
   //   note, onHand, inTransit, transitFrom ('now', a day number, or null: no ETA), total, photoKey }.
@@ -151,24 +190,27 @@
   //   last): { style, desc, category, pack, note, when ('now', a day number, or null), where, units }.
   // totals: { onHand, inTransit, total } (units). counts: { styles, rows, split (styles on more than one row), reserved
   //   (rows with a note), leftOff (nothing available), stockUnknown (no ATS figure: left off), transitUnknown (on hand
-  //   only: its In Trans can't be read), notOnReport, byDateRows, noPack (rows) }.
+  //   only: its In Trans can't be read), notOnReport, byDateRows, noPack (rows), oursStyles and oursUnits (in transit
+  //   from our own sheets: not on the report's In Trans) }.
   function salesRows(sell, opts) {
     const today = todayOf(sell, opts), reserved = reservedOf(opts);
-    const counts = { styles: 0, rows: 0, split: 0, reserved: 0, leftOff: 0, stockUnknown: 0, transitUnknown: 0, notOnReport: 0, byDateRows: 0, noPack: 0 };
+    const counts = { styles: 0, rows: 0, split: 0, reserved: 0, leftOff: 0, stockUnknown: 0, transitUnknown: 0, notOnReport: 0, byDateRows: 0, noPack: 0,
+      oursStyles: 0, oursUnits: 0 };
     const totals = { onHand: 0, inTransit: 0, total: 0 };
     const reportDay = sell && isDay(sell.reportDay) ? sell.reportDay : null;
     const why = refusal(sell);
-    if (why) return { ok: false, reason: why, kind: 'sales', asOf: today, reportDay, rows: [], byDate: [], totals, counts };
+    if (why) return { ok: false, reason: why, kind: 'sales', asOf: today, reportDay, rows: [], byDate: [], totals, counts, merges: [] };
 
-    const rows = [], byDate = [];
-    for (const s of sell.styles.slice().sort(order)) {
+    const rows = [], byDate = [], cats = categoriesOf(sell.styles);
+    for (const s of sell.styles.slice().sort(orderBy(cats.of))) {
       if (s.onReport !== true) { counts.notOnReport++; continue; }
       const k = erpStock(s, today);
       if (!k.known) { counts.stockUnknown++; continue; }
       if (!k.transitKnown) counts.transitUnknown++;
       const inTransit = k.transit.reduce((t, x) => t + x.units, 0), total = k.onHand + inTransit;
       if (!(total > 0)) { counts.leftOff++; continue; }
-      const b = base(s), own = packOf(s.stockPack);
+      const b = base(s, cats.of), own = packOf(s.stockPack);
+      if (k.ours > 0) { counts.oursStyles++; counts.oursUnits += k.ours; }
       // The style's lines: pack and note -> { pack, note, onHand, dates (when -> units) }.
       const lines = new Map();
       const lineOf = (p, po) => {
@@ -201,10 +243,10 @@
       totals.onHand += k.onHand; totals.inTransit += inTransit; totals.total += total;
     }
     counts.rows = rows.length; counts.byDateRows = byDate.length;
-    return { ok: true, reason: '', kind: 'sales', asOf: today, reportDay, rows, byDate, totals, counts };
+    return { ok: true, reason: '', kind: 'sales', asOf: today, reportDay, rows, byDate, totals, counts, merges: cats.merges };
   }
 
-  // sell, opts: as salesRows. Answers { ok, reason, kind: 'china', asOf, reportDay, rows, totals, counts }:
+  // sell, opts: as salesRows. Answers { ok, reason, kind: 'china', asOf, reportDay, rows, totals, counts, merges }:
   // rows, one per style, pull-from date and pack (and note), by category, sub category, style, then date (no date last),
   //   then pack: { style, upc, desc, brand, category, sub, pack (Master/Inner of those goods), note, units, pullFrom (a
   //   day number, or null: no ETD, ready or order date), estimate (that date is about 75 days after the order date),
@@ -218,10 +260,10 @@
     const totals = { units: 0 };
     const reportDay = sell && isDay(sell.reportDay) ? sell.reportDay : null;
     const why = refusal(sell);
-    if (why) return { ok: false, reason: why, kind: 'china', asOf: today, reportDay, rows: [], totals, counts };
+    if (why) return { ok: false, reason: why, kind: 'china', asOf: today, reportDay, rows: [], totals, counts, merges: [] };
 
-    const rows = [], styles = new Set();
-    for (const s of sell.styles.slice().sort(order)) {
+    const rows = [], styles = new Set(), cats = categoriesOf(sell.styles);
+    for (const s of sell.styles.slice().sort(orderBy(cats.of))) {
       // Our lots still in China, as they stood before customer orders (core/sell.js took orders off them by its own
       // rule): units = available + taken.
       const lots = (Array.isArray(s.lots) ? s.lots : []).filter(l => l && l.inChina && l.source !== 'erp')
@@ -230,7 +272,7 @@
         .filter(l => l.units > 0)
         .sort((a, b) => (a.pullFrom == null) - (b.pullFrom == null) || (a.pullFrom ?? 0) - (b.pullFrom ?? 0));
       if (!lots.length) continue;
-      // What the style is oversold beyond its In Trans, less the orders that ship from China with goods sold there.
+      // What the style is oversold beyond its in transit, less the orders that ship from China with goods sold there.
       let left = 0;
       if (s.onReport === true) {
         const k = erpStock(s, today);
@@ -252,7 +294,7 @@
         g.units += n; if (l.estimate) g.estimate = true;
       }
       if (!groups.size) continue;
-      const b = base(s);
+      const b = base(s, cats.of);
       for (const g of [...groups.values()].sort((p, q) => whenRank(p.day) - whenRank(q.day) || lineOrder(p, q))) {
         rows.push({ style: b.style, upc: b.upc, desc: b.desc, brand: b.brand, category: b.category, sub: b.sub, pack: packText(g.pack ? [g.pack] : []),
           note: g.note, units: g.units, pullFrom: g.day, estimate: g.estimate, photoKey: b.photoKey });
@@ -262,7 +304,7 @@
       styles.add(b.style);
     }
     counts.rows = rows.length; counts.styles = styles.size;
-    return { ok: true, reason: '', kind: 'china', asOf: today, reportDay, rows, totals, counts };
+    return { ok: true, reason: '', kind: 'china', asOf: today, reportDay, rows, totals, counts, merges: cats.merges };
   }
 
   // ---------- the Excel files
@@ -332,8 +374,8 @@
   // The category tabs, A to Z with no category last: { name (the tab's name), category (as the ERP has it; '' for
   // none), rows (their places in sheet.rows, in its order) }. A name is the category with what Excel won't take in a
   // tab's name ([ ] : * ? / \) made a space, at most 31 characters, never "History" (Excel keeps that one) and never
-  // the same as another tab's (case aside: a second one gets " (2)"). Categories are never joined: Cosmetics1 and
-  // cosmetics1 are two tabs.
+  // the same as another tab's (case aside: a second one gets " (2)"). The rows' categories as they are: one written two
+  // ways is made one when the rows are built (categoriesOf), never here.
   const NO_CAT = 'No category';
   function categoryTabs(rows) {
     const groups = new Map();

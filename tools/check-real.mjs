@@ -569,19 +569,37 @@ async function salesReport(S, R) {
   const k = sheet.counts, rows = sheet.rows, sum = (a, f) => a.reduce((p, x) => p + (f(x) || 0), 0);
   console.log(`  On hand ATS: styles ${n(k.styles)} on ${n(k.rows)} lines (${n(k.split)} styles on more than one: a line per pack and note) · reserved lines ${n(k.reserved)} · left off (nothing available) ${n(k.leftOff)} · not on the ATS report ${n(k.notOnReport)} · no ATS figure ${n(k.stockUnknown)} · In Trans not readable ${n(k.transitUnknown)} · by-date rows ${n(k.byDateRows)} · no Master/Inner ${n(k.noPack)}`);
   // The ATS report on its own: on hand = its ATS from in WH above 0; in transit = its In Trans less what's oversold.
-  let wantOn = 0, wantTr = 0;
+  // With our own shipped goods its In Trans doesn't have (Saul, Nov 23; the engine's lots, not the sheet's own count):
+  // in transit = its In Trans + those, less what's oversold.
+  const oursBy = new Map();
+  for (const l of S.lots) if (l.source !== 'erp' && !l.inChina && l.notOnErp > 0) oursBy.set(l.style, (oursBy.get(l.style) || 0) + l.notOnErp);
+  let wantOn = 0, wantTr = 0, wantErp = 0, oursAll = 0;
   for (const e of atsR.styles.values()) {
     const ats = typeof e.erpAts === 'number' ? e.erpAts : typeof e.inWh === 'number' && typeof e.orders === 'number' ? e.inWh - e.orders : null;
     if (ats == null) continue;
     wantOn += Math.max(0, ats);
     const bad = e.rows.some(x => (x.inTransBad || []).length || (x.inTransList || []).some(v => !(v >= 0)));
     const it = bad ? 0 : e.rows.reduce((p, x) => p + (x.inTransList || []).reduce((q, v) => q + v, 0), 0);
-    wantTr += Math.max(0, it - Math.max(0, -ats));
+    const ours = bad ? 0 : oursBy.get(e.style) || 0;
+    wantErp += Math.max(0, it - Math.max(0, -ats));
+    wantTr += Math.max(0, it + ours - Math.max(0, -ats));
+    oursAll += ours;
   }
-  for (const [got, want, label] of [[sum(rows, r => r.onHand), wantOn, 'Available on hand'], [sum(rows, r => r.inTransit), wantTr, 'Available in transit']]) {
-    console.log(`  ${label.padEnd(22)} ${n(got).padStart(12)} units on the sheet · ${n(want).padStart(12)} from the ATS report on its own   same: ${got === want ? 'yes' : 'NO'}`);
+  for (const [got, want, label, from] of [[sum(rows, r => r.onHand), wantOn, 'Available on hand', 'from the ATS report on its own'],
+    [sum(rows, r => r.inTransit), wantTr, 'Available in transit', "from the ATS report + our shipped goods it doesn't have"]]) {
+    console.log(`  ${label.padEnd(22)} ${n(got).padStart(12)} units on the sheet · ${n(want).padStart(12)} ${from}   same: ${got === want ? 'yes' : 'NO'}`);
     if (got !== want) fails(`the sales sheet's ${label} (${n(got)}) isn't the ATS report's (${n(want)})`);
   }
+  console.log(`  in transit by the ATS report on its own ${n(wantErp)} + from our own sheets ${n(wantTr - wantErp)} (our goods on the water or at port not on its In Trans: ${n(oursAll)} units on ${n(oursBy.size)} styles, before the oversold; the sheet counts ${n(k.oursUnits)} on ${n(k.oursStyles)} styles after it)`);
+  if (k.oursUnits > oursAll || wantTr - wantErp > oursAll) fails("the sales sheet adds more of our shipped goods than the engine says the ERP's In Trans lacks");
+  // One category written two ways (Saul, Nov 23): listed, so a wrong join is seen.
+  const sameMerges = JSON.stringify(sheet.merges) === JSON.stringify(china.merges);
+  console.log(`  categories written two ways, made one (capitals and spaces only): ${sheet.merges.length ? sheet.merges.map(m => `${m.spellings.join(' + ')} → ${m.sub == null ? m.category : `${m.category} › ${m.sub}`}`).join(' · ') : 'none'} · the same on both sheets: ${sameMerges ? 'yes' : 'NO'}`);
+  if (!sameMerges) fails('the two sales sheets name a category differently');
+  const key = v => String(v).toLowerCase().replace(/\s+/g, ''), spell = new Map();
+  for (const r of [...rows, ...china.rows]) (spell.get(key(r.category)) || spell.set(key(r.category), new Set()).get(key(r.category))).add(r.category);
+  const twice = [...spell.values()].filter(x => x.size > 1);
+  if (twice.length) fails(`a category is still written two ways on the sales sheets: ${twice.map(x => [...x].join(' / ')).join('; ')}`);
   const sched = sum(sheet.byDate, r => r.units), schedOk = sum(rows, r => r.total) === sched && sum(rows, r => r.total) === sum(rows, r => r.onHand + r.inTransit);
   console.log(`  total ${n(sum(rows, r => r.total))} = on hand + in transit = by date ${n(sched)}: ${schedOk ? 'yes' : 'NO'} · in transit available now ${n(sum(sheet.byDate.filter(r => r.where === 'In transit' && r.when === 'now'), r => r.units))} · no ETA ${n(sum(sheet.byDate.filter(r => r.when == null), r => r.units))} units`);
   if (!schedOk) fails("the sales sheet's total isn't on hand + in transit, or its schedule doesn't add up to it");

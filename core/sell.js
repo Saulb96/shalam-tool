@@ -675,6 +675,9 @@
         erpAts: e && isDay(e.erpAts) ? e.erpAts : null,
         // parts: our goods each shipment was matched to ({ units, master, inner, po }; the rest of it: none known).
         erpTransit: x.mode === 'erp' ? x.erpLots.map(l => ({ units: l.units, eta: l.eta, parts: l.parts.map(p => ({ ...p })) })) : null,
+        // Our own goods on the water or at port that its In Trans doesn't have yet ({ units, eta, master, inner, po },
+        // before customer orders): the sales sheet adds them to in transit (Saul, Nov 23: "show from our sheets").
+        oursTransit: x.mode === 'erp' ? ours.filter(l => !l.inChina && l.notOnErp > 0).map(l => ({ ...partOf(l, l.notOnErp), eta: l.eta })) : [],
         // The pack stock is in when nothing says otherwise ({ master, inner }, null when unknown), and our Landed goods not
         // sold ({ units, day, master, inner, po }, the latest first): the sales sheets split the stock by them (Saul, Nov 4).
         stockPack: isDay(stockPack) ? { master: stockPack, inner: stockPair ? stockPair.inner : null } : null,

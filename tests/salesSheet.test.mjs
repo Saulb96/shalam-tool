@@ -54,7 +54,8 @@ const sellOf = (allocs, ats) => SELL.buildSell({ stages: stagesOf(allocs), ats, 
 // SS100: ATS from in WH 460; In Trans 300 (ETA 11/20: ours on the water, the same shipment) and 120 (ETA 10/20: due
 //   10/27, so now); in China a Booked lot whose pull-from date has passed (10/10), 480 on 12/1 and 100 about 12/15.
 // SS200: oversold 50: its 30 In Trans and 20 of its 70 in China go to the orders; no case pack.
-// SS300: ATS from in WH 10; lots in two packs; 60 of ours on the water the ERP doesn't have (never on the sheet).
+// SS300: ATS from in WH 10; lots in two packs; 60 of ours on the water the ERP doesn't have (in transit from our own
+//   sheets, ETA 11/15: available 11/22).
 // SS400: nothing available (left off). SS500: its "ATS from in WH" (80) isn't In WH − orders (90): the report's wins;
 //   an In Trans shipment with no ETA.
 function mainSell() {
@@ -68,7 +69,7 @@ function mainSell() {
     alloc({ style: 'SS300', styleRaw: 'SS300', upc: '000000000300', master: 24, inner: 6, units: 48, dates: { factoryCrd: D(12, 6) } }),
     alloc({ style: 'SS300', styleRaw: 'SS300', upc: '000000000301', master: 12, inner: 3, units: 36, po: '900106', dates: { factoryCrd: D(12, 6) } }),
     alloc({ style: 'SS300', styleRaw: 'SS300', upc: '000000000300', master: 12, inner: 3, units: 30, po: '900107', dates: { factoryCrd: D(12, 25) } }),
-    alloc({ style: 'SS300', styleRaw: 'SS300', upc: '000000000300', master: 12, units: 60, po: '900108', bucket: 'water', eta: D(11, 15), stage: 'On the water' }),
+    alloc({ style: 'SS300', styleRaw: 'SS300', upc: '000000000300', master: 24, inner: 6, units: 60, po: '900108', bucket: 'water', eta: D(11, 15), stage: 'On the water' }),
   ];
   return sellOf(as, atsOf({ SS100: [500, 40, 460, [[300, D(11, 20)], [120, D(10, 20)]]], SS200: [0, 50, -50, [[30, D(11, 10)]]], SS300: [10, 0, 10],
     SS400: [0, 0, 0], SS500: [100, 10, 80, [[24, null]]] }));
@@ -126,16 +127,18 @@ test('Available to sell: one row per style on the ATS report with something avai
   }
   for (const b of sh.byDate) assert.deepEqual(Object.keys(b), DATE_KEYS);
   // SS050 isn't on the report; SS200 (oversold beyond its In Trans) and SS400 have nothing.
-  assert.deepEqual(sh.counts, { styles: 3, rows: 3, split: 0, reserved: 0, leftOff: 2, stockUnknown: 0, transitUnknown: 0, notOnReport: 1, byDateRows: sh.byDate.length, noPack: 1 });
-  assert.deepEqual(sh.totals, { onHand: 550, inTransit: 444, total: 994 });
+  assert.deepEqual(sh.counts, { styles: 3, rows: 3, split: 0, reserved: 0, leftOff: 2, stockUnknown: 0, transitUnknown: 0, notOnReport: 1, byDateRows: sh.byDate.length, noPack: 1,
+    oursStyles: 1, oursUnits: 60 });
+  assert.deepEqual(sh.totals, { onHand: 550, inTransit: 504, total: 1054 });
+  assert.deepEqual(sh.merges, []);
 });
 
-test("on hand is the ATS report's own ATS from in WH (0 when below 0); our shipping sheets add nothing", () => {
+test("on hand is the ATS report's own ATS from in WH (0 when below 0); our shipping sheets add nothing to it", () => {
   const sh = SS.salesRows(mainSell(), { today: TODAY }), row = st => sh.rows.find(r => r.style === st);
   assert.deepEqual([row('SS100').onHand, row('SS300').onHand, row('SS500').onHand], [460, 10, 80]);
   // SS500: In WH 100 − orders 10 would be 90; the report says 80, and the report wins.
-  // SS300: our 60 on the water aren't on the ERP's In Trans, so they aren't offered.
-  assert.equal(row('SS300').inTransit, 0);
+  // SS300: our 60 on the water aren't on the ERP's In Trans: in transit from our own sheets (Saul, Nov 23).
+  assert.deepEqual([row('SS300').inTransit, row('SS300').total], [60, 70]);
   // With no "ATS from in WH" for a style, In WH − orders.
   const fb = SS.salesRows(sellOf([alloc({ dates: { factoryCrd: D(12, 6) } })], atsOf({ SS100: [70, 30] })), { today: TODAY });
   assert.deepEqual([fb.rows[0].onHand, fb.rows[0].total], [40, 40]);
@@ -156,7 +159,7 @@ test('in transit: every In Trans shipment, the oversold off the earliest first, 
   assert.deepEqual([row('SS100').inTransit, row('SS100').transitFrom, row('SS100').total], [420, 'now', 880]);
   // SS500: a shipment with no ETA has no date.
   assert.deepEqual([row('SS500').inTransit, row('SS500').transitFrom], [24, null]);
-  assert.equal(row('SS300').transitFrom, null);
+  assert.equal(row('SS300').transitFrom, D(11, 22));
   // The oversold comes off the earliest ETA first; a shipment with no ETA last.
   const ats = atsOf({ SS100: [0, 130, -130, [[24, null], [100, D(11, 25)], [60, D(11, 12)]]] });
   const o = SS.salesRows(sellOf([alloc({ dates: { factoryCrd: D(12, 6) } })], ats), { today: TODAY });
@@ -175,7 +178,7 @@ test('Master/Inner: the pack of each line, "–" with no Inner, blank when not k
   assert.equal(row('SS500').pack, '', 'only on the ATS report: no pack known');
   // As the selling engine gives them: our lots' pairs; none, the latest Master Sheet line's.
   const s = mainSell().styles.find(x => x.style === 'SS300');
-  assert.deepEqual(s.packs, [{ master: 12, inner: null }, { master: 12, inner: 3 }, { master: 24, inner: 6 }]);
+  assert.deepEqual(s.packs, [{ master: 12, inner: 3 }, { master: 24, inner: 6 }]);
   assert.deepEqual(s.stockPack, { master: 24, inner: 6 });
 });
 
@@ -231,11 +234,44 @@ test('by date: on hand now, then each in-transit date, units only; in the rows\'
   const sh = SS.salesRows(mainSell(), { today: TODAY });
   const of = st => sh.byDate.filter(b => b.style === st).map(b => [b.when, b.where, b.units]);
   assert.deepEqual(of('SS100'), [['now', 'On hand', 460], ['now', 'In transit', 120], [D(11, 27), 'In transit', 300]]);
-  assert.deepEqual(of('SS300'), [['now', 'On hand', 10]]);
+  assert.deepEqual(of('SS300'), [['now', 'On hand', 10], [D(11, 22), 'In transit', 60]]);
   assert.deepEqual(of('SS500'), [['now', 'On hand', 80], [null, 'In transit', 24]]);
   assert.ok(sh.byDate.every(b => b.units > 0));
   for (const r of sh.rows) assert.equal(sh.byDate.filter(b => b.style === r.style).reduce((t, b) => t + b.units, 0), r.total, r.style);
   assert.deepEqual([...new Set(sh.byDate.map(b => b.style))], sh.rows.map(r => r.style));
+});
+
+test("in transit from our own sheets: our goods on the water or at port the report's In Trans doesn't have, in their PO's pack; the oversold off the earliest ETA", () => {
+  // SS620: In Trans 100 (ETA 11/20: our 100 on the water, the same shipment). Ours it doesn't have: 80 on a -ZZQ PO in
+  // 12/3 (ETA 11/10) and 40 at port (ETA 10/20, before the report's day, with no stock for them to be in: kept).
+  const as = (extra = []) => [
+    alloc({ style: 'SS620', styleRaw: 'SS620', po: '900301', bucket: 'water', units: 100, inner: 6, eta: D(11, 20), stage: 'On the water' }),
+    alloc({ style: 'SS620', styleRaw: 'SS620', po: '900302-ZZQ', bucket: 'water', units: 80, master: 12, inner: 3, eta: D(11, 10), stage: 'On the water' }),
+    alloc({ style: 'SS620', styleRaw: 'SS620', po: '900303', bucket: 'port', units: 40, inner: 6, eta: D(10, 20), stage: 'At port' }),
+    ...extra,
+  ];
+  const sell = sellOf(as(), atsOf({ SS620: [0, 0, 0, [[100, D(11, 20)]]] }));
+  assert.deepEqual(sell.styles[0].oursTransit, [{ units: 40, master: 24, inner: 6, po: '900303', eta: D(10, 20) }, { units: 80, master: 12, inner: 3, po: '900302-ZZQ', eta: D(11, 10) }]);
+  const sh = SS.salesRows(sell, { today: TODAY, reserved: RESERVED });
+  assert.deepEqual(sh.rows.map(r => [r.pack, r.note, r.onHand, r.inTransit, r.transitFrom]), [['12/3', 'Reserved -ZZQ', 0, 80, D(11, 17)], ['24/6', '', 0, 140, 'now']]);
+  assert.deepEqual(sh.byDate.map(b => [b.pack, b.when, b.where, b.units]), [['12/3', D(11, 17), 'In transit', 80], ['24/6', 'now', 'In transit', 40], ['24/6', D(11, 27), 'In transit', 100]]);
+  assert.deepEqual([sh.counts.oursStyles, sh.counts.oursUnits, sh.totals.inTransit], [1, 120, 220]);
+  // Goods the report has received (an ETA by its day, and the stock to hold them) are in its on hand, never added again.
+  const got = SS.salesRows(sellOf(as(), atsOf({ SS620: [500, 0, 500, [[100, D(11, 20)]]] })), { today: TODAY, reserved: RESERVED });
+  assert.deepEqual([got.totals.onHand, got.totals.inTransit, got.counts.oursUnits], [500, 180, 80]);
+  // Oversold 150: off the earliest ETA first, ours and the report's alike (40 of 10/20, 80 of 11/10, 30 of 11/20); none
+  // left to come off the goods in China.
+  const china = alloc({ style: 'SS620', styleRaw: 'SS620', po: '900304', units: 200, inner: 6, dates: { factoryCrd: D(12, 6) } });
+  const over = sellOf(as([china]), atsOf({ SS620: [0, 150, -150, [[100, D(11, 20)]]] }));
+  const so = SS.salesRows(over, { today: TODAY, reserved: RESERVED });
+  assert.deepEqual(so.rows.map(r => [r.pack, r.note, r.inTransit, r.transitFrom]), [['24/6', '', 70, D(11, 27)]]);
+  assert.deepEqual([so.counts.oursStyles, so.counts.oursUnits], [0, 0]);
+  assert.deepEqual(SS.chinaRows(over, { today: TODAY, reserved: RESERVED }).rows.map(r => r.units), [200]);
+  // A style whose In Trans can't be read: nothing of ours is added (on hand only, as before).
+  const bad = atsOf({ SS620: [10, 0, 10, [[100, D(11, 20)]]] });
+  bad.styles.get('SS620').rows[0].inTransBad = ['x'];
+  const sb = SS.salesRows(sellOf(as(), bad), { today: TODAY });
+  assert.deepEqual([sb.totals.inTransit, sb.counts.oursUnits, sb.counts.transitUnknown], [0, 0, 1]);
 });
 
 // ---------- Pull from China
@@ -332,8 +368,8 @@ test('NO LEAK: the rows and the schedule hold none of the names, numbers, flags 
   // Only the allow-listed fields, at every level.
   for (const r of sh.rows) assert.deepEqual(Object.keys(r), ROW_KEYS);
   for (const r of ch.rows) assert.deepEqual(Object.keys(r), CHINA_KEYS);
-  assert.deepEqual(Object.keys(sh).sort(), ['asOf', 'byDate', 'counts', 'kind', 'ok', 'reason', 'reportDay', 'rows', 'totals']);
-  assert.deepEqual(Object.keys(ch).sort(), ['asOf', 'counts', 'kind', 'ok', 'reason', 'reportDay', 'rows', 'totals']);
+  assert.deepEqual(Object.keys(sh).sort(), ['asOf', 'byDate', 'counts', 'kind', 'merges', 'ok', 'reason', 'reportDay', 'rows', 'totals']);
+  assert.deepEqual(Object.keys(ch).sort(), ['asOf', 'counts', 'kind', 'merges', 'ok', 'reason', 'reportDay', 'rows', 'totals']);
 });
 
 // ---------- the Excel file (ExcelJS, vendored)
@@ -372,7 +408,7 @@ test('the workbook: every style, a tab per category, By date; the title, frozen 
   assert.deepEqual(SS.COLS.map(c => c.h), ['Photo', 'Style', 'UPC', 'Description', 'Brand', 'Category', 'Sub category', 'Master/Inner', 'Available on hand (units)',
     'Available in transit (units)', 'In transit available from', 'Total available (units)', 'Notes']);
   assert.deepEqual('BCDEFGHIJKLM'.split('').map(c => v(c + '3')), ['SS100', '000111222333', 'Item SS100', undefined, 'Lip', undefined, '24/6', 460, 420, 'now', 880, undefined]);
-  assert.deepEqual('BHIJKL'.split('').map(c => v(c + '4')), ['SS300', '24/6', 10, undefined, undefined, 10]);
+  assert.deepEqual('BHIJKL'.split('').map(c => v(c + '4')), ['SS300', '24/6', 10, 60, serial(D(11, 22)), 70]);
   assert.deepEqual('BDHIJKL'.split('').map(c => v(c + '5')), ['SS500', 'ERP SS500', undefined, 80, 24, 'date to come', 104]);
   assert.equal(v('B6'), undefined, 'three styles, no more');
   assert.equal(ws.C3.t, 's', 'UPCs stay text');
@@ -389,7 +425,8 @@ test('the workbook: every style, a tab per category, By date; the title, frozen 
   const sched = [];
   for (let r = 2; w('A' + r) !== undefined; r++) sched.push(['A', 'C', 'E', 'F', 'G'].map(c => w(c + r)));
   assert.deepEqual(sched, [['SS100', 'Lip', 'now', 'On hand', 460], ['SS100', 'Lip', 'now', 'In transit', 120], ['SS100', 'Lip', serial(D(11, 27)), 'In transit', 300],
-    ['SS300', 'Lip', 'now', 'On hand', 10], ['SS500', 'Lip', 'now', 'On hand', 80], ['SS500', 'Lip', 'date to come', 'In transit', 24]]);
+    ['SS300', 'Lip', 'now', 'On hand', 10], ['SS300', 'Lip', serial(D(11, 22)), 'In transit', 60], ['SS500', 'Lip', 'now', 'On hand', 80],
+    ['SS500', 'Lip', 'date to come', 'In transit', 24]]);
 
   const parts = xlsxParts(bytes);
   const sheet1 = Buffer.from(parts.get('xl/worksheets/sheet1.xml')).toString('utf8'), sheet3 = Buffer.from(parts.get('xl/worksheets/sheet3.xml')).toString('utf8');
@@ -506,6 +543,30 @@ test("a style's category and sub category: the ATS report's, else the page's (UP
   const s3 = sellOf([alloc({ dates: { factoryCrd: D(12, 6) } })], ats);
   assert.deepEqual([s3.styles[0].atsCategory, s3.styles[0].atsSub], ['', ''], 'a sub category with no category is not the pair from the report');
   assert.deepEqual(SS.salesRows(s3, { today: TODAY }).rows.map(r => [r.category, r.sub]), [['Lip', '']]);
+});
+
+test('one category written two ways is one: names that differ only by capitals or spaces; a number is part of the name', () => {
+  const sell = mainSell();
+  const set = { SS050: ['MakeupBrushes', 'Sets'], SS100: ['BODY', 'LOTIONS'], SS200: ['Cosmetics1', ''], SS300: ['Body', 'Lotions'], SS400: ['Cosmetics2', ''], SS500: ['Makeup Brushes', 'sets'] };
+  for (const s of sell.styles) [s.atsCategory, s.atsSub] = set[s.style];
+  const sh = SS.salesRows(sell, { today: TODAY }), ch = SS.chinaRows(sell, { today: TODAY });
+  // Mixed case before all capitals; the words apart before run together. Rows by the one name, then sub category, style.
+  assert.deepEqual(sh.rows.map(r => [r.style, r.category, r.sub]), [['SS100', 'Body', 'Lotions'], ['SS300', 'Body', 'Lotions'], ['SS500', 'Makeup Brushes', 'Sets']]);
+  assert.deepEqual(sh.byDate.map(b => b.category).filter((c, i, a) => a.indexOf(c) === i), ['Body', 'Makeup Brushes']);
+  assert.deepEqual(SS.categoryTabs(sh.rows).map(t => [t.name, t.rows]), [['Body', [0, 1]], ['Makeup Brushes', [2]]]);
+  // Pull from China names them alike (SS050 is only on it), and Cosmetics1 is never Cosmetics2.
+  assert.deepEqual([...new Set(ch.rows.map(r => [r.style, r.category, r.sub].join('|')))],
+    ['SS100|Body|Lotions', 'SS300|Body|Lotions', 'SS200|Cosmetics1|', 'SS050|Makeup Brushes|Sets']);
+  const merges = [{ category: 'Body', sub: null, spellings: ['BODY', 'Body'] }, { category: 'Makeup Brushes', sub: null, spellings: ['Makeup Brushes', 'MakeupBrushes'] },
+    { category: 'Body', sub: 'Lotions', spellings: ['LOTIONS', 'Lotions'] }, { category: 'Makeup Brushes', sub: 'Sets', spellings: ['Sets', 'sets'] }];
+  assert.deepEqual(sh.merges, merges);
+  assert.deepEqual(ch.merges, merges);
+  // Neither in mixed case: the spelling on the most styles, then A to Z.
+  const name = cats => { const x = mainSell(); x.styles.forEach((s, i) => { s.atsCategory = cats[i] ?? 'Other'; s.atsSub = ''; }); return SS.salesRows(x, { today: TODAY }).merges.map(m => m.category); };
+  assert.deepEqual(name(['hair', 'HAIR', 'hair']), ['hair']);
+  assert.deepEqual(name(['hair', 'HAIR']), ['HAIR']);
+  assert.deepEqual(name(['Hair Care', 'HAIR  CARE', 'haircare', 'HairCare']), ['Hair Care']);
+  assert.deepEqual(name(['Cosmetics', 'Cosmetics1', 'Cosmetics2', 'Cosmetics 1']), ['Cosmetics 1'], 'only Cosmetics1 and "Cosmetics 1" are one');
 });
 
 test("category tab names: what Excel won't take made a space, at most 31 characters, never History or another tab's name; never joined", () => {
