@@ -413,6 +413,15 @@
     });
   }
 
+  // The ATS report's day as a file's subject says it ("ATS report 2026-11-02"; '' when the day isn't known), and read
+  // back from one (null when it isn't such a subject).
+  const reportSubject = day => (isDay(day) ? `ATS report ${C.isoDay(day)}` : '');
+  function reportDayOf(subject) {
+    const m = /^ATS report (\d{4})-(\d{2})-(\d{2})$/.exec(S(subject));
+    const d = m ? C.ymd(+m[1], +m[2], +m[3]) : null;
+    return isDay(d) && C.isoDay(d) === `${m[1]}-${m[2]}-${m[3]}` ? d : null;
+  }
+
   // ExcelJS: the library (window.ExcelJS, or require('vendor/exceljs/exceljs.min.js') in Node). sheet: salesRows's or
   // chinaRows's answer (ok, with rows). photos: a Map (or object) of photoKey -> { data (the image's bytes: ArrayBuffer
   // or Uint8Array), width, height (pixels), extension ('jpeg' when not given) }, or a list of those in the rows' order
@@ -430,6 +439,8 @@
     const wb = new ExcelJS.Workbook();
     wb.creator = 'Shalam Tool'; wb.lastModifiedBy = 'Shalam Tool';
     if (print) wb.keywords = print;
+    // The ATS report the sheet was made from, in the file's subject: the sales page says it without opening the sheet.
+    if (reportSubject(sheet.reportDay)) wb.subject = reportSubject(sheet.reportDay);
 
     // A tab of rows: the title row, the header row, the rows (rowIdx: their places in sheet.rows). Each picture goes
     // into the file once (by its photo key: a style on several rows shows the same one), however many tabs show it.
@@ -587,6 +598,6 @@
     return b instanceof Uint8Array ? new Uint8Array(b.buffer, b.byteOffset, b.byteLength) : new Uint8Array(b);
   }
 
-  return { salesRows, chinaRows, categoryTabs, tabsOf, kindOf, buildWorkbook, readWorkbook, workbookBytes, photoKey, packText, fitPhoto,
+  return { salesRows, chinaRows, categoryTabs, tabsOf, kindOf, buildWorkbook, readWorkbook, workbookBytes, reportSubject, reportDayOf, photoKey, packText, fitPhoto,
     TITLE, TABS, KINDS, NO_CAT, WHERE, COLS, CHINA_COLS, DATE_COLS, TRANSIT_DAYS, PHOTO_ROW_PT, PHOTO_INSET };
 });

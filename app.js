@@ -3887,7 +3887,8 @@
   // eTag), and each style's picture by where it comes from: the ERP report's (a hash of its bytes in the report: the same
   // in every browser) or Quote Images' (its size there, so a replaced photo is saved again). A new picture report, or a style's
   // picture changing, saves the file again. It is written into the file too (its keywords), so whoever looks at the file
-  // later can tell what it holds. pics: the ERP report's pictures the save keeps to (see erpIn).
+  // later can tell what it holds. pics: the ERP report's pictures the save keeps to (see erpIn). make: how the file is
+  // written (2: the ATS report's day in its subject, Nov 25), so a file made the old way is saved again once.
   const salesPics = (sheet, pics) => sheet.rows.map(r => {
     const e = erpIn(pics, r);
     if (e) return ['erp', e.hash];
@@ -3895,7 +3896,7 @@
     return p && p.has === true ? ['quote', p.size ?? null] : null;
   });
   async function sheetPrint(sheet, pics) {
-    const text = JSON.stringify({ kind: sheet.kind || 'sales', asOf: sheet.asOf, reportDay: sheet.reportDay, rows: sheet.rows, byDate: sheet.byDate,
+    const text = JSON.stringify({ make: 2, kind: sheet.kind || 'sales', asOf: sheet.asOf, reportDay: sheet.reportDay, rows: sheet.rows, byDate: sheet.byDate,
       pictures: pics ? `${pics.itemId}|${pics.eTag}` : '', photos: salesPics(sheet, pics) });
     return window.crypto && crypto.subtle ? sha256Hex(text) : hash(text);
   }

@@ -68,7 +68,7 @@ const NAMES = { msl: 'Master Sheet Live', tracker: 'PO Status Tracker', pobook: 
 
 const X = loadXLSX();
 const C = core('common'), PB = core('pobook'), CT = core('ct'), SH = core('shipping'), UPC = core('upc'), ST = core('stages');
-const ATS = core('ats'), SELL = core('sell'), SS = core('salesSheet'), EP = core('erpPictures'), SV = core('salesView');
+const ATS = core('ats'), SELL = core('sell'), SS = core('salesSheet'), EP = core('erpPictures');
 const TODAY = C.todayNY(Date.now());   // the page works its dates out from the same clock
 const iso = days => new Date(Date.now() - days * 864e5).toISOString();
 const fmtN = v => (typeof v === 'number' ? v.toLocaleString('en-US') : String(v));
@@ -1422,40 +1422,33 @@ const want0 = (S, today) => (S && S.ok ? SS.salesRows(S, { today }).rows.length 
 const sheetFor = (fx, today, f) => { const { S } = sellFor(fx, today, f); return S && S.ok ? SS.salesRows(S, { today }) : null; };
 const chinaFor = (fx, today, f) => { const { S } = sellFor(fx, today, f); return S && S.ok ? SS.chinaRows(S, { today }) : null; };
 
-// ---- the sales page (sales.html, Saul, Nov 4): it reads the two files in the library, nothing else.
-// Ready: signed in, done loading, and showing rows or why there are none.
-const SALES_READY = `(() => { const a = document.getElementById('app'), l = document.getElementById('lead'), b = document.getElementById('busy');
-  return !!a && !a.hidden && a.getAttribute('aria-busy') === 'false' && !!b && b.hidden &&
-    (!!document.querySelector('#grid tbody tr') || (!!l && !l.hidden && !/^Loading/.test(document.getElementById('leadH').textContent))); })()`;
-// What the checks read from the sales page, in one call. A row: its style, pack, note and every cell's text.
+// ---- the sales page (sales.html, Saul, Nov 4; made simple Nov 25): the latest ATS import and a download for each of
+// the two files in the library, nothing else.
+// Ready: signed in and done loading.
+const SALES_READY = `(() => { const a = document.getElementById('app'), b = document.getElementById('busy');
+  return !!a && !a.hidden && a.getAttribute('aria-busy') === 'false' && !!b && b.hidden; })()`;
+// What the checks read from the sales page, in one call.
 const SALES_SNAP = `(() => {
   const q = s => document.querySelector(s), txt = el => (el ? el.textContent.replace(/\\s+/g, ' ').trim() : '');
-  const rows = [...document.querySelectorAll('#grid tbody tr')].filter(tr => !tr.querySelector('td.empty'));
-  return { tab: (q('#tabs .tab.on') || {}).dataset.tab, cSales: txt(q('#cSales')), cChina: txt(q('#cChina')), lead: q('#lead').hidden ? '' : txt(q('#lead')),
-    health: txt(q('#health')), info: txt(q('#fInfo')), heads: [...document.querySelectorAll('#grid thead th')].map(txt), barShown: !q('#fbar').hidden,
-    rows: rows.map(tr => ({ style: txt(tr.children[1].querySelector('b')), cells: [...tr.children].map(txt), pic: !!tr.querySelector('img.pic') })),
-    brands: [...q('#fBrand').options].map(o => o.value), cats: [...q('#fCat').options].map(o => o.value), whereShown: !q('#fWhere').hidden,
-    clear: !q('#btnClearF').hidden, dl: { disabled: q('#btnDl').disabled, text: txt(q('#btnDl')) }, toast: txt(q('#toast')),
-    saved: ((window.__headless || {}).saved || []).map(x => x.name) };
+  const btn = id => ({ disabled: q(id).disabled, text: txt(q(id)) });
+  return { h: txt(q('#impH')), p: txt(q('#impP')), health: txt(q('#health')), sales: btn('#btnDlSales'), china: btn('#btnDlChina'),
+    infoSales: txt(q('#infoSales')), infoChina: txt(q('#infoChina')), red: [q('#infoSales').className, q('#infoChina').className],
+    card: txt(q('.salescard')), buttons: [...document.querySelectorAll('#app button')].map(txt), tables: document.querySelectorAll('table, input, select, img').length,
+    toast: txt(q('#toast')), saved: ((window.__headless || {}).saved || []).map(x => x.name) };
 })()`;
 const salesSnap = t => t.eval(SALES_SNAP);
-// A filter set as a person would: a select's value, the search typed, a date picked.
-const setFilter = (t, id, value) => t.eval(`(() => { const el = document.getElementById(${JSON.stringify(id)}); el.value = ${JSON.stringify(value)};
-  el.dispatchEvent(new Event(${JSON.stringify(id === 'fq' ? 'input' : 'change')})); })()`);
-const isoDay = d => new Date(d * 864e5).toISOString().slice(0, 10);
 // The two files as Shalam Tool saves them, with the invented photos, put in the library before the page opens: answers
-// each file's sheet as the page should read it back.
-async function salesLibrary(w, today) {
+// each file's sheet (as made) and its bytes. opts.noDay: files made before the ATS report's day was written into them.
+async function salesLibrary(w, today, opts = {}) {
   const files = { ...SELL_FILES, ats: SELL_ATS }, E = loadExcelJS(), out = {};
   for (const [kind, sh] of [['sales', sheetFor(w.fx, today, files)], ['china', chinaFor(w.fx, today, files)]]) {
     const pics = sh.rows.map(r => { const n = SELL_PICS[r.photoKey], b = n && w.fx.bytes.get(n), d = b && EP.pictureSize(new Uint8Array(b), 'jpeg');
       return d ? { data: new Uint8Array(b), width: d.w, height: d.h, extension: 'jpeg' } : null; });
-    const bytes = Buffer.from(await SS.workbookBytes(SS.buildWorkbook(E, sh, pics)));
+    const made = opts.noDay ? { ...sh, reportDay: null } : sh;
+    const bytes = Buffer.from(await SS.workbookBytes(SS.buildWorkbook(E, made, pics)));
     const f = kind === 'sales' ? { id: 'itm-sales', name: SALES_FILE, eTag: '"{5A1E5000-0000-4000-8000-000000000001},1"' } : { id: 'itm-china', name: CHINA_FILE, eTag: '"{C41A5000-0000-4000-8000-000000000001},1"' };
     w.sales[kind === 'sales' ? 'file' : 'china'] = { ...f, size: bytes.length, bytes, sent: bytes, at: new Date().toISOString() };
-    const wb = new E.Workbook();
-    await wb.xlsx.load(bytes);
-    out[kind] = SS.readWorkbook(wb);
+    out[kind] = { sheet: made, bytes };
   }
   return out;
 }
@@ -3081,110 +3074,82 @@ const SCENARIOS = [
     },
   },
   {
-    name: 'salespage', title: 'the sales page: both files from the library with their photos; filters; Download is exactly what is shown; nothing but GETs, nothing else read',
+    name: 'salespage', title: 'the sales page: the latest ATS import and a download for each file, handed over exactly as it is in the library; nothing but GETs, nothing else read or shown',
     world: { cfg: { chinaFile: CHINA_FILE } }, page: 'sales.html', photos: true, noGraph: false,
     async setup(o) { o.w.lib = await salesLibrary(o.w, o.today); },
-    async run({ t, w, c, today }) {
-      const L = w.lib, sales = L.sales, china = L.china;
-      t.shots.push(await t.shot('salespage-onhand'));
+    async run({ t, w, c }) {
+      const L = w.lib, day = L.sales.sheet.reportDay;
+      t.shots.push(await t.shot('salespage'));
       let p = await salesSnap(t);
-      c(`On hand ATS shown first: ${sales.rows.length} lines, Pull from China ${china.rows.length}, both saved (said at the top)`, p.tab === 'sales' && !p.lead && p.barShown &&
-        p.cSales === fmtN(sales.rows.length) && p.cChina === fmtN(china.rows.length) && /On hand ATS saved .* · Pull from China saved /.test(p.health), JSON.stringify({ tab: p.tab, lead: p.lead, c: [p.cSales, p.cChina], h: p.health }));
-      c('its columns', p.heads.join('|') === 'Photo|Style|Description|Brand|Category|Sub category|Master/Inner|On hand|In transit|Available from|Total|Notes', p.heads.join('|'));
-      c('every line of the file, in its order, with its units and its photo', p.rows.length === sales.rows.length && p.rows.every((r, i) => r.style === sales.rows[i].style &&
-        r.cells[6] === sales.rows[i].pack && r.cells[7] === (sales.rows[i].onHand ? fmtN(sales.rows[i].onHand) : '') && r.cells[10] === fmtN(sales.rows[i].total) && r.pic === !!sales.photos[i]),
-        JSON.stringify(p.rows.slice(0, 3)));
-      c('photos shown for the lines that have one in the file', p.rows.filter(r => r.pic).length === sales.photos.filter(Boolean).length && sales.photos.some(Boolean), p.rows.filter(r => r.pic).length);
-      const ch = SV.choices(sales);
-      c("the brand and category choices are the file's", JSON.stringify(p.brands) === JSON.stringify([SV.ALL, ...ch.brands]) && JSON.stringify(p.cats) === JSON.stringify([SV.ALL, ...ch.categories]),
-        JSON.stringify({ b: p.brands, c: p.cats }));
-      c('the brand is on the sheet (Brand S on the invented lines)', ch.brands.includes('Brand S'), ch.brands.join(', '));
+      c(`the files here are made from the ATS report of ${C.fmtDay(day)} (both the same)`, typeof day === 'number' && L.china.sheet.reportDay === day, JSON.stringify([day, L.china.sheet.reportDay]));
+      c(`"Latest ATS import: ${C.fmtDay(day)}"`, p.h === `Latest ATS import: ${C.fmtDay(day)}` && p.p === 'The files below are made from that ATS report by Shalam Tool.' && !p.health, JSON.stringify({ h: p.h, p: p.p, health: p.health }));
+      c('the two buttons, on: "Download On hand ATS" and "Download Pull from China", and no other', !p.sales.disabled && !p.china.disabled && p.buttons.join('|') === 'Download On hand ATS|Download Pull from China', JSON.stringify(p.buttons));
+      const info = new RegExp(`^ATS report of ${C.fmtDay(day).replace(/\//g, '\\/')} · saved \\d+\\/\\d+\\/\\d{4}, \\d+:\\d\\d [AP]M$`);
+      c('under each: its ATS report and when it was saved', info.test(p.infoSales) && info.test(p.infoChina), `${p.infoSales} · ${p.infoChina}`);
+      c('nothing of the sheets is on the page: no table, photo, search or filter', p.tables === 0 && !/SL-|Brand S|Factory|Customer/.test(p.card), p.card);
       const reads = w.calls.map(x => `${x.method} ${x.path}`);
       const want = ['GET /sites/met1sol.sharepoint.com:/sites/TestReports', 'GET /sites/site-rep/drives', `GET /drives/${SALES_DRV}/root:/${SALES_FILE}`, `GET /drives/${SALES_DRV}/root:/${CHINA_FILE}`];
       c('it asked SharePoint for the library and the two files only, and downloaded those two', reads.length === want.length && want.every(x => reads.includes(x)) &&
         JSON.stringify(w.downloads.map(d => d.name).sort()) === JSON.stringify(['china file', 'sales file']), `${reads.join('; ')} · ${w.downloads.map(d => d.name).join(', ')}`);
       c('no email, no upload, no source read', !w.calls.some(x => x.method !== 'GET') && !w.sales.made && !w.sales.chinaMade && !w.downloads.some(d => !/file$/.test(d.name)));
-
-      // Filters, each compared with core/salesView.js on the file as read here.
-      const f = { q: '', brand: SV.ALL, category: SV.ALL, sub: SV.ALL, where: 'all', by: null };
-      const same = async (label, ff) => {
-        await sleep(350);
-        const s1 = await salesSnap(t), v = SV.view(sales, ff);
-        c(label + `: ${v.rows.length} lines`, s1.rows.map(r => `${r.style}|${r.cells[6]}|${r.cells[11]}`).join() === v.rows.map(lineOf).join() &&
-          s1.rows.every((r, i) => r.cells[8] === (v.rows[i].inTransit ? fmtN(v.rows[i].inTransit) : '') && r.cells[10] === fmtN(v.rows[i].total)) && s1.clear === SV.filtered(ff) &&
-          s1.info.endsWith(`${fmtN(v.totals.total)} units`), `${s1.rows.map(r => `${r.style}|${r.cells[6]}|${r.cells[8]}|${r.cells[10]}`).join('; ')} · want ${v.rows.map(r => `${lineOf(r)}|${r.inTransit}|${r.total}`).join('; ')} · ${s1.info}`);
-        return v;
-      };
-      const cat = ch.categories[0];
-      await setFilter(t, 'fCat', cat); f.category = cat;
-      await same(`category ${cat}`, f);
-      await setFilter(t, 'fq', 'SL-10'); f.q = 'SL-10';
-      await same('and the search "SL-10"', f);
-      await setFilter(t, 'fq', ''); f.q = '';
-      await setFilter(t, 'fWhere', 'onHand'); f.where = 'onHand';
-      await same('on hand only', f);
-      await setFilter(t, 'fWhere', 'transit'); f.where = 'transit';
-      await same('in transit only', f);
-      await setFilter(t, 'fWhere', 'all'); f.where = 'all';
-      const by = today + 20;
-      await setFilter(t, 'fBy', isoDay(by)); f.by = by;
-      const v = await same(`available by ${C.fmtDay(by)}`, f);
-      p = await salesSnap(t);
-      c('the button says the file will be filtered', p.dl.text === 'Download On hand ATS (filtered)' && !p.dl.disabled, JSON.stringify(p.dl));
-      await t.eval(`document.getElementById('btnDl').click()`);
+      // Each button hands over its file, byte for byte.
+      const handed = async i => Buffer.from(await t.eval(`window.__headless.savedFile(${i})`), 'base64');
+      await t.eval(`document.getElementById('btnDlSales').click()`);
       await t.waitFor(`(window.__headless.saved || []).length === 1`, 'the file to be handed over', 20000);
-      const got = await savedSheet(t, 0);
       p = await salesSnap(t);
-      c(`Download: "On hand ATS (filtered).xlsx" holds exactly the ${v.rows.length} lines shown, their schedule and photos`, p.saved[0] === 'On hand ATS (filtered).xlsx' && got.kind === 'sales' &&
-        JSON.stringify(got.rows) === JSON.stringify(v.rows) && JSON.stringify(got.byDate) === JSON.stringify(v.byDate) && got.photos.filter(Boolean).length === v.photos.filter(Boolean).length,
-        `${p.saved.join(', ')} · ${got.rows.map(lineOf).join('; ')} · want ${v.rows.map(lineOf).join('; ')}`);
-      c('its toast', p.toast === `On hand ATS (filtered).xlsx downloaded: ${v.rows.length} line${v.rows.length === 1 ? '' : 's'}, ${v.photos.filter(Boolean).length} photo${v.photos.filter(Boolean).length === 1 ? '' : 's'}.`, p.toast);
-      await t.eval(`document.getElementById('btnClearF').click()`);
-      await same('Clear filters: every line again', { q: '', brand: SV.ALL, category: SV.ALL, sub: SV.ALL, where: 'all', by: null });
-
-      // Pull from China: its own columns, no on hand / in transit choice; downloaded whole.
-      await t.eval(`document.querySelector('#tabs .tab[data-tab="china"]').click()`);
-      await sleep(200);
-      p = await salesSnap(t);
-      c(`Pull from China: its ${china.rows.length} lines and columns; no "on hand or in transit"`, p.tab === 'china' && p.rows.length === china.rows.length && !p.whereShown &&
-        p.heads.join('|') === 'Photo|Style|Description|Brand|Category|Sub category|Master/Inner|Units|Pull from date|Notes' && p.rows.every((r, i) => r.style === china.rows[i].style && r.cells[7] === fmtN(china.rows[i].units)),
-        JSON.stringify({ tab: p.tab, n: p.rows.length, heads: p.heads, whereShown: p.whereShown }));
-      await t.eval(`document.getElementById('btnDl').click()`);
+      const g1 = await handed(0);
+      c(`Download On hand ATS: "${SALES_FILE}", the file in the library byte for byte (${fmtN(g1.length)} bytes)`, p.saved[0] === SALES_FILE && g1.equals(L.sales.bytes) && p.toast === `${SALES_FILE} downloaded.`,
+        `${p.saved.join(', ')} · ${g1.length} of ${L.sales.bytes.length} · ${p.toast}`);
+      await t.eval(`document.getElementById('btnDlChina').click()`);
       await t.waitFor(`(window.__headless.saved || []).length === 2`, 'the second file to be handed over', 20000);
-      const g2 = await savedSheet(t, 1);
       p = await salesSnap(t);
-      c('Download: "Pull from China.xlsx", every line', p.saved[1] === 'Pull from China.xlsx' && g2.kind === 'china' && JSON.stringify(g2.rows) === JSON.stringify(china.rows), p.saved.join(', '));
+      const g2 = await handed(1);
+      c(`Download Pull from China: "${CHINA_FILE}", byte for byte`, p.saved[1] === CHINA_FILE && g2.equals(L.china.bytes) && p.toast === `${CHINA_FILE} downloaded.`, `${p.saved.join(', ')} · ${g2.length} of ${L.china.bytes.length}`);
+      c('the downloads asked SharePoint for nothing more', w.calls.length === want.length && w.downloads.length === 2, `${w.calls.length} calls, ${w.downloads.length} downloads`);
       // The 5-minute refresh: the files haven't changed, so nothing is downloaded again.
       const dls = w.downloads.length;
       await t.eval('window.__headless.fireLong()');
+      await sleep(300);
       await t.waitFor(SALES_READY, 'the refresh', 20000);
       await sleep(300);
-      c('the 5-minute refresh: the files looked at again, not downloaded again (unchanged)', w.downloads.length === dls && w.calls.filter(x => x.path === `/drives/${SALES_DRV}/root:/${SALES_FILE}`).length === 2,
-        `${w.downloads.length - dls} downloads`);
-      t.shots.push(await t.shot('salespage'));
+      p = await salesSnap(t);
+      c('the 5-minute refresh: the files looked at again, not downloaded again (unchanged); the page says the same', w.downloads.length === dls && w.calls.filter(x => x.path === `/drives/${SALES_DRV}/root:/${SALES_FILE}`).length === 2 &&
+        p.h === `Latest ATS import: ${C.fmtDay(day)}` && !p.sales.disabled && !p.china.disabled, `${w.downloads.length - dls} downloads · ${p.h}`);
     },
   },
   {
-    name: 'salespage-noaccess', title: "the sales page for someone who can't open the library: said plainly, nothing shown, nothing downloaded",
+    name: 'salespage-old', title: "the sales page with files saved before the ATS report's day was written into them: it says so, and both still download",
+    world: { cfg: { chinaFile: CHINA_FILE } }, page: 'sales.html', photos: true,
+    async setup(o) { o.w.lib = await salesLibrary(o.w, o.today, { noDay: true }); },
+    async run({ t, w, c }) {
+      let p = await salesSnap(t);
+      c('"Latest ATS import", with no day, and why', p.h === 'Latest ATS import' && p.p === "The files don't say yet which ATS report they were made from. They will once Shalam Tool saves them again.", JSON.stringify({ h: p.h, p: p.p }));
+      c('each file says when it was saved; both buttons on', /^saved \d/.test(p.infoSales) && /^saved \d/.test(p.infoChina) && !p.sales.disabled && !p.china.disabled, `${p.infoSales} · ${p.infoChina}`);
+      await t.eval(`document.getElementById('btnDlSales').click()`);
+      await t.waitFor(`(window.__headless.saved || []).length === 1`, 'the file to be handed over', 20000);
+      const g = Buffer.from(await t.eval('window.__headless.savedFile(0)'), 'base64');
+      c('Download On hand ATS: the file byte for byte', g.equals(w.lib.sales.bytes), `${g.length} of ${w.lib.sales.bytes.length}`);
+    },
+  },
+  {
+    name: 'salespage-noaccess', title: "the sales page for someone who can't open the library: said plainly, nothing to download",
     world: { cfg: { chinaFile: CHINA_FILE }, salesHidden: true }, page: 'sales.html', photos: true,
     async setup(o) { await salesLibrary(o.w, o.today); },
     async run({ t, w, c }) {
-      const p = await salesSnap(t);
-      c('"Your account can\'t open Sales Test Library. Ask Saul for access."', /^On hand ATS can't be shown Your account can't open Sales Test Library\. Ask Saul for access\.$/.test(p.lead) && !p.barShown && !p.rows.length && p.dl.disabled,
-        JSON.stringify({ lead: p.lead, bar: p.barShown }));
+      const p = await salesSnap(t), msg = "Your account can't open Sales Test Library. Ask Saul for access.";
+      c(`"${msg}"`, p.health === msg && p.infoSales === msg && p.infoChina === msg && p.h === 'Latest ATS import' && !p.p, JSON.stringify(p));
+      c('both buttons off', p.sales.disabled && p.china.disabled && p.red.every(x => / r$/.test(x)), JSON.stringify(p.red));
       c('no file read', !w.downloads.length && !w.calls.some(x => x.path.includes(SALES_DRV + '/')), w.calls.map(x => x.path).join('; '));
     },
   },
   {
-    name: 'salespage-none', title: "the sales page before Shalam Tool has saved the files: each tab says so",
+    name: 'salespage-none', title: "the sales page before Shalam Tool has saved the files: each button is off and says so",
     world: { cfg: { chinaFile: CHINA_FILE } }, page: 'sales.html',
     async run({ t, c }) {
-      let p = await salesSnap(t);
-      c('On hand ATS: "hasn\'t been saved into Shalam Sales tool yet"', p.lead === "On hand ATS can't be shown On hand ATS hasn't been saved into Shalam Sales tool yet." && !p.cSales, p.lead);
-      await t.eval(`document.querySelector('#tabs .tab[data-tab="china"]').click()`);
-      await sleep(150);
-      p = await salesSnap(t);
-      c('Pull from China the same', p.lead === "Pull from China can't be shown Pull from China hasn't been saved into Shalam Sales tool yet.", p.lead);
+      const p = await salesSnap(t);
+      c('On hand ATS: "hasn\'t been saved into Shalam Sales tool yet", its button off', p.infoSales === "On hand ATS hasn't been saved into Shalam Sales tool yet." && p.sales.disabled, p.infoSales);
+      c('Pull from China the same', p.infoChina === "Pull from China hasn't been saved into Shalam Sales tool yet." && p.china.disabled, p.infoChina);
+      c('"Latest ATS import" with no day', p.h === 'Latest ATS import' && !p.p, JSON.stringify({ h: p.h, p: p.p }));
     },
   },
   {

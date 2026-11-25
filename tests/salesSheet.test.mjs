@@ -305,6 +305,14 @@ test('goods on a PO left off (reservedOff) and brands left off (brandsOff) are o
   assert.equal(bc.totals.units + bc.counts.past + bc.counts.brandOff, all.totals.units + all.counts.past);
 });
 
+test("the ATS report's day is written into the file's subject, and read back from it", () => {
+  assert.equal(SS.reportSubject(D(11, 2)), `ATS report ${C.isoDay(D(11, 2))}`);
+  assert.match(SS.reportSubject(D(11, 2)), /^ATS report \d{4}-11-02$/);
+  assert.equal(SS.reportDayOf(SS.reportSubject(D(11, 2))), D(11, 2));
+  for (const v of [null, undefined, '', 'x', NaN]) assert.equal(SS.reportSubject(v), '');
+  for (const v of [null, '', 'ATS report', 'ATS report 2026-13-40', 'ATS report 2026-02-30', 'report 2026-11-02', 'ATS report 2026-11-02 x']) assert.equal(SS.reportDayOf(v), null, String(v));
+});
+
 // ---------- Pull from China
 
 test('Pull from China: our goods in China not sold, one row per style, pull-from date and pack; a date before today left off', () => {

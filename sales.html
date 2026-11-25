@@ -24,37 +24,18 @@
 
   <section id="signin" class="glass" hidden>
     <h2>Shalam Sales</h2>
-    <p id="signinMsg">Sign in with your M1S account to see what is available to sell.</p>
+    <p id="signinMsg">Sign in with your M1S account to get the latest sales files.</p>
     <button class="primary" id="btnSignin" type="button">Sign in</button>
   </section>
 
   <section id="app" hidden aria-busy="false">
-    <div class="glass gridcard">
-      <div class="tabs" id="tabs" role="tablist">
-        <button class="tab on" type="button" role="tab" data-tab="sales">On hand ATS<span class="c" id="cSales" hidden></span></button>
-        <button class="tab" type="button" role="tab" data-tab="china">Pull from China<span class="c" id="cChina" hidden></span></button>
+    <div class="glass salescard">
+      <h2 id="impH">Latest ATS import</h2>
+      <p class="note" id="impP" aria-live="polite"></p>
+      <div class="salesfiles">
+        <div class="salesfile"><button type="button" class="dl" id="btnDlSales" disabled><svg class="ico" width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8m-3.5-3.5L8 10l3.5-3.5M3 13h10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Download On hand ATS</span></button><div class="selinfo" id="infoSales" aria-live="polite"></div></div>
+        <div class="salesfile"><button type="button" class="dl china" id="btnDlChina" disabled><svg class="ico" width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8m-3.5-3.5L8 10l3.5-3.5M3 13h10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Download Pull from China</span></button><div class="selinfo" id="infoChina" aria-live="polite"></div></div>
       </div>
-      <div class="card lead" id="lead" hidden>
-        <h2 id="leadH"></h2>
-        <div class="note" id="leadP"></div>
-      </div>
-      <div class="toolbar fbar" id="fbar">
-        <input type="search" id="fq" placeholder="Search style, UPC, description…" autocomplete="off" spellcheck="false" aria-label="Search style, UPC or description">
-        <select id="fBrand" aria-label="Brand"></select>
-        <select id="fCat" aria-label="Category"></select>
-        <select id="fSub" aria-label="Sub category"></select>
-        <select id="fWhere" aria-label="On hand or in transit">
-          <option value="all">On hand and in transit</option>
-          <option value="onHand">On hand only</option>
-          <option value="transit">In transit only</option>
-        </select>
-        <label class="chk" for="fBy">Available by <input type="date" id="fBy"></label>
-        <button type="button" class="ghost" id="btnClearF" hidden>Clear filters</button>
-        <span class="sp"></span>
-        <span class="selinfo" id="fInfo"></span>
-        <span class="dlbox"><button type="button" class="dl" id="btnDl" disabled><svg class="ico" width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8m-3.5-3.5L8 10l3.5-3.5M3 13h10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><span id="btnDlText">Download</span></button><span class="selinfo" id="dlMsg" aria-live="polite"></span><button type="button" class="ghost" id="btnDlX" hidden>Cancel</button></span>
-      </div>
-      <div class="pane spane" id="pane"><table class="grid" id="grid"><thead></thead><tbody></tbody></table></div>
     </div>
   </section>
 </div>
@@ -63,7 +44,6 @@
 <script src="vendor/msal/msal-browser.min.js"></script>
 <script src="core/common.js"></script>
 <script src="core/salesSheet.js"></script>
-<script src="core/salesView.js"></script>
 <script src="sales.js"></script>
 </body>
 </html>
