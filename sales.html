@@ -32,10 +32,12 @@
     <div class="glass salescard">
       <h2 id="impH">Latest ATS import</h2>
       <p class="note" id="impP" aria-live="polite"></p>
+      <div class="salesoff" id="offRow" hidden><span class="selinfo">Leave off your downloads:</span><details class="brands" id="brandsBox" hidden><summary id="brandsSum">Brands</summary><div class="brandspop"><div class="brandshd">Ticked brands are in your downloads. Kept in this browser.</div><div class="brandslist" id="brandsList"></div><div class="brandsft"><button type="button" class="ghost" id="brandsAll">Show all</button><button type="button" class="ghost" id="brandsClose">Close</button></div></div></details><details class="brands" id="factoriesBox" hidden><summary id="factoriesSum">Factories</summary><div class="brandspop"><div class="brandshd">Ticked factories are in your downloads; each is known here by its code. Kept in this browser.</div><div class="brandslist" id="factoriesList"></div><div class="brandsft"><button type="button" class="ghost" id="factoriesAll">Show all</button><button type="button" class="ghost" id="factoriesClose">Close</button></div></div></details></div>
       <div class="salesfiles">
         <div class="salesfile"><button type="button" class="dl" id="btnDlSales" disabled><svg class="ico" width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8m-3.5-3.5L8 10l3.5-3.5M3 13h10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Download On hand ATS</span></button><div class="selinfo" id="infoSales" aria-live="polite"></div></div>
         <div class="salesfile"><button type="button" class="dl china" id="btnDlChina" disabled><svg class="ico" width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8m-3.5-3.5L8 10l3.5-3.5M3 13h10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Download Pull from China</span></button><div class="selinfo" id="infoChina" aria-live="polite"></div></div>
       </div>
+      <div class="salesmaking"><span class="selinfo" id="dlMsg" aria-live="polite"></span><button type="button" class="ghost" id="btnDlX" hidden>Cancel</button></div>
     </div>
   </section>
 </div>

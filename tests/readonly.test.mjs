@@ -289,7 +289,7 @@ test('Shalam Sales: sign-in asks for read permissions only; the page is a whole 
   assert.doesNotMatch(h, /<!--/, 'a comment marker in sales.html');
   const scripts = [...h.matchAll(/<script src="([^"]+)"><\/script>/g)].map(m => m[1]);
   assert.deepEqual(scripts, ['config.js', 'vendor/msal/msal-browser.min.js', 'core/common.js', 'core/salesSheet.js', 'sales.js']);
-  // Nothing of the sheets is shown or made on the page (Saul, Nov 25): the files are handed over as they are.
-  assert.doesNotMatch(h, /<table|<input|<select/);
-  assert.doesNotMatch(sales, /buildWorkbook|readWorkbook|ExcelJS|innerHTML = .*rows/);
+  // Nothing of the sheets is shown on the page (Saul, Nov 25): no table, no search; only the two tick lists' boxes.
+  assert.doesNotMatch(h, /<table|<input|<select|<img/);
+  assert.doesNotMatch(sales, /<table|<td|<img/);
 });

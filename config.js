@@ -25,6 +25,10 @@ window.INV_CONFIG = {
   reservedOff: ['-BCF'],
   // Brands left off the sales sheets (capitals and spaces aside).
   brandsOff: [],
+  // Factory codes (Saul, Nov 25): the name of a list on the Production site with a line per factory: Title = the
+  // factory's name as Master Sheet Live writes it, Code = what the sales sheets say instead (A, B, C…). Blank: the
+  // sheets' Factory column stays empty. The names and their codes are never written in this file.
+  factoryCodes: 'Factory Codes',
   photos: '/sites/Production/Shared Documents/Quote Sheets/Quote Images',
   errorEmailTo: 'saul@metro1solutions.com',
   errorEmailName: 'Saul',

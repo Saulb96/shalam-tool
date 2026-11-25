@@ -50,6 +50,7 @@ const TEST_SECTIONS = { pullFromChina: ['Customer Direct'], planning: ['Planning
 const SALES_LIB = '/sites/TestReports/Sales Test Library', SALES_FILE = 'Sales Test.xlsx', SALES_DRV = 'drv-sales';
 const SESSION_PATH = `/drives/${SALES_DRV}/root:/${SALES_FILE}:/createUploadSession`;
 // The Pull from China sheet (Saul, Nov 3), saved next to it when a scenario sets chinaFile.
+const FAC_LIST = 'Test Factory Codes';
 const CHINA_FILE = 'China Test.xlsx', CHINA_SESSION = `/drives/${SALES_DRV}/root:/${CHINA_FILE}:/createUploadSession`;
 const PHOTO_LOC = '/sites/TestSite/Shared Documents/Photo Store';
 const UP_HOST = 'https://contoso-test.sharepoint.com';
@@ -673,6 +674,9 @@ function graph(w, method, path, q, body) {
     if (path === `/drives/${REP}/items/itm-dray-old`) return J(200, fileMeta('itm-dray-old', 'drayage-report-old.csv', o.drayOldFile, 1));
     if (path === `/sites/${SITE_ID}/lists/PO_Book_Lines`) return J(200, listMeta('lst-pob', 'PO_Book_Lines'));
     if (path === `/sites/${SITE_ID}/lists/lst-pob/items`) return J(200, { value: o.real ? w.fx.real.pob : w.fx.pob });
+    if (path === `/sites/${SITE_ID}/lists/${FAC_LIST}`) return o.facCodes ? J(200, { id: 'lst-fac' }) : J(404, { error: { code: 'itemNotFound', message: 'no such list' } });
+    if (path === `/sites/${SITE_ID}/lists/lst-fac/columns`) return J(200, { value: [{ name: 'Title', displayName: 'Factory' }, { name: 'Code0', displayName: 'Code' }, { name: 'Modified', displayName: 'Modified' }] });
+    if (path === `/sites/${SITE_ID}/lists/lst-fac/items`) return J(200, { value: o.facCodes.map(([Title, Code0], i) => ({ id: String(i + 1), fields: { Title, Code0 } })) });
     if (path === `/sites/${SITE_ID}/lists/UPC_MASTER`) return J(200, listMeta('lst-upc', 'UPC_MASTER'));
     if (path === `/sites/${SITE_ID}/lists/lst-upc/items`) {
       const pages = o.real ? w.fx.real.upcPages : w.fx.upcPages;
@@ -1431,17 +1435,22 @@ const SALES_READY = `(() => { const a = document.getElementById('app'), b = docu
 const SALES_SNAP = `(() => {
   const q = s => document.querySelector(s), txt = el => (el ? el.textContent.replace(/\\s+/g, ' ').trim() : '');
   const btn = id => ({ disabled: q(id).disabled, text: txt(q(id)) });
+  const list = k => ({ shown: !q('#' + k + 'Box').hidden && !q('#offRow').hidden, sum: txt(q('#' + k + 'Sum')),
+    items: [...document.querySelectorAll('#' + k + 'List label')].map(l => ({ name: l.querySelector('input').dataset.name, on: l.querySelector('input').checked, text: txt(l) })) });
   return { h: txt(q('#impH')), p: txt(q('#impP')), health: txt(q('#health')), sales: btn('#btnDlSales'), china: btn('#btnDlChina'),
     infoSales: txt(q('#infoSales')), infoChina: txt(q('#infoChina')), red: [q('#infoSales').className, q('#infoChina').className],
-    card: txt(q('.salescard')), buttons: [...document.querySelectorAll('#app button')].map(txt), tables: document.querySelectorAll('table, input, select, img').length,
-    toast: txt(q('#toast')), saved: ((window.__headless || {}).saved || []).map(x => x.name) };
+    card: txt(q('.salescard')), tables: document.querySelectorAll('table, select, img, input:not([type=checkbox])').length, brands: list('brands'), factories: list('factories'),
+    toast: txt(q('#toast')), saved: ((window.__headless || {}).saved || []).map(x => x.name), store: Object.fromEntries(Object.keys(localStorage).filter(k => k.startsWith('sales:')).map(k => [k, localStorage.getItem(k)])) };
 })()`;
 const salesSnap = t => t.eval(SALES_SNAP);
 // The two files as Shalam Tool saves them, with the invented photos, put in the library before the page opens: answers
 // each file's sheet (as made) and its bytes. opts.noDay: files made before the ATS report's day was written into them.
+// opts.mixed: the lines given invented brands and factory codes in turn, so there is something to leave off.
+const MIX = [['Brand S', 'A'], ['Brand T', 'B'], ['brand  s', 'A, B'], ['', '']];
 async function salesLibrary(w, today, opts = {}) {
   const files = { ...SELL_FILES, ats: SELL_ATS }, E = loadExcelJS(), out = {};
   for (const [kind, sh] of [['sales', sheetFor(w.fx, today, files)], ['china', chinaFor(w.fx, today, files)]]) {
+    if (opts.mixed) { const of = new Map(); for (const r of sh.rows) { if (!of.has(r.style)) of.set(r.style, MIX[of.size % MIX.length]); [r.brand, r.factory] = of.get(r.style); } }
     const pics = sh.rows.map(r => { const n = SELL_PICS[r.photoKey], b = n && w.fx.bytes.get(n), d = b && EP.pictureSize(new Uint8Array(b), 'jpeg');
       return d ? { data: new Uint8Array(b), width: d.w, height: d.h, extension: 'jpeg' } : null; });
     const made = opts.noDay ? { ...sh, reportDay: null } : sh;
@@ -3083,10 +3092,12 @@ const SCENARIOS = [
       let p = await salesSnap(t);
       c(`the files here are made from the ATS report of ${C.fmtDay(day)} (both the same)`, typeof day === 'number' && L.china.sheet.reportDay === day, JSON.stringify([day, L.china.sheet.reportDay]));
       c(`"Latest ATS import: ${C.fmtDay(day)}"`, p.h === `Latest ATS import: ${C.fmtDay(day)}` && p.p === 'The files below are made from that ATS report by Shalam Tool.' && !p.health, JSON.stringify({ h: p.h, p: p.p, health: p.health }));
-      c('the two buttons, on: "Download On hand ATS" and "Download Pull from China", and no other', !p.sales.disabled && !p.china.disabled && p.buttons.join('|') === 'Download On hand ATS|Download Pull from China', JSON.stringify(p.buttons));
+      c('the two buttons, on: "Download On hand ATS" and "Download Pull from China"', !p.sales.disabled && !p.china.disabled && p.sales.text === 'Download On hand ATS' && p.china.text === 'Download Pull from China', JSON.stringify([p.sales, p.china]));
+      c("a Brands tick list with the files' one brand, ticked; no Factories list (these files have no factory codes)", p.brands.shown && p.brands.sum === 'Brands' && p.brands.items.map(x => x.name).join() === 'Brand S' && p.brands.items[0].on && !p.factories.shown,
+        JSON.stringify([p.brands, p.factories]));
       const info = new RegExp(`^ATS report of ${C.fmtDay(day).replace(/\//g, '\\/')} · saved \\d+\\/\\d+\\/\\d{4}, \\d+:\\d\\d [AP]M$`);
       c('under each: its ATS report and when it was saved', info.test(p.infoSales) && info.test(p.infoChina), `${p.infoSales} · ${p.infoChina}`);
-      c('nothing of the sheets is on the page: no table, photo, search or filter', p.tables === 0 && !/SL-|Brand S|Factory|Customer/.test(p.card), p.card);
+      c('nothing of the sheets is on the page: no table, photo or search, no style, no factory or customer name', p.tables === 0 && !/SL-|Factory S|Customer/.test(p.card), p.card);
       const reads = w.calls.map(x => `${x.method} ${x.path}`);
       const want = ['GET /sites/met1sol.sharepoint.com:/sites/TestReports', 'GET /sites/site-rep/drives', `GET /drives/${SALES_DRV}/root:/${SALES_FILE}`, `GET /drives/${SALES_DRV}/root:/${CHINA_FILE}`];
       c('it asked SharePoint for the library and the two files only, and downloaded those two', reads.length === want.length && want.every(x => reads.includes(x)) &&
@@ -3115,6 +3126,125 @@ const SCENARIOS = [
       p = await salesSnap(t);
       c('the 5-minute refresh: the files looked at again, not downloaded again (unchanged); the page says the same', w.downloads.length === dls && w.calls.filter(x => x.path === `/drives/${SALES_DRV}/root:/${SALES_FILE}`).length === 2 &&
         p.h === `Latest ATS import: ${C.fmtDay(day)}` && !p.sales.disabled && !p.china.disabled, `${w.downloads.length - dls} downloads · ${p.h}`);
+    },
+  },
+  {
+    name: 'salespage-filter', title: 'the sales page: a brand or a factory code unticked is left off both downloads, made in this browser; kept in this browser; Show all gives the files as they are',
+    world: { cfg: { chinaFile: CHINA_FILE } }, page: 'sales.html', photos: true,
+    async setup(o) { o.w.lib = await salesLibrary(o.w, o.today, { mixed: true }); },
+    async run({ t, w, c }) {
+      const L = w.lib, read = async bytes => { const E = loadExcelJS(), wb = new E.Workbook(); await wb.xlsx.load(Buffer.from(bytes)); return SS.readWorkbook(wb); };
+      const sales = await read(L.sales.bytes), china = await read(L.china.bytes);
+      const handed = async i => Buffer.from(await t.eval(`window.__headless.savedFile(${i})`), 'base64');
+      const tick = (k, name) => t.eval(`(() => { document.getElementById('${k}Sum').click(); [...document.querySelectorAll('#${k}List input')].find(i => i.dataset.name === ${JSON.stringify(name)}).click(); })()`);
+      let p = await salesSnap(t);
+      c('Brands: Brand S (its two spellings one) and Brand T, ticked, with their lines; Factories: A and B', p.brands.shown && p.brands.items.map(x => x.name).join('|') === 'Brand S|Brand T' && p.brands.items.every(x => x.on && /\d+ lines?$/.test(x.text)) &&
+        p.factories.shown && p.factories.items.map(x => x.name).join('|') === 'A|B' && p.factories.items.every(x => x.on), JSON.stringify([p.brands, p.factories]));
+      c('no factory name on the page, only codes', !/Factory S/.test(p.card), p.card);
+      // A brand left off.
+      await tick('brands', 'Brand T');
+      await sleep(200);
+      p = await salesSnap(t);
+      const wantB = SS.without(sales, { brands: ['Brand T'] }), wantBC = SS.without(china, { brands: ['Brand T'] });
+      c(`Brand T unticked: "Brands (1 off)", kept in this browser; the buttons say (filtered) and how many lines are left off (${wantB.off} and ${wantBC.off})`, p.brands.sum === 'Brands (1 off)' && p.store['sales:brands-off'] === JSON.stringify(['Brand T']) &&
+        wantB.off > 0 && p.sales.text === 'Download On hand ATS (filtered)' && p.infoSales.endsWith(` · ${wantB.off} of ${sales.rows.length} lines left off`) &&
+        p.china.text === `Download Pull from China${wantBC.off ? ' (filtered)' : ''}`, JSON.stringify([p.brands.sum, p.store, p.sales.text, p.infoSales, p.china.text, p.infoChina]));
+      await t.eval(`document.getElementById('btnDlSales').click()`);
+      await t.waitFor(`(window.__headless.saved || []).length === 1`, 'the filtered file to be handed over', 40000);
+      p = await salesSnap(t);
+      let got = await read(await handed(0));
+      c(`Download: "${SALES_FILE.replace('.xlsx', ' (filtered).xlsx')}" holds every line but Brand T's (${wantB.rows.length}), their schedule and photos`, p.saved[0] === SALES_FILE.replace('.xlsx', ' (filtered).xlsx') && got.kind === 'sales' &&
+        JSON.stringify(got.rows) === JSON.stringify(wantB.rows) && JSON.stringify(got.byDate) === JSON.stringify(wantB.byDate) && got.photos.filter(Boolean).length === wantB.photos.filter(Boolean).length &&
+        got.rows.every(r => r.brand !== 'Brand T'), `${p.saved.join(', ')} · ${got.rows.length} rows, want ${wantB.rows.length} · ${got.byDate.length}/${wantB.byDate.length} · ${p.toast}`);
+      const opened = await openSheet(await handed(0), MARKS_SELL);
+      c("the file made here names no factory, customer or person, and says its ATS report", !opened.found.length, opened.found.join('; '));
+      // A factory code as well.
+      await tick('factories', 'A');
+      await sleep(200);
+      p = await salesSnap(t);
+      const off = { brands: ['Brand T'], factories: ['A'] }, wantF = SS.without(china, off), wantFS = SS.without(sales, off);
+      c(`factory A unticked too: "Factories (1 off)", kept; every line that may hold its goods is left off (A and "A, B": ${wantFS.off} of On hand ATS)`, p.factories.sum === 'Factories (1 off)' && p.store['sales:factories-off'] === JSON.stringify(['A']) &&
+        wantFS.rows.every(r => !SS.codeList(r.factory).includes('A')) && p.infoSales.endsWith(` · ${wantFS.off} of ${sales.rows.length} lines left off`), JSON.stringify([p.factories.sum, p.store, p.infoSales]));
+      await t.eval(`document.getElementById('btnDlChina').click()`);
+      await t.waitFor(`(window.__headless.saved || []).length === 2`, 'the filtered Pull from China to be handed over', 40000);
+      p = await salesSnap(t);
+      got = await read(await handed(1));
+      c(`Download Pull from China (filtered): ${wantF.rows.length} lines, none of Brand T or factory A`, p.saved[1] === CHINA_FILE.replace('.xlsx', ' (filtered).xlsx') && got.kind === 'china' && JSON.stringify(got.rows) === JSON.stringify(wantF.rows) && wantF.rows.length > 0,
+        `${p.saved.join(', ')} · ${got.rows.length} rows, want ${wantF.rows.length}`);
+      // A reload keeps the choice.
+      await t.eval('location.reload()');
+      await sleep(500);
+      await t.waitFor(SALES_READY, 'the page after a reload', 30000);
+      p = await salesSnap(t);
+      c('after a reload: still Brand T and factory A unticked', p.brands.sum === 'Brands (1 off)' && p.factories.sum === 'Factories (1 off)' && p.brands.items.find(x => x.name === 'Brand T').on === false, JSON.stringify([p.brands, p.factories]));
+      // Show all on both: the files as they are again.
+      await t.eval(`document.getElementById('brandsAll').click(); document.getElementById('factoriesAll').click()`);
+      await sleep(200);
+      const n0 = (await salesSnap(t)).saved.length;
+      await t.eval(`document.getElementById('btnDlSales').click()`);
+      await t.waitFor(`(window.__headless.saved || []).length === ${n0 + 1}`, 'the whole file to be handed over', 20000);
+      p = await salesSnap(t);
+      const whole = await handed(n0);
+      c('Show all: nothing kept in this browser, and Download On hand ATS is the file in the library byte for byte', !('sales:brands-off' in p.store) && !('sales:factories-off' in p.store) && p.sales.text === 'Download On hand ATS' &&
+        p.saved[n0] === SALES_FILE && whole.equals(L.sales.bytes), JSON.stringify([p.store, p.sales.text, p.saved]));
+      c('nothing but GETs; no upload', !w.calls.some(x => x.method !== 'GET') && !w.sales.made && !w.sales.chinaMade);
+      t.shots.push(await t.shot('salespage-filter'));
+    },
+  },
+  {
+    name: 'sales-factory', title: "Factory codes: the private list read from the Production site (its Code column found by its display name); both sheets say each line's code, never the factory's name",
+    world: { ...SELLW, ats: SELL_ATS, ...PICS, cfg: { ...PICS.cfg, chinaFile: CHINA_FILE, factoryCodes: FAC_LIST }, facCodes: [['factory  s', 'K'], ['Factory Other', 'M']] }, init: { scp: SAVE_SCP }, photos: true, saves: true,
+    async run({ t, w, c, today }) {
+      const files = { ...SELL_FILES, ats: SELL_ATS }, { S } = sellFor(w.fx, today, files);
+      const rowsOf = (name, sh) => C.sheetRows(X, C.findSheet(X.read(w.fx.bytes.get(name), { ...XOPT, sheets: [sh] }), sh).ws);
+      const factoriesBy = SS.factoriesByStyle([{ rows: rowsOf(files.trk, 'PO Status Tracker'), style: 'Style #', factory: 'Supplier' }, { rows: rowsOf(files.msl, 'Master Sheet Live'), style: 'Style Number', factory: 'Factory' }]);
+      const map = SS.factoryCodes([{ name: 'Factory S', code: 'K' }]).map, want = SS.salesRows(S, { today, factoryCodes: map, factoriesBy }), wantChina = SS.chinaRows(S, { today, factoryCodes: map, factoriesBy });
+      c(`each style's factories from the tracker and Master Sheet Live: ${factoriesBy.size} styles`, factoriesBy.size > 0 && [...factoriesBy.values()].every(v => v.join() === 'Factory S'), JSON.stringify([...factoriesBy].slice(0, 3)));
+      await t.waitFor(chipIs('ok'), 'both files to be saved', 40000);
+      const read = async bytes => { const E = loadExcelJS(), wb = new E.Workbook(); await wb.xlsx.load(Buffer.from(bytes)); return SS.readWorkbook(wb); };
+      const got = await read(w.sales.file.sent), gotChina = await read(w.sales.china.sent);
+      c(`worked out here: Factory S is K on ${want.rows.filter(r => r.factory === 'K').length} of ${want.rows.length} On hand ATS lines`, want.rows.some(r => r.factory === 'K') && wantChina.rows.every(r => r.factory === 'K'), JSON.stringify(want.rows.map(r => r.factory)));
+      c('the saved On hand ATS says the same codes, line for line', JSON.stringify(got.rows.map(r => [r.style, r.factory])) === JSON.stringify(want.rows.map(r => [r.style, r.factory])), JSON.stringify(got.rows.map(r => [r.style, r.factory])));
+      c('and the saved Pull from China', JSON.stringify(gotChina.rows.map(r => [r.style, r.factory])) === JSON.stringify(wantChina.rows.map(r => [r.style, r.factory])), JSON.stringify(gotChina.rows.map(r => r.factory)));
+      const o1 = await openSheet(w.sales.file.sent, MARKS_SELL), o2 = await openSheet(w.sales.china.sent, MARKS_SELL, 'china');
+      c("neither file holds the factory's name", !o1.found.length && !o2.found.length, [...o1.found, ...o2.found].join('; '));
+      const reads = w.calls.filter(x => /lists\/(Test%20Factory%20Codes|Test Factory Codes|lst-fac)/.test(x.path)).map(x => `${x.method} ${x.path}`);
+      c('the list, its columns and its items were read (GETs)', reads.length >= 3 && reads.every(x => x.startsWith('GET ')), reads.join('; '));
+      await t.click('#tabs .tab[data-tab="problems"]');
+      const iss = await t.eval(`[...document.querySelectorAll('#issTable tbody tr')].map(r => r.textContent).filter(x => /factory/i.test(x) && /code/i.test(x)).join(' | ')`);
+      c('nothing about factory codes on Problems', !iss, iss);
+    },
+  },
+  {
+    name: 'sales-factory-none', title: "Factory codes: a factory with no code on the list shows no factory on its lines and is named on Problems (in the main tool only); no list at all is said too",
+    world: { ...SELLW, ats: SELL_ATS, ...PICS, cfg: { ...PICS.cfg, chinaFile: CHINA_FILE, factoryCodes: FAC_LIST }, facCodes: [['Factory Other', 'M'], ['Factory Other', 'N']] }, init: { scp: SAVE_SCP }, photos: true, saves: true,
+    async run({ t, w, c }) {
+      await t.waitFor(chipIs('ok'), 'both files to be saved', 40000);
+      const read = async bytes => { const E = loadExcelJS(), wb = new E.Workbook(); await wb.xlsx.load(Buffer.from(bytes)); return SS.readWorkbook(wb); };
+      const got = await read(w.sales.file.sent);
+      c('every line of the saved sheet has an empty Factory', got.rows.length > 0 && got.rows.every(r => r.factory === ''), JSON.stringify(got.rows.map(r => r.factory)));
+      const o1 = await openSheet(w.sales.file.sent, MARKS_SELL);
+      c("the file doesn't hold the factory's name", !o1.found.length, o1.found.join('; '));
+      await t.click('#tabs .tab[data-tab="problems"]');
+      await sleep(200);
+      const iss = await t.eval(`[...document.querySelectorAll('#issTable tbody tr')].map(r => r.textContent).filter(x => /Factory/.test(x) && /code/i.test(x))`);
+      c('Problems: "1 factory on the sales sheets has no code on the Test Factory Codes list, so its lines show no factory: Factory S."', iss.some(x => x.includes('1 factory on the sales sheets has no code on the Test Factory Codes list, so its lines show no factory: Factory S.')), iss.join(' | '));
+      c("and the list's own problem: Factory Other twice with different codes", iss.some(x => x.includes('Test Factory Codes list: Factory Other is on the list twice with different codes (M and N): M is used.')), iss.join(' | '));
+    },
+  },
+  {
+    name: 'sales-factory-nolist', title: "Factory codes: the list isn't on the Production site: said on Problems, the sheets saved with an empty Factory column",
+    world: { ...SELLW, ats: SELL_ATS, ...PICS, cfg: { ...PICS.cfg, chinaFile: CHINA_FILE, factoryCodes: FAC_LIST } }, init: { scp: SAVE_SCP }, photos: true, saves: true,
+    async run({ t, w, c }) {
+      await t.waitFor(chipIs('ok'), 'both files to be saved', 40000);
+      const E = loadExcelJS(), wb = new E.Workbook();
+      await wb.xlsx.load(Buffer.from(w.sales.file.sent));
+      const got = SS.readWorkbook(wb);
+      c('the sheet is saved, every Factory empty', got.rows.length > 0 && got.rows.every(r => r.factory === ''), JSON.stringify(got.rows.map(r => r.factory)));
+      await t.click('#tabs .tab[data-tab="problems"]');
+      await sleep(200);
+      const iss = await t.eval(`[...document.querySelectorAll('#issTable tbody tr')].map(r => r.textContent).filter(x => /Factory codes:/.test(x))`);
+      c('Problems says the list wasn\'t found and the column is empty', iss.some(x => x.includes("Factory codes: the Test Factory Codes list wasn't found on the Production site (not made yet, or renamed), so the sales sheets' Factory column is empty.")), iss.join(' | '));
     },
   },
   {

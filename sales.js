@@ -1,7 +1,9 @@
 // Shalam Sales (Saul, Nov 4; made simple Nov 25: "his login just show him latest ATS import and the 2 download
 // buttons"): the page a salesperson opens. It looks only at the two sales sheets Shalam Tool saves into Shalam Sales tool
 // (config.js salesLibrary: salesFile and chinaFile), says which ATS report they were made from and when they were saved,
-// and hands each file over exactly as it is in the library. Nothing of the sheets is shown on the page. The page never
+// and hands each file over exactly as it is in the library. Brands and factories (by their codes: the files hold no
+// factory's name) can be unticked: a download is then made here, in this browser, without their lines; the choice is
+// kept in this browser and nothing is saved anywhere. Nothing of the sheets is shown on the page. The page never
 // writes: any request but a GET is refused before it leaves the page. A salesperson needs read access to that one
 // library and nothing else.
 (function () {
@@ -38,6 +40,13 @@
   const $ = id => document.getElementById(id);
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const isDay = v => typeof v === 'number' && Number.isFinite(v);
+  const fmtN = n => (typeof n === 'number' && Number.isFinite(n) ? n.toLocaleString('en-US') : '');
+  const plural = (n, w) => `${fmtN(n)} ${w}${n === 1 ? '' : 's'}`;
+  const store = {
+    get(k) { try { return localStorage.getItem('sales:' + k); } catch (e) { return null; } },
+    set(k, v) { try { localStorage.setItem('sales:' + k, v); } catch (e) { /* storage blocked: nothing kept */ } },
+    del(k) { try { localStorage.removeItem('sales:' + k); } catch (e) { /* nothing kept */ } },
+  };
   const safeDecode = s => { try { return decodeURIComponent(s); } catch (e) { return s; } };
   const tail = u => safeDecode(String(u || '')).replace(/\/+$/, '').split('/').pop();
   const encPath = p => p.split('/').filter(Boolean).map(encodeURIComponent).join('/');
@@ -177,33 +186,43 @@
     return d.id;
   }
 
-  // The spreadsheet library (vendor/xlsx-js-style): loaded the first time a file is read, only to read its properties.
-  let xlsxLoading = null;
-  function loadXlsx() {
-    if (window.XLSX) return Promise.resolve(window.XLSX);
-    if (!xlsxLoading) {
-      xlsxLoading = new Promise((resolve, reject) => {
+  // The two libraries, each loaded the first time it's needed: xlsx-js-style to look into a file (its ATS report, its
+  // lines' brands and factory codes), ExcelJS to make a file without some of them.
+  const libs = {};
+  function loadLib(src, name, what) {
+    if (window[name]) return Promise.resolve(window[name]);
+    if (!libs[name]) {
+      libs[name] = new Promise((resolve, reject) => {
         const s = document.createElement('script');
-        s.src = 'vendor/xlsx-js-style/xlsx.bundle.js';
-        s.onload = () => (window.XLSX ? resolve(window.XLSX) : reject(new Error("The spreadsheet library loaded but didn't start.")));
-        s.onerror = () => reject(new Error("The spreadsheet library didn't load."));
+        s.src = src;
+        s.onload = () => (window[name] ? resolve(window[name]) : reject(new Error(`${what} loaded but didn't start.`)));
+        s.onerror = () => reject(new Error(`${what} didn't load. Check the connection and try again.`));
         document.head.appendChild(s);
-      }).catch(e => { xlsxLoading = null; throw e; });
+      }).catch(e => { delete libs[name]; throw e; });
     }
-    return xlsxLoading;
+    return libs[name];
   }
-  // The ATS report a file was made from, as Shalam Tool wrote it into the file's properties (null: not said, or the
-  // file can't be read for it; the file is still handed over).
-  async function reportDayIn(bytes) {
+  const loadXlsx = () => loadLib('vendor/xlsx-js-style/xlsx.bundle.js', 'XLSX', 'The spreadsheet library');
+  const loadExcelJS = () => loadLib('vendor/exceljs/exceljs.min.js', 'ExcelJS', 'The Excel library');
+  // What the page needs to know of a file without showing it: the ATS report it was made from (as Shalam Tool wrote it
+  // into the file's properties; null when not said) and each line's brand and factory codes (null when the file can't
+  // be looked into: it is still handed over as it is).
+  async function peek(bytes) {
     try {
       const X = await loadXlsx();
-      return InvSalesSheet.reportDayOf((X.read(new Uint8Array(bytes), { type: 'array', bookProps: true }).Props || {}).Subject);
-    } catch (e) { console.error(e); return null; }
+      const wb = X.read(new Uint8Array(bytes), { type: 'array', sheets: 0 });
+      const reportDay = InvSalesSheet.reportDayOf((wb.Props || {}).Subject);
+      const rows = X.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, range: 1, defval: '' });
+      const head = (rows[0] || []).map(v => String(v).trim()), at = h => head.indexOf(h);
+      const iS = at('Style'), iB = at('Brand'), iF = at('Factory');
+      const lines = iS < 0 ? null : rows.slice(1).filter(r => String(r[iS] ?? '').trim()).map(r => ({ brand: iB < 0 ? '' : String(r[iB] ?? '').trim(), factory: iF < 0 ? '' : String(r[iF] ?? '').trim() }));
+      return { reportDay, lines };
+    } catch (e) { console.error(e); return { reportDay: null, lines: null }; }
   }
 
   // ---------- the two files ----------
   // Per kind: { meta (the file as SharePoint has it), bytes (the file itself, as downloaded), reportDay (the ATS report
-  // it was made from, or null), err (why there's none, in plain words) }.
+  // it was made from, or null), lines (each line's { brand, factory }, or null), err (why there's none, in plain words) }.
   const data = { sales: null, china: null };
   let loadCtl = null, refreshTimer = null;
   async function loadAll() {
@@ -227,9 +246,9 @@
         const was = data[K.kind];
         if (was && was.bytes && was.meta && was.meta.eTag === meta.eTag) { was.meta = meta; continue; }
         const bytes = await download(meta, signal);
-        const reportDay = await reportDayIn(bytes);
+        const { reportDay, lines } = await peek(bytes);
         if (signal.aborted) throw abortErr();
-        data[K.kind] = { meta, bytes, reportDay };
+        data[K.kind] = { meta, bytes, reportDay, lines };
         render();
       }
       $('health').textContent = '';
@@ -254,7 +273,56 @@
     $('busyMsg').textContent = msg || '';
   }
 
-  // ---------- what the page shows: the latest ATS import, and a button for each file ----------
+  // ---------- brands and factories left off: two tick lists, kept in this browser ----------
+  // key: how a choice is known (a brand by its name without capitals or spaces, as the sheets match it; a factory by
+  // its code). What is unticked is kept as the names shown.
+  const SS = window.InvSalesSheet;
+  const LISTS = [
+    { k: 'brands', word: 'Brands', one: 'brand', field: 'brand', key: v => SS.nameKey(v), of: l => (l.brand ? [l.brand] : []) },
+    { k: 'factories', word: 'Factories', one: 'factory', field: 'factory', key: v => String(v).trim(), of: l => SS.codeList(l.factory) },
+  ];
+  const el = (L, part) => $(L.k + part);
+  function offOf(L) {
+    try { const j = JSON.parse(store.get(L.k + '-off') || '[]'); return Array.isArray(j) ? j.map(v => String(v ?? '').trim()).filter(Boolean) : []; }
+    catch (e) { return []; }
+  }
+  const offNow = () => ({ brands: offOf(LISTS[0]), factories: offOf(LISTS[1]) });
+  // A list's choices: every one on a line of either file, A to Z, with its lines (a brand written two ways is one, shown
+  // as the spelling on the most lines).
+  function choicesOf(L) {
+    const by = new Map();
+    for (const K of SHEETS) for (const l of (data[K.kind] && data[K.kind].lines) || []) for (const name of L.of(l)) {
+      const k = L.key(name), x = by.get(k) || by.set(k, { names: new Map(), n: 0 }).get(k);
+      x.n++; x.names.set(name, (x.names.get(name) || 0) + 1);
+    }
+    return [...by].map(([k, x]) => ({ k, n: x.n, name: [...x.names].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))[0][0] }))
+      .sort((a, b) => a.name.localeCompare(b.name, 'en', { sensitivity: 'base', numeric: true }));
+  }
+  // The lines of a file the unticked brands and factories leave off (0: the file is handed over as it is).
+  const leftOff = kind => { const d = data[kind]; return d && d.lines ? SS.without({ rows: d.lines }, offNow()).off : 0; };
+  const shown = {};
+  function renderLists() {
+    let any = false;
+    for (const L of LISTS) {
+      const list = choicesOf(L), off = new Set(offOf(L).map(L.key)), n = list.filter(c => off.has(c.k)).length;
+      el(L, 'Box').hidden = !list.length;
+      if (list.length) any = true; else el(L, 'Box').open = false;
+      el(L, 'Sum').textContent = n ? `${L.word} (${fmtN(n)} off)` : L.word;
+      el(L, 'Sum').classList.toggle('some', n > 0);
+      el(L, 'All').disabled = !off.size;
+      const sig = JSON.stringify([list, [...off]]);
+      if (sig === shown[L.k]) continue;
+      shown[L.k] = sig;
+      el(L, 'List').innerHTML = list.map(c => `<label><input type="checkbox" data-key="${esc(c.k)}" data-name="${esc(c.name)}"${off.has(c.k) ? '' : ' checked'}>${esc(c.name)}<span class="n">${plural(c.n, 'line')}</span></label>`).join('');
+    }
+    $('offRow').hidden = !any;
+  }
+  function setOff(L, names) {
+    if (names.length) store.set(L.k + '-off', JSON.stringify(names)); else store.del(L.k + '-off');
+    render();
+  }
+
+  // ---------- what the page shows: the latest ATS import, the tick lists, and a button for each file ----------
   const fmtDay = d => InvCommon.fmtDay(d);
   const EL = { sales: ['btnDlSales', 'infoSales'], china: ['btnDlChina', 'infoChina'] };
   function render() {
@@ -264,28 +332,59 @@
     $('impP').textContent = days.length === 2 && days[0] !== days[1] ? 'The two files are from different ATS reports: each says its own below.'
       : days.length ? 'The files below are made from that ATS report by Shalam Tool.'
         : got ? "The files don't say yet which ATS report they were made from. They will once Shalam Tool saves them again." : loadCtl ? 'Getting the files…' : '';
+    renderLists();
     for (const K of SHEETS) {
       const d = data[K.kind], [btn, info] = EL[K.kind].map($);
-      btn.disabled = !(d && d.bytes);
+      const off = leftOff(K.kind);
+      btn.disabled = !(d && d.bytes) || !!dl;
+      btn.querySelector('span').textContent = `Download ${K.label}${off ? ' (filtered)' : ''}`;
       if (!d) { info.className = 'selinfo'; info.textContent = loadCtl ? 'Getting the file…' : ''; continue; }
       if (!d.bytes) { info.className = 'selinfo r'; info.textContent = d.err || ''; continue; }
       const at = d.meta.lastModifiedDateTime, old = at && Date.now() - new Date(at).getTime() > STALE_MS;
       info.className = 'selinfo' + (old ? ' a' : '');
-      info.textContent = `${isDay(d.reportDay) ? `ATS report of ${fmtDay(d.reportDay)} · ` : ''}saved ${fmtLong(at)}${old ? ' (not saved since: the numbers may be out of date)' : ''}`;
+      info.textContent = `${isDay(d.reportDay) ? `ATS report of ${fmtDay(d.reportDay)} · ` : ''}saved ${fmtLong(at)}${old ? ' (not saved since: the numbers may be out of date)' : ''}` +
+        (off ? ` · ${fmtN(off)} of ${plural(d.lines.length, 'line')} left off` : '');
     }
+    $('dlMsg').textContent = dl ? `Making ${dl.label} without what's unticked…` : '';
+    $('btnDlX').hidden = !dl;
   }
 
-  // ---------- Download: the file as it is in the library ----------
-  function downloadNow(kind) {
-    const d = data[kind], K = SHEETS.find(x => x.kind === kind);
-    if (!d || !d.bytes) return;
-    const name = d.meta.name || K.file();
-    const url = URL.createObjectURL(new Blob([d.bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
+  // ---------- Download: the file as it is in the library, or made here without the unticked brands and factories ----------
+  let dl = null;
+  function hand(bytes, name) {
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
     const a = document.createElement('a');
     a.href = url; a.download = name;
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 60000);
-    toast(`${name} downloaded.`, 5000);
+  }
+  async function downloadNow(kind) {
+    const d = data[kind], K = SHEETS.find(x => x.kind === kind);
+    if (dl || !d || !d.bytes) return;
+    const name = d.meta.name || K.file();
+    if (!leftOff(kind)) { hand(d.bytes, name); toast(`${name} downloaded.`, 5000); return; }
+    const me = dl = { label: K.label, stop: false };
+    render();
+    try {
+      const E = await loadExcelJS(), wb = new E.Workbook();
+      await wb.xlsx.load(d.bytes.slice(0));
+      if (me.stop) return;
+      const sheet = SS.readWorkbook(wb);
+      if (sheet.kind !== kind) throw new Error(`${name} isn't the ${K.label} sheet.`);
+      const v = SS.without({ ...sheet, reportDay: d.reportDay }, offNow());
+      if (!v.rows.length) { toast(`Nothing is left of ${K.label} with those brands and factories unticked.`, 7000); return; }
+      const bytes = await SS.workbookBytes(SS.buildWorkbook(E, v, v.photos));
+      if (me.stop) return;
+      const made = name.replace(/(\.xlsx)?$/i, ' (filtered).xlsx');
+      hand(bytes, made);
+      toast(`${made} downloaded: ${plural(v.rows.length, 'line')}, ${plural(v.off, 'line')} left off.`, 6000);
+    } catch (e) {
+      console.error(e);
+      if (!me.stop) toast(`The file couldn't be made without what's unticked: ${e.message || e} Tick everything to get the file as it is.`, 9000);
+    } finally {
+      if (dl === me) dl = null;
+      render();
+    }
   }
 
   function toast(t, ms = 3500) {
@@ -309,6 +408,19 @@
     $('btnCancelBusy').onclick = () => { if (loadCtl) loadCtl.abort(); };
     $('btnDlSales').onclick = () => downloadNow('sales');
     $('btnDlChina').onclick = () => downloadNow('china');
+    $('btnDlX').onclick = () => { if (dl) { dl.stop = true; dl = null; render(); toast('Download cancelled.'); } };
+    for (const L of LISTS) {
+      el(L, 'List').onchange = e => {
+        const t = e.target;
+        if (!t || !t.dataset || t.dataset.key == null) return;
+        const rest = offOf(L).filter(v => L.key(v) !== t.dataset.key);
+        setOff(L, t.checked ? rest : [...rest, t.dataset.name]);
+      };
+      el(L, 'All').onclick = () => setOff(L, []);
+      el(L, 'Close').onclick = () => { el(L, 'Box').open = false; el(L, 'Sum').focus(); };
+    }
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') for (const L of LISTS) if (el(L, 'Box').open) { el(L, 'Box').open = false; el(L, 'Sum').focus(); } });
+    document.addEventListener('click', e => { for (const L of LISTS) { const b = el(L, 'Box'); if (b.open && !b.contains(e.target)) b.open = false; } });
   }
   // Drifting dots behind the glass, as on Shalam Tool; still under prefers-reduced-motion.
   function startBg() {

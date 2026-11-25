@@ -294,6 +294,10 @@ button.tag.ov:hover{background:#f6cdc5}
 .salespage .salescard{max-width:760px;margin:6vh auto 0;padding:26px 28px}
 .salespage .salescard h2{font-size:22px;margin:0 0 6px}
 .salespage .salescard .note{margin:0 0 20px;min-height:1.3em}
+.salespage .salesoff{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:0 0 18px}
+.salespage .salesoff[hidden]{display:none}
+.salespage .brandspop{left:0;right:auto}
+.salespage .salesmaking{display:flex;align-items:center;gap:10px;margin-top:10px;min-height:1.3em}
 .salespage .salesfiles{display:flex;flex-wrap:wrap;gap:16px}
 .salespage .salesfile{flex:1 1 260px;display:flex;flex-direction:column;gap:8px;min-width:0}
 .salespage .salesfile button.dl{justify-content:center;padding:13px 18px;font-size:15px}

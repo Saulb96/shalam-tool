@@ -139,6 +139,64 @@
   const poOffOf = opts => { const list = listOf(opts && opts.reservedOff).map(k => k.toUpperCase()); return po => { const p = S(po).toUpperCase(); return !!p && list.some(k => p.endsWith(k)); }; };
   const brandOffOf = opts => { const set = new Set(listOf(opts && opts.brandsOff).map(nameKey)); return s => { const b = nameKey(s && s.brand); return !!b && set.has(b); }; };
 
+  // Factory codes (Saul, Nov 25: "a hidden type factory list like A,b,c"): the sheets say a code, never a factory's
+  // name. list: [{ name, code }] as the private list has them. Answers { map (a factory's name, capitals and spaces
+  // aside -> its code), issues: [plain words] }: a line with no name or no code is skipped and said; a factory on two
+  // lines with different codes keeps the first and is said; one code on two factories is kept (they read as one) and said.
+  function factoryCodes(list) {
+    const map = new Map(), by = new Map(), issues = [];
+    let blank = 0;
+    for (const x of Array.isArray(list) ? list : []) {
+      const name = S(x && x.name), code = S(x && x.code), k = nameKey(name);
+      if (!k && !code) continue;
+      if (!k || !code) { blank++; continue; }
+      if (map.has(k)) { if (map.get(k) !== code) issues.push(`${name} is on the list twice with different codes (${map.get(k)} and ${code}): ${map.get(k)} is used.`); continue; }
+      map.set(k, code);
+      (by.get(code) || by.set(code, []).get(code)).push(name);
+    }
+    if (blank) issues.push(`${blank} line${blank === 1 ? '' : 's'} on the list ${blank === 1 ? 'has' : 'have'} no factory or no code, so ${blank === 1 ? "it isn't" : "they aren't"} used.`);
+    for (const [code, names] of by) if (names.length > 1) issues.push(`Code ${code} is given to ${names.length} factories (${names.join(', ')}): they read as one factory on the sheets.`);
+    return { map, issues };
+  }
+  // Every factory a style was ever ordered from, by the sheets that say so (stock in the warehouse has no open PO to
+  // tell). sheets: [{ rows (a sheet's rows, the header first), style, factory (the two headers) }]; one that is missing,
+  // or lacks a header, adds nothing. Answers a Map: style (as C.normStyle) -> names, A to Z (one spelling per factory,
+  // capitals and spaces aside).
+  function factoriesByStyle(sheets) {
+    const by = new Map(), hk = v => S(v).toLowerCase().replace(/\s+/g, ' ');
+    for (const sh of Array.isArray(sheets) ? sheets : []) {
+      const rows = sh && Array.isArray(sh.rows) ? sh.rows : [], head = (rows[0] || []).map(hk);
+      const iS = head.indexOf(hk(sh && sh.style)), iF = head.indexOf(hk(sh && sh.factory));
+      if (iS < 0 || iF < 0) continue;
+      for (let n = 1; n < rows.length; n++) {
+        const style = C.normStyle(rows[n] && rows[n][iS]), name = S(rows[n] && rows[n][iF]);
+        if (!style || !name) continue;
+        const m = by.get(style) || by.set(style, new Map()).get(style);
+        if (!m.has(nameKey(name))) m.set(nameKey(name), name);
+      }
+    }
+    return new Map([...by].map(([k, m]) => [k, [...m.values()].sort(byName)]));
+  }
+  // opts.factoryCodes (factoryCodes's map, or none): a style's factories as their codes, A to Z, joined with ", " ('' when
+  // none is known or coded). none: called with each factory's name that has no code. The factories: those of its open
+  // lines, and (all: stock may be from any of them) every one opts.factoriesBy (factoriesByStyle's) has for the style;
+  // without all, those only when it has no open line's.
+  const codesOf = (opts, none, all) => {
+    const map = opts && opts.factoryCodes instanceof Map ? opts.factoryCodes : null;
+    const by = opts && opts.factoriesBy instanceof Map ? opts.factoriesBy : null;
+    return s => {
+      const open = (Array.isArray(s && s.factories) && s.factories.length ? s.factories : [s && s.factory]).map(S).filter(n => n && n !== 'Several');
+      const past = by && (all || !open.length) ? by.get(C.normStyle(s && (s.styleRaw || s.style))) || by.get(C.normStyle(s && s.style)) || [] : [];
+      const names = [...open, ...past];
+      const out = new Set();
+      for (const n of names) { const c = map && map.get(nameKey(n)); if (c) out.add(c); else if (map && none) none(n); }
+      return [...out].sort(byName).join(', ');
+    };
+  };
+  const uncodedOf = () => { const m = new Map(); return { add: n => { if (!m.has(nameKey(n))) m.set(nameKey(n), n); }, list: () => [...m.values()].sort(byName) }; };
+  // A row's factory codes as a list ("A, C" -> ['A', 'C']).
+  const codeList = v => S(v).split(',').map(S).filter(Boolean);
+
   // A style's stock by the ATS report: { known, onHand, transit: [{ units, when, parts, ours }], transitKnown, left,
   // ours }. Its "ATS from in WH" (else In WH − Total Customer Orders, when the report has no such figure for it); what's
   // below 0 (oversold) comes off its In Trans shipments and our own shipped goods its In Trans doesn't have (oursTransit:
@@ -203,12 +261,13 @@
   //   off; heldStyles: styles with nothing else), brandOffStyles, brandOffOnHand and brandOffTransit (a brand left off) }.
   function salesRows(sell, opts) {
     const today = todayOf(sell, opts), reserved = reservedOf(opts), poOff = poOffOf(opts), brandOff = brandOffOf(opts);
+    const uncoded = uncodedOf(), codes = codesOf(opts, uncoded.add, true);
     const counts = { styles: 0, rows: 0, split: 0, reserved: 0, leftOff: 0, stockUnknown: 0, transitUnknown: 0, notOnReport: 0, byDateRows: 0, noPack: 0,
-      oursStyles: 0, oursUnits: 0, heldOnHand: 0, heldTransit: 0, heldStyles: 0, brandOffStyles: 0, brandOffOnHand: 0, brandOffTransit: 0 };
+      oursStyles: 0, oursUnits: 0, heldOnHand: 0, heldTransit: 0, heldStyles: 0, brandOffStyles: 0, brandOffOnHand: 0, brandOffTransit: 0, noFactory: 0 };
     const totals = { onHand: 0, inTransit: 0, total: 0 };
     const reportDay = sell && isDay(sell.reportDay) ? sell.reportDay : null;
     const why = refusal(sell);
-    if (why) return { ok: false, reason: why, kind: 'sales', asOf: today, reportDay, rows: [], byDate: [], totals, counts, merges: [] };
+    if (why) return { ok: false, reason: why, kind: 'sales', asOf: today, reportDay, rows: [], byDate: [], totals, counts, merges: [], uncoded: [] };
 
     const rows = [], byDate = [], cats = categoriesOf(sell.styles);
     for (const s of sell.styles.slice().sort(orderBy(cats.of))) {
@@ -242,6 +301,7 @@
       counts.heldOnHand += held.onHand; counts.heldTransit += heldTransit;
       const list = [...lines.values()].sort(lineOrder);
       if (!list.length) { counts.heldStyles++; continue; }
+      const factory = codes(s);
       for (const L of list) {
         const pack = packText(L.pack ? [L.pack] : []);
         const dates = [...L.dates.keys()].sort((p, q) => whenRank(p) - whenRank(q));
@@ -249,8 +309,9 @@
         if (L.onHand > 0) byDate.push({ style: b.style, desc: b.desc, category: b.category, pack, note: L.note, when: 'now', where: WHERE[0], units: L.onHand });
         for (const w of dates) byDate.push({ style: b.style, desc: b.desc, category: b.category, pack, note: L.note, when: w, where: WHERE[1], units: L.dates.get(w) });
         rows.push({ style: b.style, upc: b.upc, desc: b.desc, brand: b.brand, category: b.category, sub: b.sub, pack, note: L.note,
-          onHand: L.onHand, inTransit: lt, transitFrom: dates.length ? dates[0] : null, total: L.onHand + lt, photoKey: b.photoKey });
+          onHand: L.onHand, inTransit: lt, transitFrom: dates.length ? dates[0] : null, total: L.onHand + lt, factory, photoKey: b.photoKey });
         if (!pack) counts.noPack++;
+        if (!factory) counts.noFactory++;
         if (L.note) counts.reserved++;
       }
       counts.styles++;
@@ -258,7 +319,7 @@
       totals.onHand += k.onHand - held.onHand; totals.inTransit += inTransit - heldTransit; totals.total += total - held.onHand - heldTransit;
     }
     counts.rows = rows.length; counts.byDateRows = byDate.length;
-    return { ok: true, reason: '', kind: 'sales', asOf: today, reportDay, rows, byDate, totals, counts, merges: cats.merges };
+    return { ok: true, reason: '', kind: 'sales', asOf: today, reportDay, rows, byDate, totals, counts, merges: cats.merges, uncoded: uncoded.list() };
   }
 
   // sell, opts: as salesRows. Answers { ok, reason, kind: 'china', asOf, reportDay, rows, totals, counts, merges }:
@@ -272,11 +333,12 @@
   //   brandOff (units of a brand left off) }.
   function chinaRows(sell, opts) {
     const today = todayOf(sell, opts), reserved = reservedOf(opts), poOff = poOffOf(opts), brandOff = brandOffOf(opts);
-    const counts = { rows: 0, styles: 0, reserved: 0, ordersOff: 0, past: 0, noDate: 0, stockUnknown: 0, held: 0, brandOff: 0 };
+    const uncoded = uncodedOf(), codes = codesOf(opts, uncoded.add);
+    const counts = { rows: 0, styles: 0, reserved: 0, ordersOff: 0, past: 0, noDate: 0, stockUnknown: 0, held: 0, brandOff: 0, noFactory: 0 };
     const totals = { units: 0 };
     const reportDay = sell && isDay(sell.reportDay) ? sell.reportDay : null;
     const why = refusal(sell);
-    if (why) return { ok: false, reason: why, kind: 'china', asOf: today, reportDay, rows: [], totals, counts, merges: [] };
+    if (why) return { ok: false, reason: why, kind: 'china', asOf: today, reportDay, rows: [], totals, counts, merges: [], uncoded: [] };
 
     const rows = [], styles = new Set(), cats = categoriesOf(sell.styles);
     for (const s of sell.styles.slice().sort(orderBy(cats.of))) {
@@ -312,17 +374,18 @@
         g.units += n; if (l.estimate) g.estimate = true;
       }
       if (!groups.size) continue;
-      const b = base(s, cats.of);
+      const b = base(s, cats.of), factory = codes(s);
       for (const g of [...groups.values()].sort((p, q) => whenRank(p.day) - whenRank(q.day) || lineOrder(p, q))) {
         rows.push({ style: b.style, upc: b.upc, desc: b.desc, brand: b.brand, category: b.category, sub: b.sub, pack: packText(g.pack ? [g.pack] : []),
-          note: g.note, units: g.units, pullFrom: g.day, estimate: g.estimate, photoKey: b.photoKey });
+          note: g.note, units: g.units, pullFrom: g.day, estimate: g.estimate, factory, photoKey: b.photoKey });
         totals.units += g.units;
+        if (!factory) counts.noFactory++;
         if (g.note) counts.reserved++;
       }
       styles.add(b.style);
     }
     counts.rows = rows.length; counts.styles = styles.size;
-    return { ok: true, reason: '', kind: 'china', asOf: today, reportDay, rows, totals, counts, merges: cats.merges };
+    return { ok: true, reason: '', kind: 'china', asOf: today, reportDay, rows, totals, counts, merges: cats.merges, uncoded: uncoded.list() };
   }
 
   // ---------- the Excel files
@@ -346,13 +409,14 @@
     { h: 'Available in transit (units)', w: 12, k: 'inTransit', n: true },
     { h: 'In transit available from', w: 13, k: 'transitFrom', when: r => (r.inTransit > 0 ? [r.transitFrom, false] : null) },
     { h: 'Total available (units)', w: 12, k: 'total', n: true },
+    { h: 'Factory', w: 10, k: 'factory', center: true, wrap: true },
     { h: 'Notes', w: 16, k: 'note', wrap: true },
   ];
   const CHINA_COLS = [
     ...COLS.slice(0, 8),
     { h: 'Units', w: 12, k: 'units', n: true },
     { h: 'Pull from date', w: 16, k: 'pullFrom', when: r => [r.pullFrom, r.estimate] },
-    COLS[COLS.length - 1],
+    ...COLS.slice(-2),
   ];
   const DATE_COLS = [
     { h: 'Style', w: 16, k: 'style' }, { h: 'Description', w: 34, k: 'desc', wrap: true }, { h: 'Category', w: 14, k: 'category', wrap: true },
@@ -537,8 +601,8 @@
   }
   // The fields of a row (and of a schedule row) in the order salesRows and chinaRows give them.
   const ROW_KEYS = {
-    sales: ['style', 'upc', 'desc', 'brand', 'category', 'sub', 'pack', 'note', 'onHand', 'inTransit', 'transitFrom', 'total', 'photoKey'],
-    china: ['style', 'upc', 'desc', 'brand', 'category', 'sub', 'pack', 'note', 'units', 'pullFrom', 'estimate', 'photoKey'],
+    sales: ['style', 'upc', 'desc', 'brand', 'category', 'sub', 'pack', 'note', 'onHand', 'inTransit', 'transitFrom', 'total', 'factory', 'photoKey'],
+    china: ['style', 'upc', 'desc', 'brand', 'category', 'sub', 'pack', 'note', 'units', 'pullFrom', 'estimate', 'factory', 'photoKey'],
   };
   const DATE_KEYS = ['style', 'desc', 'category', 'pack', 'note', 'when', 'where', 'units'];
   // wb: an ExcelJS Workbook loaded from one of these files. Answers { kind ('sales' | 'china'), rows, byDate (On hand
@@ -592,12 +656,31 @@
     return { kind, rows, byDate, photos };
   }
 
+  // A sheet read from a file (readWorkbook's) without some brands and factories (the sales page: Saul, Nov 25).
+  // off.brands: brand names (capitals and spaces aside; a line with no brand is never left off). off.factories: factory
+  // codes; a line is left off when any of its codes is one of them (it may hold that factory's goods; one with no code
+  // never). Answers { ok: true, reason: '', kind, reportDay, rows, byDate (the kept lines' schedule), photos, off (lines
+  // left off) }.
+  function without(sheet, off) {
+    const brands = new Set(listOf(off && off.brands).map(nameKey)), facs = new Set(listOf(off && off.factories));
+    const lk = r => `${S(r.style)}|${S(r.pack)}|${S(r.note)}`;
+    const rows = [], photos = [], kept = new Set();
+    ((sheet && sheet.rows) || []).forEach((r, i) => {
+      const b = nameKey(r.brand);
+      if ((b && brands.has(b)) || codeList(r.factory).some(c => facs.has(c))) return;
+      rows.push(r); photos.push(((sheet && sheet.photos) || [])[i] || null); kept.add(lk(r));
+    });
+    const all = ((sheet && sheet.rows) || []).length;
+    return { ok: true, reason: '', kind: sheet && sheet.kind === 'china' ? 'china' : 'sales', reportDay: sheet && isDay(sheet.reportDay) ? sheet.reportDay : null,
+      rows, byDate: ((sheet && sheet.byDate) || []).filter(b => kept.has(lk(b))), photos, off: all - rows.length };
+  }
+
   // The workbook as .xlsx bytes (a Uint8Array).
   async function workbookBytes(wb) {
     const b = await wb.xlsx.writeBuffer();
     return b instanceof Uint8Array ? new Uint8Array(b.buffer, b.byteOffset, b.byteLength) : new Uint8Array(b);
   }
 
-  return { salesRows, chinaRows, categoryTabs, tabsOf, kindOf, buildWorkbook, readWorkbook, workbookBytes, reportSubject, reportDayOf, photoKey, packText, fitPhoto,
+  return { salesRows, chinaRows, categoryTabs, tabsOf, kindOf, buildWorkbook, readWorkbook, workbookBytes, reportSubject, reportDayOf, factoryCodes, factoriesByStyle, codeList, without, nameKey, photoKey, packText, fitPhoto,
     TITLE, TABS, KINDS, NO_CAT, WHERE, COLS, CHINA_COLS, DATE_COLS, TRANSIT_DAYS, PHOTO_ROW_PT, PHOTO_INSET };
 });

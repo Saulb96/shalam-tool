@@ -565,6 +565,19 @@ async function salesReport(S, R) {
   let reserved, cfgOff = {};
   try { cfgOff = configReserved(); reserved = cfgOff.reserved; } catch (e) { fails(`can't read config.js: ${e.message}`); }
   try { sheet = SS.salesRows(S, { today, ...cfgOff }); china = SS.chinaRows(S, { today, ...cfgOff }); } catch (e) { fails(`the sales sheets stopped: ${e.message}`); return; }
+  // Factory codes (Saul, Nov 25): how many lines would have one, were every factory on the list (the names stay here).
+  try {
+    const factoriesBy = SS.factoriesByStyle([{ rows: trows, style: 'Style #', factory: 'Supplier' }, { rows: mrows, style: 'Style Number', factory: 'Factory' }]);
+    const seen = new Map();
+    for (const name of [...S.styles.flatMap(x => x.factories || []), ...[...factoriesBy.values()].flat()].filter(Boolean)) if (!seen.has(SS.nameKey(name))) seen.set(SS.nameKey(name), name);
+    const all = [...seen.values()].sort();
+    const map = SS.factoryCodes(all.map((name, i) => ({ name, code: 'F' + (i + 1) }))).map;
+    const a = SS.salesRows(S, { today, ...cfgOff, factoryCodes: map, factoriesBy }), b = SS.chinaRows(S, { today, ...cfgOff, factoryCodes: map, factoriesBy });
+    const per = {}; for (const r of a.rows) { const k = SS.codeList(r.factory).length; per[k] = (per[k] || 0) + 1; }
+    console.log(`  factories on a line of On hand ATS (how many lines): ${Object.keys(per).sort((x, y) => x - y).map(k => `${k}: ${per[k]}`).join(' · ')}`);
+    const used = new Set([...a.rows, ...b.rows].flatMap(r => SS.codeList(r.factory)));
+    console.log(`  factory codes: ${used.size} factories on the sales sheets' lines (of ${all.length} known) · On hand ATS: ${a.rows.length - a.counts.noFactory} of ${a.rows.length} lines have a factory, ${a.counts.noFactory} have none known · Pull from China: ${b.rows.length - b.counts.noFactory} of ${b.rows.length}, ${b.counts.noFactory} none · lines with more than one: ${[...a.rows, ...b.rows].filter(r => SS.codeList(r.factory).length > 1).length}`);
+  } catch (e) { fails(`the factory codes stopped: ${e.message}`); }
   if (!sheet.ok) { fails(`no sales sheet: ${sheet.reason}`); return; }
   if (!china.ok) { fails(`no Pull from China sheet: ${china.reason}`); return; }
   const k = sheet.counts, rows = sheet.rows, sum = (a, f) => a.reduce((p, x) => p + (f(x) || 0), 0);
@@ -625,9 +638,9 @@ async function salesReport(S, R) {
   if (!chinaOk) fails("the Pull from China sheet doesn't add up to our goods in China");
   console.log(`  pull-from dates: about (an estimate) ${n(crow.filter(r => r.estimate).length)} rows · no date ${n(crow.filter(r => r.pullFrom == null).length)} rows`);
   // Only the fields the sheets may hold, on every row.
-  const odd = rows.filter(r => Object.keys(r).join() !== 'style,upc,desc,brand,category,sub,pack,note,onHand,inTransit,transitFrom,total,photoKey').length +
+  const odd = rows.filter(r => Object.keys(r).join() !== 'style,upc,desc,brand,category,sub,pack,note,onHand,inTransit,transitFrom,total,factory,photoKey').length +
     sheet.byDate.filter(r => Object.keys(r).join() !== 'style,desc,category,pack,note,when,where,units').length +
-    crow.filter(r => Object.keys(r).join() !== 'style,upc,desc,brand,category,sub,pack,note,units,pullFrom,estimate,photoKey').length;
+    crow.filter(r => Object.keys(r).join() !== 'style,upc,desc,brand,category,sub,pack,note,units,pullFrom,estimate,factory,photoKey').length;
   console.log(`  every row holds only the sheets' fields: ${odd ? 'NO' : 'yes'}`);
   if (odd) fails(`${n(odd)} rows of the sales sheets hold other fields`);
   // A tab per category (Saul, Nov 3): every row on exactly one.

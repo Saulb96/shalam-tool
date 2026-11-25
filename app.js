@@ -143,7 +143,7 @@
     // what one of the ATS report's In Trans shipments is to our sheets
     'erp-ours-sailed': 'Ours on the water or at port (counted here, once)', 'erp-off-china': 'Left China per the ATS report: taken off our lots still in China',
     // the sales sheet (its photos, and saving it into Shalam Sales tool)
-    'no-photo': 'No picture (not in the ERP report, not in Quote Images)', 'photo-error': "Photos couldn't be read", 'not-saved': 'Sales sheet not saved',
+    'factory-codes': 'Factory codes', 'no-photo': 'No picture (not in the ERP report, not in Quote Images)', 'photo-error': "Photos couldn't be read", 'not-saved': 'Sales sheet not saved',
     // the ERP report's pictures (the newest ATS report that has them)
     'erp-pictures-unread': "The ATS report's pictures couldn't be read", 'erp-pictures-differ': "Different pictures on a style's rows (the first used)",
     'erp-pictures-skipped': 'Reports not looked in for pictures (at most 2 downloaded per load)',
@@ -759,6 +759,11 @@
       attempt(S.pobook, () => listSource('pobook', S.pobook, POB_FIELDS, false, force, signal)),
     ]);
     setBusy('Reading the PO Book group…'); await yieldUi();
+    // Each style's factories for the sales sheets' Factory column (stock has no open PO to tell): from both sheets as read.
+    if (trows || mrows) {
+      try { facCodes.by = window.InvSalesSheet.factoriesByStyle([{ rows: trows, style: 'Style #', factory: 'Supplier' }, { rows: mrows, style: 'Style Number', factory: 'Factory' }]); facCodes.ver++; }
+      catch (e) { console.error(e); }
+    }
 
     // countTracker / countMaster give every row read a result and name every missing column at once; the copied
     // parseTracker / parseMaster then read the lines exactly as the PO Book does.
@@ -1107,6 +1112,41 @@
     } catch (e) { console.error(e); return null; }
   }
 
+  // ---------- factory codes (Saul, Nov 25): the private list the sales sheets' Factory column goes by ----------
+  // map: a factory's name -> its code (null until the list is read; kept from the last good read when a later one
+  // fails, so the codes on the sheets don't come and go); issues: the list's own problems; err: why it wasn't read; ver:
+  // counts each change, so the sheets are worked out again.
+  // by: every factory each style was ordered from, by the PO Status Tracker and Master Sheet Live as last read.
+  const facCodes = { map: null, issues: [], err: '', ver: 0, by: null };
+  const facList = () => String(CFG.factoryCodes || '').trim();
+  async function loadFactoryCodes(signal) {
+    const name = facList();
+    if (!name) return;
+    try {
+      await ensureSite(signal);
+      let list;
+      try { list = await gj(`/sites/${siteId}/lists/${encodeURIComponent(name)}?$select=id`, { signal }); }
+      catch (e) {
+        if (e.status === 404) throw problem('not found', `the ${name} list wasn't found on the Production site (not made yet, or renamed)`);
+        throw e;
+      }
+      // The Code column's internal name isn't always its display name: found here.
+      const cols = await gAll(`/sites/${siteId}/lists/${list.id}/columns?$select=name,displayName`, signal);
+      const col = cols.find(c => String(c.displayName || '').trim().toLowerCase() === 'code') || cols.find(c => String(c.name || '').trim().toLowerCase() === 'code');
+      if (!col) throw problem('no Code column', `the ${name} list has no column called Code`);
+      const items = await gAll(`/sites/${siteId}/lists/${list.id}/items?$expand=fields($select=Title,${encodeURIComponent(col.name)})&$top=999`, signal);
+      const r = window.InvSalesSheet.factoryCodes(items.map(i => ({ name: i.fields && i.fields.Title, code: i.fields && i.fields[col.name] })));
+      if (!r.map.size) throw problem('empty', `the ${name} list has no factory with a code yet`);
+      const same = facCodes.map && JSON.stringify([...facCodes.map]) === JSON.stringify([...r.map]);
+      facCodes.map = r.map; facCodes.issues = r.issues; facCodes.err = '';
+      if (!same) facCodes.ver++;
+    } catch (e) {
+      if (isAbort(e)) throw e;
+      console.error(e);
+      facCodes.err = e.label ? e.message : `the ${name} list couldn't be read (${e.message || e})`;
+    }
+  }
+
   // ---------- UPC_MASTER ----------
   async function loadUpc(force, signal) {
     const s = fresh('upc');
@@ -1336,7 +1376,7 @@
     setBusy('Connecting to SharePoint…');
     try {
       // Master Sheet Live, the tracker and Container Tracking first; UPC_MASTER last.
-      await Promise.all([loadPoGroup(force, signal), loadCT(today, force, signal)]);
+      await Promise.all([loadPoGroup(force, signal), loadCT(today, force, signal), loadFactoryCodes(signal)]);
       await Promise.all([loadReport('forwarder', today, force, signal), loadReport('drayage', today, force, signal), loadAts(today, force, signal)]);
       // The stage numbers as soon as their sources are in; UPC_MASTER (descriptions, categories) fills in after.
       if (!signal.aborted) { buildStages(today); renderStageViews(); }
@@ -3749,10 +3789,10 @@
     const K = SHEETS.find(x => x.kind === kind);
     // core/salesSheet.js missing: boot() stops the page and says so; until then, no sheet.
     if (!window.InvSalesSheet) return { ok: false, kind, reason: "Part of the page (core/salesSheet.js) didn't load, so there's no sales sheet.", rows: [], byDate: [], counts: {} };
-    const m = sheetMemo[kind], brandsOff = brandsOffNow(), brands = brandsOff.map(brandKey).sort().join('|');
+    const m = sheetMemo[kind], brandsOff = brandsOffNow(), brands = brandsOff.map(brandKey).sort().join('|') + '#' + facCodes.ver;
     if (!m || m.sell !== sell || m.stages !== stages || m.brands !== brands) {
       let sheet;
-      try { sheet = window.InvSalesSheet[K.make](sell && !sellErr ? sell : { ok: false, notLoaded: (stages && stages.notLoaded) || [] }, { today: sellToday(), reserved: CFG.reserved, reservedOff: CFG.reservedOff, brandsOff }); }
+      try { sheet = window.InvSalesSheet[K.make](sell && !sellErr ? sell : { ok: false, notLoaded: (stages && stages.notLoaded) || [] }, { today: sellToday(), reserved: CFG.reserved, reservedOff: CFG.reservedOff, brandsOff, factoryCodes: facCodes.map, factoriesBy: facCodes.by }); }
       catch (e) { console.error(e); sheet = { ok: false, kind, reason: `The ${K.label} sheet couldn't be worked out (${(e && e.message) || e}): a bug in Shalam Tool, tell Saul.`, rows: [], byDate: [], counts: {} }; }
       // The page's own checks too (core/salesSheet.js sees only the selling engine's): the stage numbers or the rows of
       // Available to sell don't add up, the red banner says its numbers can't be trusted, so there's no sheet either.
@@ -3785,6 +3825,14 @@
       }
     }
     out.push(...picIssues().map(i => normIssue(SALES.name, i)));
+    // Factory codes: the list not read, its own problems, and factories on the sheets with no code (their lines say none).
+    if (facList()) {
+      if (facCodes.err) add('factory-codes', `Factory codes: ${facCodes.err}, so ${facCodes.map ? 'the sales sheets keep the codes read before' : "the sales sheets' Factory column is empty"}.`);
+      for (const m of facCodes.issues) add('factory-codes', `${facList()} list: ${m}`);
+      const china = sheetNow('china');
+      const none = [...new Set([...(sheet.ok ? sheet.uncoded || [] : []), ...(china.ok ? china.uncoded || [] : [])])].sort();
+      if (facCodes.map && none.length) add('factory-codes', `${fmtN(none.length)} ${none.length === 1 ? 'factory' : 'factories'} on the sales sheets ${none.length === 1 ? 'has' : 'have'} no code on the ${facList()} list, so ${none.length === 1 ? 'its' : 'their'} lines show no factory: ${none.join(', ')}.`);
+    }
     if (sales.state === 'err') add('not-saved', sales.message);
     return out;
   }

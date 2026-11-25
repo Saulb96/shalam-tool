@@ -74,9 +74,9 @@ function mainSell() {
   return sellOf(as, atsOf({ SS100: [500, 40, 460, [[300, D(11, 20)], [120, D(10, 20)]]], SS200: [0, 50, -50, [[30, D(11, 10)]]], SS300: [10, 0, 10],
     SS400: [0, 0, 0], SS500: [100, 10, 80, [[24, null]]] }));
 }
-const ROW_KEYS = ['style', 'upc', 'desc', 'brand', 'category', 'sub', 'pack', 'note', 'onHand', 'inTransit', 'transitFrom', 'total', 'photoKey'];
+const ROW_KEYS = ['style', 'upc', 'desc', 'brand', 'category', 'sub', 'pack', 'note', 'onHand', 'inTransit', 'transitFrom', 'total', 'factory', 'photoKey'];
 const DATE_KEYS = ['style', 'desc', 'category', 'pack', 'note', 'when', 'where', 'units'];
-const CHINA_KEYS = ['style', 'upc', 'desc', 'brand', 'category', 'sub', 'pack', 'note', 'units', 'pullFrom', 'estimate', 'photoKey'];
+const CHINA_KEYS = ['style', 'upc', 'desc', 'brand', 'category', 'sub', 'pack', 'note', 'units', 'pullFrom', 'estimate', 'factory', 'photoKey'];
 // config.js's reserved, invented: goods on a PO ending in -ZZQ are held for a customer.
 const RESERVED = { '-ZZQ': 'Reserved -ZZQ' };
 
@@ -128,7 +128,7 @@ test('Available to sell: one row per style on the ATS report with something avai
   for (const b of sh.byDate) assert.deepEqual(Object.keys(b), DATE_KEYS);
   // SS050 isn't on the report; SS200 (oversold beyond its In Trans) and SS400 have nothing.
   assert.deepEqual(sh.counts, { styles: 3, rows: 3, split: 0, reserved: 0, leftOff: 2, stockUnknown: 0, transitUnknown: 0, notOnReport: 1, byDateRows: sh.byDate.length, noPack: 1,
-    oursStyles: 1, oursUnits: 60, heldOnHand: 0, heldTransit: 0, heldStyles: 0, brandOffStyles: 0, brandOffOnHand: 0, brandOffTransit: 0 });
+    oursStyles: 1, oursUnits: 60, heldOnHand: 0, heldTransit: 0, heldStyles: 0, brandOffStyles: 0, brandOffOnHand: 0, brandOffTransit: 0, noFactory: 3 });
   assert.deepEqual(sh.totals, { onHand: 550, inTransit: 504, total: 1054 });
   assert.deepEqual(sh.merges, []);
 });
@@ -332,7 +332,7 @@ test('Pull from China: our goods in China not sold, one row per style, pull-from
     ['SS300', D(12, 20), false, 30, '12/3'],
   ]);
   // SS100's Booked 240 had 10/10 to pull from: too late, left off.
-  assert.deepEqual(sh.counts, { rows: 7, styles: 4, reserved: 0, ordersOff: 20, past: 240, noDate: 0, stockUnknown: 0, held: 0, brandOff: 0 });
+  assert.deepEqual(sh.counts, { rows: 7, styles: 4, reserved: 0, ordersOff: 20, past: 240, noDate: 0, stockUnknown: 0, held: 0, brandOff: 0, noFactory: 7 });
   assert.deepEqual(sh.totals, { units: 840 });
   // What a style is oversold beyond its In Trans comes off its earliest goods in China first (a past one too).
   const o = SS.chinaRows(sellOf([alloc({ units: 100, etd: D(10, 20), bucket: 'booked', stage: 'Booked' }), alloc({ units: 200, po: '900109', dates: { factoryCrd: D(12, 6) } })],
@@ -407,8 +407,78 @@ test('NO LEAK: the rows and the schedule hold none of the names, numbers, flags 
   // Only the allow-listed fields, at every level.
   for (const r of sh.rows) assert.deepEqual(Object.keys(r), ROW_KEYS);
   for (const r of ch.rows) assert.deepEqual(Object.keys(r), CHINA_KEYS);
-  assert.deepEqual(Object.keys(sh).sort(), ['asOf', 'byDate', 'counts', 'kind', 'merges', 'ok', 'reason', 'reportDay', 'rows', 'totals']);
-  assert.deepEqual(Object.keys(ch).sort(), ['asOf', 'counts', 'kind', 'merges', 'ok', 'reason', 'reportDay', 'rows', 'totals']);
+  assert.deepEqual(Object.keys(sh).sort(), ['asOf', 'byDate', 'counts', 'kind', 'merges', 'ok', 'reason', 'reportDay', 'rows', 'totals', 'uncoded']);
+  assert.deepEqual(Object.keys(ch).sort(), ['asOf', 'counts', 'kind', 'merges', 'ok', 'reason', 'reportDay', 'rows', 'totals', 'uncoded']);
+  // With factory codes: a coded factory is its code on the rows, never its name; one with no code is named only in
+  // uncoded (for the main tool's Problems), and its rows say nothing.
+  const coded = { today: TODAY, factoryCodes: SS.factoryCodes([{ name: MARK.factory, code: 'Q' }]).map };
+  for (const [out, where] of [[SS.salesRows(sell, coded), 'the sales rows'], [SS.chinaRows(sell, coded), 'the Pull from China rows']]) {
+    noMarks(allText({ rows: out.rows, byDate: out.byDate || [] }), where + ' with codes');
+    assert.ok(out.rows.some(r => r.factory === 'Q'), where);
+    assert.ok(out.rows.every(r => /^([A-Z](, [A-Z])*)?$/.test(r.factory)), where);
+  }
+  const none = SS.salesRows(sell, { today: TODAY, factoryCodes: new Map() });
+  assert.ok(none.uncoded.includes(MARK.factory));
+  noMarks(allText({ rows: none.rows, byDate: none.byDate }), 'the sales rows with no code for the factory');
+  assert.ok(none.rows.every(r => r.factory === ''));
+});
+
+test("factory codes: a style's factories as their codes from the private list; no code, no name; the list's own problems said", () => {
+  const got = SS.factoryCodes([{ name: 'Factory A', code: 'A' }, { name: ' factory  b ', code: ' B ' }, { name: 'FACTORY A', code: 'Z' }, { name: 'Factory C', code: 'B' },
+    { name: 'Factory D', code: '' }, { name: '', code: 'X' }, { name: '', code: '' }, { name: 'Factory A', code: 'A' }]);
+  assert.deepEqual([...got.map], [['factorya', 'A'], ['factoryb', 'B'], ['factoryc', 'B']]);
+  assert.deepEqual(got.issues, ['FACTORY A is on the list twice with different codes (A and Z): A is used.', "2 lines on the list have no factory or no code, so they aren't used.",
+    'Code B is given to 2 factories (factory  b, Factory C): they read as one factory on the sheets.']);
+  assert.deepEqual(SS.factoryCodes(null), { map: new Map(), issues: [] });
+  // The fixture's styles are all Factory A's; SS300 is made by two factories, one with no code.
+  const sell = mainSell();
+  sell.styles.find(x => x.style === 'SS300').factories = ['Factory Z', 'factory a', 'Factory N'];
+  sell.styles.find(x => x.style === 'SS500').factories = [];
+  sell.styles.find(x => x.style === 'SS500').factory = '';
+  const map = SS.factoryCodes([{ name: 'Factory A', code: 'C' }, { name: 'Factory Z', code: 'A' }]).map;
+  const sh = SS.salesRows(sell, { today: TODAY, factoryCodes: map }), ch = SS.chinaRows(sell, { today: TODAY, factoryCodes: map });
+  assert.deepEqual(sh.rows.map(r => [r.style, r.factory]), [['SS100', 'C'], ['SS300', 'A, C'], ['SS500', '']]);
+  assert.deepEqual([sh.uncoded, sh.counts.noFactory], [['Factory N'], 1]);
+  assert.deepEqual([...new Set(ch.rows.map(r => `${r.style} ${r.factory}`))], ['SS050 C', 'SS100 C', 'SS200 C', 'SS300 A, C']);
+  assert.deepEqual(ch.uncoded, ['Factory N']);
+  // No list: every line blank, nothing said to be missing a code.
+  const no = SS.salesRows(sell, { today: TODAY });
+  assert.deepEqual([no.rows.every(r => r.factory === ''), no.uncoded, no.counts.noFactory], [true, [], 3]);
+  assert.deepEqual(SS.codeList(' A, C ,,'), ['A', 'C']);
+  // Every factory a style was ordered from (the tracker's Supplier, Master Sheet Live's Factory): On hand ATS says them
+  // all (stock may be from any); Pull from China keeps to its open lines' factory, and uses these only when it has none.
+  const by = SS.factoriesByStyle([
+    { rows: [['PO#', ' supplier ', 'Style  #'], [1, 'Factory Z', 'ss100'], [2, 'FACTORY  Z', 'SS100'], [3, 'Factory A', ' SS500 '], [4, '', 'SS500'], [5, 'Factory Q', '']], style: 'Style #', factory: 'Supplier' },
+    { rows: [['Style Number', 'Factory'], ['SS500', 'Factory N'], ['SS100', 'Factory A']], style: 'Style Number', factory: 'Factory' },
+    { rows: [['Style', 'Maker'], ['SS100', 'Factory X']], style: 'Style Number', factory: 'Factory' }, { rows: null, style: 'a', factory: 'b' }, null]);
+  assert.deepEqual([...by], [['SS100', ['Factory A', 'Factory Z']], ['SS500', ['Factory A', 'Factory N']]]);
+  const sh2 = SS.salesRows(sell, { today: TODAY, factoryCodes: map, factoriesBy: by }), ch2 = SS.chinaRows(sell, { today: TODAY, factoryCodes: map, factoriesBy: by });
+  assert.deepEqual(sh2.rows.map(r => [r.style, r.factory]), [['SS100', 'A, C'], ['SS300', 'A, C'], ['SS500', 'C']]);
+  assert.deepEqual(sh2.uncoded, ['Factory N']);
+  assert.deepEqual([...new Set(ch2.rows.map(r => `${r.style} ${r.factory}`))], ['SS050 C', 'SS100 C', 'SS200 C', 'SS300 A, C']);
+  assert.deepEqual(SS.factoriesByStyle(null), new Map());
+});
+
+test('without: a sheet read from its file, less the brands and factory codes left off; the schedule and photos of the kept lines', () => {
+  const sell = mainSell();
+  const by = { SS100: ['Brand One', ['Factory A']], SS300: ['brand two', ['Factory A', 'Factory Z']], SS500: ['', ['Factory Z']] };
+  for (const x of sell.styles) if (by[x.style]) [x.brand, x.factories] = by[x.style];
+  const map = SS.factoryCodes([{ name: 'Factory A', code: 'A' }, { name: 'Factory Z', code: 'B' }]).map;
+  const sh = SS.salesRows(sell, { today: TODAY, factoryCodes: map });
+  const sheet = { kind: 'sales', reportDay: D(10, 31), rows: sh.rows, byDate: sh.byDate, photos: sh.rows.map((r, i) => ({ n: i })) };
+  assert.deepEqual(sh.rows.map(r => [r.style, r.brand, r.factory]), [['SS100', 'Brand One', 'A'], ['SS300', 'brand two', 'A, B'], ['SS500', '', 'B']]);
+  const all = SS.without(sheet, {});
+  assert.deepEqual([all.rows, all.byDate, all.photos, all.off, all.kind, all.reportDay, all.ok], [sh.rows, sh.byDate, sheet.photos, 0, 'sales', D(10, 31), true]);
+  // A brand, capitals and spaces aside; the line with no brand stays.
+  const b = SS.without(sheet, { brands: ['BRAND  ONE'] });
+  assert.deepEqual([b.rows.map(r => r.style), b.photos, b.off, [...new Set(b.byDate.map(x => x.style))]], [['SS300', 'SS500'], [{ n: 1 }, { n: 2 }], 1, ['SS300', 'SS500']]);
+  // A factory code: every line that may hold its goods.
+  assert.deepEqual(SS.without(sheet, { factories: ['A'] }).rows.map(r => r.style), ['SS500']);
+  assert.deepEqual(SS.without(sheet, { factories: ['B'] }).rows.map(r => r.style), ['SS100']);
+  assert.deepEqual(SS.without(sheet, { brands: ['Brand Two'], factories: ['B'] }).rows.map(r => r.style), ['SS100']);
+  const ch = SS.chinaRows(sell, { today: TODAY, factoryCodes: map });
+  const c = SS.without({ kind: 'china', rows: ch.rows, photos: [] }, { factories: ['B'] });
+  assert.deepEqual([c.kind, c.byDate, c.rows.every(r => !SS.codeList(r.factory).includes('B')), c.rows.length < ch.rows.length], ['china', [], true, true]);
 });
 
 // ---------- the Excel file (ExcelJS, vendored)
@@ -443,9 +513,9 @@ test('the workbook: every style, a tab per category, By date; the title, frozen 
   const ws = book.Sheets['On hand ATS'], v = a => (ws[a] ? ws[a].v : undefined);
   assert.equal(v('A1'), 'M1S · On hand ATS');
   assert.equal(v('D1'), undefined, 'no "as of" line (Saul, Nov 3)');
-  assert.deepEqual('ABCDEFGHIJKLM'.split('').map(c => v(c + '2')), SS.COLS.map(c => c.h));
+  assert.deepEqual('ABCDEFGHIJKLMN'.split('').map(c => v(c + '2')), SS.COLS.map(c => c.h));
   assert.deepEqual(SS.COLS.map(c => c.h), ['Photo', 'Style', 'UPC', 'Description', 'Brand', 'Category', 'Sub category', 'Master/Inner', 'Available on hand (units)',
-    'Available in transit (units)', 'In transit available from', 'Total available (units)', 'Notes']);
+    'Available in transit (units)', 'In transit available from', 'Total available (units)', 'Factory', 'Notes']);
   assert.deepEqual('BCDEFGHIJKLM'.split('').map(c => v(c + '3')), ['SS100', '000111222333', 'Item SS100', undefined, 'Lip', undefined, '24/6', 460, 420, 'now', 880, undefined]);
   assert.deepEqual('BHIJKL'.split('').map(c => v(c + '4')), ['SS300', '24/6', 10, 60, serial(D(11, 22)), 70]);
   assert.deepEqual('BDHIJKL'.split('').map(c => v(c + '5')), ['SS500', 'ERP SS500', undefined, 80, 24, 'date to come', 104]);
@@ -470,7 +540,7 @@ test('the workbook: every style, a tab per category, By date; the title, frozen 
   const parts = xlsxParts(bytes);
   const sheet1 = Buffer.from(parts.get('xl/worksheets/sheet1.xml')).toString('utf8'), sheet3 = Buffer.from(parts.get('xl/worksheets/sheet3.xml')).toString('utf8');
   assert.match(sheet1, /<pane xSplit="2" ySplit="2" topLeftCell="C3" activePane="bottomRight" state="frozen"\/>/);
-  assert.match(sheet1, /<autoFilter ref="A2:M2"\/>/);
+  assert.match(sheet1, /<autoFilter ref="A2:N2"\/>/);
   assert.match(sheet3, /<pane xSplit="1" ySplit="1" topLeftCell="B2" activePane="bottomRight" state="frozen"\/>/);
   assert.match(sheet3, /<autoFilter ref="A1:H1"\/>/);
   // Two photos, in the Photo column on their styles' rows (SS100 on row 3, SS300 on row 4: 0-based 2 and 3), fitted
@@ -499,15 +569,15 @@ test('the Pull from China workbook: every row, a tab per category, no By date; u
   const ws = book.Sheets['Pull from China'], v = a => (ws[a] ? ws[a].v : undefined);
   assert.equal(v('A1'), 'M1S · Pull from China');
   assert.equal(book.Sheets.Lip.A1.v, 'M1S · Pull from China · Lip');
-  assert.deepEqual('ABCDEFGHIJK'.split('').map(c => v(c + '2')), ['Photo', 'Style', 'UPC', 'Description', 'Brand', 'Category', 'Sub category', 'Master/Inner', 'Units', 'Pull from date', 'Notes']);
-  assert.deepEqual(SS.CHINA_COLS.map(c => c.h), 'ABCDEFGHIJK'.split('').map(c => v(c + '2')));
+  assert.deepEqual('ABCDEFGHIJKL'.split('').map(c => v(c + '2')), ['Photo', 'Style', 'UPC', 'Description', 'Brand', 'Category', 'Sub category', 'Master/Inner', 'Units', 'Pull from date', 'Factory', 'Notes']);
+  assert.deepEqual(SS.CHINA_COLS.map(c => c.h), 'ABCDEFGHIJKL'.split('').map(c => v(c + '2')));
   const about = `about ${C.fmtDay(D(10, 1) + 75)}`;
   const got = [];
   for (let r = 3; v('B' + r) !== undefined; r++) got.push(['B', 'H', 'I', 'J'].map(c => v(c + r)));
   assert.deepEqual(got, [['SS050', '24/6', 96, about], ['SS100', '24/6', 480, serial(D(12, 1))], ['SS100', '24/6', 100, about], ['SS200', undefined, 50, serial(D(12, 1))],
     ['SS300', '12/3', 36, serial(D(12, 1))], ['SS300', '24/6', 48, serial(D(12, 1))], ['SS300', '12/3', 30, serial(D(12, 20))]]);
   assert.equal(ws.J4.z, 'm/d/yyyy');
-  assert.match(Buffer.from(xlsxParts(bytes).get('xl/worksheets/sheet1.xml')).toString('utf8'), /<autoFilter ref="A2:K2"\/>/);
+  assert.match(Buffer.from(xlsxParts(bytes).get('xl/worksheets/sheet1.xml')).toString('utf8'), /<autoFilter ref="A2:L2"\/>/);
   // SS100 on rows 4 and 5 and SS300 on rows 7 to 9, on both tabs: two pictures in the file, shown ten times.
   const parts = xlsxParts(bytes);
   assert.equal([...parts.keys()].filter(p => /^xl\/media\//.test(p)).length, 2);
@@ -535,7 +605,7 @@ test('a tab per category: A to Z, no category last, rows by sub category then st
   const cell = (tab, a) => (book.Sheets[tab][a] ? book.Sheets[tab][a].v : undefined);
   assert.equal(cell('Bath', 'A1'), 'M1S · On hand ATS · Bath');
   assert.equal(cell('No category', 'A1'), 'M1S · On hand ATS · No category');
-  assert.deepEqual('ABCDEFGHIJKLM'.split('').map(c => cell('Cosmetics2', c + '2')), SS.COLS.map(c => c.h));
+  assert.deepEqual('ABCDEFGHIJKLMN'.split('').map(c => cell('Cosmetics2', c + '2')), SS.COLS.map(c => c.h));
   assert.deepEqual(['B3', 'F3', 'G3', 'B4'].map(a => cell('Bath', a)), ['SS300', 'Bath', 'Gloves', undefined]);
   assert.deepEqual(['B3', 'F3', 'G3', 'B4'].map(a => cell('No category', a)), ['SS500', undefined, undefined, undefined]);
   // Every category tab's cells are the all-styles tab's, row for row, and together they hold every style once.
